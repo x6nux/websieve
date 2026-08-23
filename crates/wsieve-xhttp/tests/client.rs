@@ -124,7 +124,7 @@ impl HttpTransport for FakeTransport {
                         None
                     }
                 });
-            if matches!(prev, Ok(_)) {
+            if prev.is_ok() {
                 return Err(anyhow::anyhow!("scripted transport error"));
             }
             // 状态码覆盖

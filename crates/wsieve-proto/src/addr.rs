@@ -175,10 +175,10 @@ mod tests {
         assert!(decode_addr(&[0x01, 1]).is_err());
         assert!(decode_addr(&[0x03, 5, b'a']).is_err());
         assert!(decode_addr(
-            &vec![0x04]
+            &[0x04]
                 .iter()
                 .copied()
-                .chain(std::iter::repeat(0u8).take(15))
+                .chain(std::iter::repeat_n(0u8, 15))
                 .collect::<Vec<u8>>()[..]
         )
         .is_err());
