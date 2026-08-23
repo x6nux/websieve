@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+wsieve-proto = { path = "../wsieve-proto" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]

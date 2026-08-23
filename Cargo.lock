@@ -2799,6 +2799,12 @@ dependencies = [
 [[package]]
 name = "wsieve-socks5"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "tokio",
+ "wsieve-proto",
+]
 
 [[package]]
 name = "wsieve-transport"
