@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 use bytes::Bytes;
-use tokio::time::{pause, timeout};
+use tokio::time::timeout;
 use wsieve_xhttp::server::{SessionStore, SessionGone, Sid};
 
 #[tokio::test]
@@ -22,70 +22,93 @@ async fn reorder_and_dedup() {
     let mut buf = vec![0u8; 10];
     let mut total_n = 0;
 
-    // 第一次读取（seq 0）
-    let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf[total_n..])).await.unwrap().unwrap();
-    total_n += n;
-    println!("read 1: {} bytes", n);
-
-    // 第二次读取（seq 1）
-    if total_n < 6 {
-        let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf[total_n..])).await.unwrap().unwrap();
+    while total_n < 6 {
+        let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf[total_n..]))
+            .await
+            .expect("data already buffered; read returns immediately")
+            .unwrap();
         total_n += n;
-        println!("read 2: {} bytes", n);
     }
 
-    // 第三次读取（seq 2）
-    if total_n < 6 {
-        let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf[total_n..])).await.unwrap().unwrap();
-        total_n += n;
-        println!("read 3: {} bytes", n);
-    }
-
-    println!("total: {} bytes: {:?}", total_n, &buf[..total_n]);
-    assert_eq!(total_n, 6);
     assert_eq!(&buf[..6], b"aabbcc");
 
     // 重复推送 seq 0 → 应该被去重，仍 Ok，不增加数据
     s.push_post(&sid, 0, Bytes::copy_from_slice(b"AA")).await.unwrap();
 
-    // 再次读取：应该没有额外数据（缓冲已空）
+    // 再次读取：应该没有新数据（缓冲已空）
     let n = timeout(Duration::from_millis(10), s.read(&sid, &mut buf)).await;
     assert!(n.is_err()); // 超时说明没有新数据
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn gc_attach_window() {
-    // 暂时跳过，因为 GC 任务在 paused 时间内无法正确触发
-    // 实际环境中（非 paused），这个测试会正常工作
+    // create 后 30s 内无 attach → SessionGone（spec §9.4 attach 窗口）
     let s = SessionStore::new();
     let sid = Sid::random();
 
     s.create(sid).await;
 
-    // 等待稍长时间，确保 GC 至少运行一次
+    // advance 31s（> 30s 窗口）；sleep 1.1s 让 GC task 的 1s tick 跑一轮
+    //（paused clock 下 sleep 即 auto-advance）
+    tokio::time::advance(Duration::from_secs(31)).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
-
-    // 手动杀死会话来验证 DownlinkHandle 的行为
-    s.kill(&sid).await;
+    tokio::task::yield_now().await;
 
     let mut buf = vec![0u8; 10];
     let result = s.read(&sid, &mut buf).await;
     assert!(matches!(result, Err(SessionGone)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn gc_upstream_idle() {
-    // 暂时跳过，因为 GC 任务在 paused 时间内无法正确触发
+    // attach 后 180s 无上行 → SessionGone（spec §9.4 上行空闲 GC）
     let s = SessionStore::new();
     let sid = Sid::random();
 
     s.create(sid).await;
-    s.attach_downlink(&sid).await.unwrap();
+    let _handle = s.attach_downlink(&sid).await.unwrap(); // 不 drop：走空闲分支
 
-    // 手动杀死会话来验证行为
-    s.kill(&sid).await;
+    // advance 181s（> 180s 空闲）+ GC tick
+    tokio::time::advance(Duration::from_secs(181)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::task::yield_now().await;
 
     let mut buf = vec![0u8; 10];
+    let result = s.read(&sid, &mut buf).await;
+    assert!(matches!(result, Err(SessionGone)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_upstream_idle_reset_by_post() {
+    // 变体：attach 后中途有 POST → 计时重置，181s 从最后一次 POST 起算
+    let s = SessionStore::new();
+    let sid = Sid::random();
+
+    s.create(sid).await;
+    let _handle = s.attach_downlink(&sid).await.unwrap();
+
+    // 过 100s 后来一个 POST（seq 0，落在 next_seq 上）
+    tokio::time::advance(Duration::from_secs(100)).await;
+    s.push_post(&sid, 0, Bytes::copy_from_slice(b"xx")).await.unwrap();
+
+    // 再过 100s（自 POST 起仅 100s < 180s）→ 会话仍活着
+    tokio::time::advance(Duration::from_secs(100)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::task::yield_now().await;
+
+    // 读得到 POST 的数据（会话活着，且 seq 0 可消费）
+    let mut buf = vec![0u8; 10];
+    let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf))
+        .await
+        .expect("session alive, seq 0 buffered")
+        .unwrap();
+    assert_eq!(&buf[..n], b"xx");
+
+    // 再过 81s（自 POST 起 181s）→ 会话被 GC
+    tokio::time::advance(Duration::from_secs(81)).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::task::yield_now().await;
+
     let result = s.read(&sid, &mut buf).await;
     assert!(matches!(result, Err(SessionGone)));
 }
@@ -121,11 +144,10 @@ async fn double_attach_rejected() {
 
     s.create(sid).await;
 
-    // 第一次 attach
-    let handle1 = s.attach_downlink(&sid).await.unwrap();
-    drop(handle1);
+    // 第一次 attach，持有 handle 不 drop
+    let _handle1 = s.attach_downlink(&sid).await.unwrap();
 
-    // 第二次 attach → SessionGone
+    // 第二次 attach → 走 attached 标志分支 → SessionGone
     let result = s.attach_downlink(&sid).await;
     assert!(matches!(result, Err(SessionGone)));
 }

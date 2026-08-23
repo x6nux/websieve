@@ -3,11 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::task::Waker;
-use std::time::Instant;
 
 use bytes::Bytes;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{interval, Duration, sleep};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::time::{Instant, interval, Duration};
 
 /// 会话 ID（128-bit）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,11 +40,8 @@ impl Drop for DownlinkHandle {
         // 异步处理 GC
         tokio::spawn(async move {
             let mut inner = store.lock().await;
-            if let Some(session) = inner.sessions.get(&sid) {
-                if session.attached {
-                    // 下行断开 → 立即 GC
-                    inner.sessions.remove(&sid);
-                }
+            if inner.sessions.remove(&sid).is_some() {
+                inner.notify.notify_one();
             }
         });
     }
@@ -69,6 +65,8 @@ struct Session {
 
 struct SessionStoreInner {
     sessions: BTreeMap<Sid, Session>,
+    /// 会话增删/数据到达的全局通知（与 read_waker 配对）
+    notify: Arc<Notify>,
 }
 
 pub struct SessionStore {
@@ -84,6 +82,7 @@ impl SessionStore {
     pub fn new() -> Self {
         let inner = SessionStoreInner {
             sessions: BTreeMap::new(),
+            notify: Arc::new(Notify::new()),
         };
 
         let store = Self {
@@ -110,6 +109,7 @@ impl SessionStore {
             created_at: Instant::now(),
             read_waker: None,
         });
+        inner.notify.notify_one();
     }
 
     /// 推送 POST body（seq 已解析）
@@ -133,71 +133,53 @@ impl SessionStore {
         let has_hole = session.heap.keys().next().map(|k| *k != session.next_seq).unwrap_or(false);
         if has_hole && session.heap.len() > MAX_BUFFERED_POSTS {
             inner.sessions.remove(&sid);
+            inner.notify.notify_one();
             return Err(SessionGone);
         }
 
-        // 唤醒读任务
-        if let Some(waker) = &session.read_waker {
-            let waker = waker.clone();
-            session.read_waker = None;
-            drop(inner);
-
-            // 在锁外唤醒
+        // 唤醒读任务（新数据到达）
+        if let Some(waker) = session.read_waker.take() {
             waker.wake();
-            return Ok(());
         }
-
+        inner.notify.notify_one();
         Ok(())
     }
 
-    /// 读取数据（阻塞直到有数据）
+    /// 读取数据（阻塞直到有数据或会话死亡）
     pub async fn read(&self, sid: &Sid, out: &mut [u8]) -> Result<usize, SessionGone> {
+        // Notify 句柄必须在 block 外持有：`Notified` future 借用 Notify 本体
+        let notify = {
+            let inner = self.inner.lock().await;
+            Arc::clone(&inner.notify)
+        };
         loop {
-            let (has_data, body) = {
+            {
                 let mut inner = self.inner.lock().await;
                 let session = inner.sessions.get_mut(sid).ok_or(SessionGone)?;
 
                 // 尝试从堆中取 next_seq
                 if let Some(b) = session.heap.remove(&session.next_seq) {
                     session.next_seq += 1;
-
-                    // 唤醒其他读任务（如果有）
-                    if session.heap.contains_key(&session.next_seq) {
-                        if let Some(waker) = &session.read_waker {
-                            let w = waker.clone();
-                            session.read_waker = None;
-                            drop(inner);
-                            w.wake();
-                        } else {
-                            drop(inner);
-                        }
-                    } else {
-                        drop(inner);
-                    }
-
-                    (true, b)
-                } else {
-                    // 注册 waker - 暂时简化，使用 channel 通知
-                    drop(inner);
-                    (false, Bytes::new())
+                    let n = out.len().min(b.len());
+                    out[..n].copy_from_slice(&b[..n]);
+                    return Ok(n);
                 }
-            };
-
-            if has_data {
-                let n = out.len().min(body.len());
-                out[..n].copy_from_slice(&body[..n]);
-                return Ok(n);
             }
 
-            // 等待推送唤醒
-            sleep(Duration::from_millis(100)).await;
+            // 无数据：挂起直到数据到达或会话被删除（两者都 notify）
+            notify.notified().await;
         }
     }
 
     /// 杀死会话
     pub async fn kill(&self, sid: &Sid) {
         let mut inner = self.inner.lock().await;
-        inner.sessions.remove(sid);
+        if let Some(session) = inner.sessions.remove(sid) {
+            if let Some(w) = session.read_waker {
+                w.wake();
+            }
+        }
+        inner.notify.notify_one();
     }
 
     /// 绑定下行（返回句柄）
@@ -242,8 +224,17 @@ impl SessionStore {
                 }
             }
 
+            let mut woken = false;
             for sid in to_remove {
-                inner.sessions.remove(&sid);
+                if let Some(session) = inner.sessions.remove(&sid) {
+                    if let Some(w) = session.read_waker {
+                        w.wake();
+                        woken = true;
+                    }
+                }
+            }
+            if woken {
+                inner.notify.notify_one();
             }
         }
     }

@@ -105,7 +105,10 @@ impl snow::types::Hash for Blake3Hash {
 
     fn result(&mut self, out: &mut [u8]) {
         // snow 以 MAXHASHLEN(64) 缓冲调用，仅前 hash_len(32) 字节有效。
-        out[..32].copy_from_slice(self.hasher.finalize().as_bytes());
+        // finalize_reset：hmac() 的两轮 result 之间要求 hash 自复位。
+        let h = self.hasher.finalize();
+        out[..32].copy_from_slice(h.as_bytes());
+        self.hasher.reset();
     }
 }
 

@@ -1,10 +1,16 @@
 //! XhttpConn：xhttp 客户端核心。spec §6.3/§6.4/§6.5。
 //!
-//! 简化架构：使用 channel 而不是共享状态，避免复杂的锁问题。
+//! 架构：共享状态（tokio Mutex，持有握手后的 Noise `TransportState`）+
+//! 后台聚合/心跳循环 + 每个 POST 一个发送任务（含重试策略）+ 下行解密任务，
+//! 经 mpsc 事件通道向 `XhttpConn` 上抛数据与会话死亡。
+//!
+//! snow 0.10 的 `TransportState` 在握手完成后同时持有发送/接收两个
+//! cipherstate（nonce 独立计数），`write_message` / `read_message` 分别走
+//! 各自一侧——上行加密与下行解密共用这一份状态，由 Mutex 串行化。
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -12,7 +18,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{Instant, interval};
 
 use wsieve_transport::HttpTransport;
@@ -25,7 +31,15 @@ const MAX_INFLIGHT: usize = 8;
 const AGGREGATE_MS: u64 = 4;
 const AGGREGATE_BYTES: usize = 64_000;
 const IDLE_HEARTBEAT_MS: u64 = 60_000;
+/// 空闲后首包立即发：距上次 flush 超过该阈值且缓冲非空 → 不等 4ms tick。
+const IDLE_FLUSH_THRESHOLD: Duration = Duration::from_millis(50);
+/// 单 POST body 上限 1 MB（spec §6.4）。单个 TU 密文 ≤ 65537 字节，
+/// 15 个 TU（≤ 983 055 B）必然落在 1 MB 内。
+const MAX_TUS_PER_POST: usize = 15;
 const SID_LEN: usize = 16;
+
+const RETRY_MAX: u8 = 2;
+const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 
 pub struct UpstreamCfg {
     pub server_pub: [u8; 32],
@@ -65,20 +79,19 @@ pub struct XhttpConn {
     dead: bool,
 }
 
-struct ConnState {
-    sid: [u8; SID_LEN],
+/// 发送任务、聚合循环与下行任务共享的会话状态。
+struct SharedState {
     sid_b64: String,
-    seq: u64,
-    in_flight: HashMap<u64, WindowEntry>,
+    /// 下一个上行 seq（握手用 0，数据/心跳从 1 起）
+    next_seq: u64,
+    /// 在途窗口：seq -> 完整 POST 字节。重试原样重发同一字节，
+    /// 不重新加密（nonce 序 = TU 加密顺序 = seq 顺序，spec §6.4）。
+    in_flight: HashMap<u64, Bytes>,
     dead: bool,
     last_write: Instant,
-    tx_state: TransportState,
-}
-
-#[derive(Clone)]
-struct WindowEntry {
-    body: Bytes,
-    retry_count: u8,
+    last_flush: Instant,
+    /// 握手后的 Noise 状态：write_message = 上行加密，read_message = 下行解密
+    noise: TransportState,
 }
 
 impl XhttpConn {
@@ -127,25 +140,23 @@ impl XhttpConn {
         let msg2_plain = &msg2_buf[..msg2_plain_len];
         let msg2 = decode_msg2(msg2_plain)?;
 
-        let tx_state = client.into_transport_mode()?;
+        let shared = Arc::new(Mutex::new(SharedState {
+            sid_b64,
+            next_seq: 1,
+            in_flight: HashMap::new(),
+            dead: false,
+            last_write: Instant::now(),
+            last_flush: Instant::now(),
+            noise: client.into_transport_mode()?,
+        }));
 
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
 
-        let mut state = ConnState {
-            sid,
-            sid_b64,
-            seq: 0,
-            in_flight: HashMap::new(),
-            dead: false,
-            last_write: Instant::now(),
-            tx_state,
-        };
-
         // 启动后台任务
         let transport_clone = transport.clone();
         tokio::spawn(async move {
-            Self::background_task(state, transport_clone, cmd_rx, event_tx).await;
+            Self::background_task(shared, transport_clone, cmd_rx, event_tx).await;
         });
 
         Ok((Self {
@@ -160,7 +171,7 @@ impl XhttpConn {
     }
 
     async fn background_task<T: HttpTransport + 'static>(
-        mut state: ConnState,
+        shared: Arc<Mutex<SharedState>>,
         transport: Arc<T>,
         mut cmd_rx: mpsc::Receiver<Command>,
         event_tx: mpsc::Sender<Event>,
@@ -170,20 +181,31 @@ impl XhttpConn {
         let mut heartbeat_interval = interval(Duration::from_millis(IDLE_HEARTBEAT_MS));
 
         // 启动下行任务
-        let downlink_event_tx = event_tx.clone();
-        let downlink_path = format!("/api/events?sid={}", state.sid_b64);
+        let downlink_path = format!("/api/events?sid={}", shared.lock().await.sid_b64);
         let transport_clone = transport.clone();
+        let shared_clone = shared.clone();
+        let downlink_event_tx = event_tx.clone();
         tokio::spawn(async move {
-            Self::downlink_task(transport_clone, downlink_path, downlink_event_tx).await;
+            Self::downlink_task(transport_clone, downlink_path, shared_clone, downlink_event_tx).await;
         });
 
         loop {
+            if shared.lock().await.dead {
+                let _ = event_tx.try_send(Event::SessionDead);
+                return;
+            }
+
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(Command::WriteData(data)) => {
+                            let mut st = shared.lock().await;
+                            st.last_write = Instant::now();
                             agg_buffer.extend_from_slice(&data);
-                            state.last_write = Instant::now();
+                            // 空闲后首包立即发：距上次 flush 超阈值 → 不等 4ms tick
+                            if st.last_flush.elapsed() >= IDLE_FLUSH_THRESHOLD {
+                                Self::flush(&shared, &mut st, &mut agg_buffer, &transport, &event_tx);
+                            }
                         }
                         None => {
                             return;
@@ -191,87 +213,85 @@ impl XhttpConn {
                     }
                 }
                 _ = ticker.tick() => {
-                    if !agg_buffer.is_empty() {
-                        let len = agg_buffer.len();
-                        let elapsed = state.last_write.elapsed();
-                        let should_send = len >= AGGREGATE_BYTES || elapsed >= Duration::from_millis(AGGREGATE_MS);
-
-                        if should_send && state.in_flight.len() < MAX_INFLIGHT {
-                            let seq = state.seq;
-                            state.seq += 1;
-
-                            let data = std::mem::take(&mut agg_buffer);
-
-                            let body = Self::encode_tus(&mut state.tx_state, &data);
-                            state.in_flight.insert(seq, WindowEntry {
-                                body: body.clone(),
-                                retry_count: 0,
-                            });
-
-                            let sid_b64 = state.sid_b64.clone();
-                            let transport = transport.clone();
-                            let event_tx = event_tx.clone();
-
-                            tokio::spawn(async move {
-                                Self::send_post(transport, sid_b64, seq, body, event_tx).await;
-                            });
-
-                            state.last_write = Instant::now();
-                        }
+                    let mut st = shared.lock().await;
+                    let elapsed = st.last_write.elapsed();
+                    let should_send =
+                        agg_buffer.len() >= AGGREGATE_BYTES || elapsed >= Duration::from_millis(AGGREGATE_MS);
+                    if should_send {
+                        Self::flush(&shared, &mut st, &mut agg_buffer, &transport, &event_tx);
                     }
                 }
                 _ = heartbeat_interval.tick() => {
-                    let idle = state.last_write.elapsed() >= Duration::from_millis(IDLE_HEARTBEAT_MS);
-                    if idle && state.in_flight.len() < MAX_INFLIGHT {
-                        let seq = state.seq;
-                        state.seq += 1;
-
-                        let frame = Frame::Padding;
-                        let plain = encode_frame(&frame, &mut rand::rng()).unwrap();
-
-                        let mut cipher_buf = vec![0u8; 65535];
-                        let cipher_len = state.tx_state.write_message(&plain, &mut cipher_buf).unwrap();
-                        let cipher = &cipher_buf[..cipher_len];
-
-                        let mut tu = Vec::with_capacity(2 + cipher.len());
-                        tu.extend_from_slice(&(cipher.len() as u16).to_be_bytes());
-                        tu.extend_from_slice(cipher);
-
-                        let body = Bytes::from(tu);
-
-                        state.in_flight.insert(seq, WindowEntry {
-                            body: body.clone(),
-                            retry_count: 0,
-                        });
-
-                        let sid_b64 = state.sid_b64.clone();
-                        let transport = transport.clone();
-                        let event_tx = event_tx.clone();
-
-                        tokio::spawn(async move {
-                            Self::send_post(transport, sid_b64, seq, body, event_tx).await;
-                        });
+                    let mut st = shared.lock().await;
+                    let idle = st.last_write.elapsed() >= Duration::from_millis(IDLE_HEARTBEAT_MS);
+                    if idle {
+                        // 心跳 PADDING TU：与数据完全相同的窗口/seq 路径，无旁路（spec §6.5）
+                        let tu = Self::encode_single_tu(&mut st, &Frame::Padding);
+                        let seq = st.next_seq;
+                        st.next_seq += 1;
+                        st.in_flight.insert(seq, tu.clone());
+                        let sid_b64 = st.sid_b64.clone();
+                        drop(st);
+                        Self::spawn_send(transport.clone(), shared.clone(), sid_b64, seq, tu, event_tx.clone());
                     }
                 }
             }
-
-            if state.dead {
-                let _ = event_tx.send(Event::SessionDead).await;
-                return;
-            }
         }
+    }
+
+    /// 把聚合缓冲编码为一个 POST 的 TU 串并发送（窗口允许时）。
+    /// 单 POST ≤ MAX_TUS_PER_POST 个 TU（≤ 1 MB），剩余留给下次 flush。
+    fn flush<T: HttpTransport + 'static>(
+        shared: &Arc<Mutex<SharedState>>,
+        st: &mut SharedState,
+        agg_buffer: &mut Vec<u8>,
+        transport: &Arc<T>,
+        event_tx: &mpsc::Sender<Event>,
+    ) {
+        if agg_buffer.is_empty() || st.dead || st.in_flight.len() >= MAX_INFLIGHT {
+            return;
+        }
+        let cap = MAX_TUS_PER_POST * MAX_PAYLOAD;
+        let take = agg_buffer.len().min(cap);
+        let data: Vec<u8> = agg_buffer.drain(..take).collect();
+
+        let body = Self::encode_tus(&mut st.noise, &data);
+        let seq = st.next_seq;
+        st.next_seq += 1;
+        st.in_flight.insert(seq, body.clone());
+        st.last_flush = Instant::now();
+        let sid_b64 = st.sid_b64.clone();
+
+        Self::spawn_send(transport.clone(), shared.clone(), sid_b64, seq, body, event_tx.clone());
+    }
+
+    fn spawn_send<T: HttpTransport + 'static>(
+        transport: Arc<T>,
+        shared: Arc<Mutex<SharedState>>,
+        sid_b64: String,
+        seq: u64,
+        body: Bytes,
+        event_tx: mpsc::Sender<Event>,
+    ) {
+        tokio::spawn(async move {
+            if send_post(transport, sid_b64, seq, body, shared).await == PostOutcome::Fatal {
+                let _ = event_tx.try_send(Event::SessionDead);
+            }
+        });
     }
 
     async fn downlink_task<T: HttpTransport + 'static>(
         transport: Arc<T>,
         path: String,
+        shared: Arc<Mutex<SharedState>>,
         event_tx: mpsc::Sender<Event>,
     ) {
         let stream = match transport.get_stream(&path).await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("downlink GET failed: {}", e);
-                let _ = event_tx.send(Event::SessionDead).await;
+                kill_session(&shared).await;
+                let _ = event_tx.try_send(Event::SessionDead);
                 return;
             }
         };
@@ -284,23 +304,49 @@ impl XhttpConn {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("downlink stream error: {}", e);
-                    let _ = event_tx.send(Event::SessionDead).await;
-                    return;
+                    break;
                 }
             };
 
-            let tus = decoder.push(&chunk);
-
-            for tu in tus {
-                // 测试阶段：直接解析帧（跳过解密）
-                let frame = match decode_frame(&tu[2..]) {
-                    Ok(f) => f,
-                    Err(_) => continue,
+            // TuDecoder 返回的每个元素是完整 TU（含 2 字节长度前缀）：
+            // 先剥前缀取密文体，再走 Noise transport-state read_message 解密
+            //（spec §6.1，生产路径，禁止跳过解密直接解帧）。
+            for tu in decoder.push(&chunk) {
+                if tu.len() < 2 {
+                    continue;
+                }
+                let tu_cipher = &tu[2..];
+                let frame = {
+                    let mut st = shared.lock().await;
+                    if st.dead {
+                        return;
+                    }
+                    let mut plain_buf = vec![0u8; 65535];
+                    let n = match st.noise.read_message(tu_cipher, &mut plain_buf) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            eprintln!("downlink TU decrypt failed");
+                            drop(st);
+                            kill_session(&shared).await;
+                            let _ = event_tx.try_send(Event::SessionDead);
+                            return;
+                        }
+                    };
+                    match decode_frame(&plain_buf[..n]) {
+                        Ok(f) => f,
+                        Err(_) => {
+                            eprintln!("downlink frame decode failed");
+                            drop(st);
+                            kill_session(&shared).await;
+                            let _ = event_tx.try_send(Event::SessionDead);
+                            return;
+                        }
+                    }
                 };
 
                 match frame {
                     Frame::Data(data) => {
-                        if event_tx.send(Event::DataReceived(data)).await.is_err() {
+                        if event_tx.try_send(Event::DataReceived(data)).is_err() {
                             return;
                         }
                     }
@@ -309,10 +355,23 @@ impl XhttpConn {
             }
         }
 
-        let _ = event_tx.send(Event::SessionDead).await;
+        // 流结束/错误 → 断会话（spec §9.1）
+        kill_session(&shared).await;
+        let _ = event_tx.try_send(Event::SessionDead);
     }
 
-    fn encode_tus(tx_state: &mut TransportState, data: &[u8]) -> Bytes {
+    fn encode_single_tu(st: &mut SharedState, frame: &Frame) -> Bytes {
+        let plain = encode_frame(frame, &mut rand::rng()).expect("padding frame encodes");
+        let mut cipher_buf = vec![0u8; 65535];
+        let cipher_len = st.noise.write_message(&plain, &mut cipher_buf)
+            .expect("transport encrypt");
+        let mut tu = Vec::with_capacity(2 + cipher_len);
+        tu.extend_from_slice(&(cipher_len as u16).to_be_bytes());
+        tu.extend_from_slice(&cipher_buf[..cipher_len]);
+        Bytes::from(tu)
+    }
+
+    fn encode_tus(noise: &mut TransportState, data: &[u8]) -> Bytes {
         let mut out = Vec::new();
         let mut remaining = data;
 
@@ -325,44 +384,89 @@ impl XhttpConn {
             let plain = encode_frame(&frame, &mut rand::rng()).unwrap();
 
             let mut cipher_buf = vec![0u8; 65535];
-            let cipher_len = tx_state.write_message(&plain, &mut cipher_buf).unwrap();
+            let cipher_len = noise.write_message(&plain, &mut cipher_buf).unwrap();
             let cipher = &cipher_buf[..cipher_len];
 
-            out.extend_from_slice(&(cipher.len() as u16).to_be_bytes());
+            out.extend_from_slice(&(cipher_len as u16).to_be_bytes());
             out.extend_from_slice(cipher);
         }
 
         Bytes::from(out)
     }
+}
 
-    async fn send_post<T: HttpTransport + 'static>(
-        transport: Arc<T>,
-        sid_b64: String,
-        seq: u64,
-        body: Bytes,
-        event_tx: mpsc::Sender<Event>,
-    ) {
-        let path = format!("/api/sync?n={}&sid={}", seq, sid_b64);
+/// send_post 的结局
+#[derive(Debug, PartialEq, Eq)]
+enum PostOutcome {
+    /// 约定的成功响应（n≥1: 204+空body；n=0: 200+合法 msg2）→ 已释放窗口槽
+    Delivered,
+    /// 会话已死亡：传输层错误/超时/5xx 重试 ≤2 次（指数退避）仍失败，
+    /// 或收到非约定响应（立即，不重试）→ 调用方据此上抛 SessionDead
+    Fatal,
+}
 
-        let result = transport.post(&path, body.clone()).await;
+/// 发送单个 POST（含完整重试策略，spec §6.4）。窗口槽持有完整 POST 字节，
+/// 重试原样重发同一 seq 同一字节——绝不重新加密，nonce 序不乱。
+async fn send_post<T: HttpTransport + 'static>(
+    transport: Arc<T>,
+    sid_b64: String,
+    seq: u64,
+    body: Bytes,
+    shared: Arc<Mutex<SharedState>>,
+) -> PostOutcome {
+    let path = format!("/api/sync?n={}&sid={}", seq, sid_b64);
 
-        let is_ok = match result {
+    let mut attempt: u8 = 0;
+    let mut backoff = RETRY_BACKOFF_INITIAL;
+
+    loop {
+        let retryable = match transport.post(&path, body.clone()).await {
+            // 传输层错误/超时 → 不知是否送达 → 重试
+            Err(_) => true,
             Ok(reply) => {
                 if seq == 0 {
-                    reply.status == 200
-                } else {
-                    reply.status == 204 && reply.body.is_empty()
+                    // n=0 约定响应：200 + 合法 msg2（msg2 合法性在 connect 里验证）
+                    if reply.status == 200 {
+                        let mut st = shared.lock().await;
+                        st.in_flight.remove(&seq);
+                        return PostOutcome::Delivered;
+                    }
+                    return fatal(&shared).await;
                 }
+                if reply.status == 204 && reply.body.is_empty() {
+                    // 送达（或被去重，等价）→ 释放窗口槽
+                    let mut st = shared.lock().await;
+                    st.in_flight.remove(&seq);
+                    return PostOutcome::Delivered;
+                }
+                // 5xx → 不知是否送达 → 重试；其余一切 → 会话失效，不重试
+                reply.status >= 500
             }
-            Err(_) => false,
         };
 
-        if is_ok {
-            return;
+        if retryable && attempt < RETRY_MAX {
+            attempt += 1;
+            tokio::time::sleep(backoff).await;
+            backoff *= 4; // 100ms → 400ms
+            continue;
         }
 
-        let _ = event_tx.send(Event::SessionDead).await;
+        // 重试耗尽或非约定响应 → 断会话
+        return fatal(&shared).await;
     }
+}
+
+async fn fatal(shared: &Arc<Mutex<SharedState>>) -> PostOutcome {
+    let mut st = shared.lock().await;
+    st.dead = true;
+    st.in_flight.clear();
+    PostOutcome::Fatal
+}
+
+async fn kill_session(shared: &Arc<Mutex<SharedState>>) {
+    let mut st = shared.lock().await;
+    st.dead = true;
+    st.in_flight.clear();
 }
 
 impl AsyncRead for XhttpConn {
@@ -387,18 +491,19 @@ impl AsyncRead for XhttpConn {
             }
         }
 
-        if self.dead {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "session dead",
-            )));
-        }
-
+        // 先吐缓冲里的数据再报死亡（会话死亡前到达的数据仍可读）
         if !self.read_buffer.is_empty() {
             let n = self.read_buffer.len().min(buf.remaining());
             let data = self.read_buffer.drain(..n).collect::<Vec<_>>();
             buf.put_slice(&data);
             return Poll::Ready(Ok(()));
+        }
+
+        if self.dead {
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "session dead",
+            )));
         }
 
         Poll::Pending
@@ -407,7 +512,7 @@ impl AsyncRead for XhttpConn {
 
 impl AsyncWrite for XhttpConn {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
