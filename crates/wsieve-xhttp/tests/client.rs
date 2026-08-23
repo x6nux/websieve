@@ -223,11 +223,7 @@ impl ServerView {
 
 /// 把 POST body 解析为 TU 密文体列表。
 fn split_tus(body: &[u8]) -> Vec<Vec<u8>> {
-    let mut dec = TuDecoder::new();
-    // TuDecoder 输入带 2 字节前缀整体流——直接喂 body
-    let mut feed = body;
-    let _ = &mut feed;
-    // 重新实现：按前缀切
+    // 按前缀切出各 TU 的密文体（不含 2 字节长度前缀）
     let mut out = Vec::new();
     let mut i = 0usize;
     while i + 2 <= body.len() {
@@ -238,7 +234,6 @@ fn split_tus(body: &[u8]) -> Vec<Vec<u8>> {
         out.push(body[i + 2..i + 2 + len].to_vec());
         i += 2 + len;
     }
-    let _ = dec.push(b"\x00\x00"); // 占位使用，避免未用警告
     out
 }
 
