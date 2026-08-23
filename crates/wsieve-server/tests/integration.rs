@@ -45,6 +45,7 @@ async fn echo_server() -> SocketAddr {
     addr
 }
 
+#[derive(Clone)]
 struct TestRig {
     addr: SocketAddr,
     client_priv: [u8; 32],
@@ -366,4 +367,51 @@ async fn probing_equivalence() {
     assert_eq!(a, cc, "垃圾 vs 路径扫描响应必须一致");
     assert_eq!(a.0, 404);
     // (b) 与 (a) 同为伪装：重放未产生 200/会话态
+}
+
+/// 7. 并发会话唤醒回归：单 rig（单 AppState/SessionStore/axum）上 5 个并发
+///    客户端会话（同一 mux：Yamux——测的是 SessionStore 而非 mux 矩阵），
+///    各自写独特 pattern 经共享 echo 服务器回显。全部 15s 内完成。
+///    回归背景：SessionStore 曾用单个全局 Notify，push_post 的 notify_one
+///    可能被无关会话的读者消费，导致目标会话 read 永久挂起（修复前本测试
+///    会因某会话上行泵挂起而超时）。
+#[tokio::test]
+async fn concurrent_sessions_do_not_lose_wakeups() {
+    const N: usize = 5;
+    let rig = start_server().await;
+    let echo = echo_server().await;
+
+    // 关键时序：先让 5 个会话全部完成握手/attach 并开流（服务端每个会话的
+    // 上行 read 均已挂起在 Notify 上），再各自写数据——这正是全局 Notify 的
+    // notify_one 被无关会话读者抢走、目标会话永久沉睡的窗口。
+    let mut sessions = Vec::new();
+    for _ in 0..N {
+        let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
+        assert_eq!(chosen, MuxId::Yamux);
+        sessions.push(mux);
+    }
+    // 等待所有服务端读任务挂起（attach 完成、无数据可读）
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 反序写（session 4 先写、0 最后）：全局 Notify 的 notify_one 按 FIFO
+    // 唤醒队头读者，若队头不是目标会话，permit 被无关会话消费后重新排到
+    // 队尾——目标会话在被唤醒前一直沉睡。反序写使队头几乎必然不是目标，
+    // 稳定复现修复前的唤醒丢失。
+    let mut handles = Vec::new();
+    for (i, mux) in sessions.into_iter().enumerate() {
+        handles.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis((N - 1 - i) as u64 * 150)).await;
+            let tag = format!("concurrent-session-{i}-payload");
+            let got = echo_roundtrip(mux.as_ref(), echo, tag.as_bytes()).await;
+            assert_eq!(got, tag.as_bytes(), "session {i} 回显不一致");
+        }));
+    }
+
+    let all = futures::future::join_all(handles);
+    let results = tokio::time::timeout(Duration::from_secs(15), all)
+        .await
+        .expect("15s 内 5 个并发会话都应完成（唤醒丢失回归）");
+    for (i, r) in results.into_iter().enumerate() {
+        r.unwrap_or_else(|e| panic!("session {i} 任务失败: {e}"));
+    }
 }
