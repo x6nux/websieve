@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "websieve",
+  "version": "0.1.0",
+  "identifier": "org.websieve.app",
+  "build": {},
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "websieve",
+        "width": 420,
+        "height": 200,
+        "resizable": true,
+        "visible": true,
+        "backgroundThrottling": "disabled"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

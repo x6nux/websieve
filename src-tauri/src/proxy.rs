@@ -1,0 +1,204 @@
+//! 客户端总装（spec §4 分层：socks5 → mux → noise → xhttp → fetch）。
+//!
+//! 会话生命周期（spec §9.1）：transport 死亡/会话死亡 → 拆 mux → 重载
+//! WebView 页面（emitter 随 initialization_script 重新注入）→ 重新握手 →
+//! 重建。连续失败指数退避 100ms → 30s 封顶，成功即重置。
+//!
+//! 关键结构：每代会话一个新的 `WebViewTransport`（自带 pending 表与死亡
+//! 标记），其 `core` 通过 `tauri::Manager::manage` 注册为该代的命令状态，
+//! IPC 命令操作「当前代」。会话死亡信号 = `Notify`（由 transport core 的
+//! 死亡监视任务或握手失败触发）。
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use tauri::Manager;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use wsieve_mux::{mux_factory, Mux, MuxStream};
+use wsieve_proto::addr::encode_addr;
+use wsieve_proto::hello::MuxId;
+use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
+
+use crate::bridge::{TransportCore, WebViewTransport};
+
+#[derive(Clone)]
+pub struct ProxyCfg {
+    pub server_pub: [u8; 32],
+    pub client_priv: [u8; 32],
+    pub mux_prefs: Vec<MuxId>,
+    pub socks_listen: String,
+}
+
+/// IPC 命令可见的「当前代」状态：emitter 的所有 invoke 都打到这里。
+pub struct CurrentCore(pub Arc<TransportCore>);
+
+fn emit_status(app: &tauri::AppHandle, msg: &str) {
+    tracing::info!("status: {msg}");
+    let _ = tauri::Emitter::emit(app, "wsieve-status", msg.to_string());
+}
+
+fn eval_fn(app: tauri::AppHandle) -> Box<dyn Fn(String) + Send + Sync> {
+    Box::new(move |js: String| {
+        if let Some(w) = app.get_webview_window("main") {
+            if let Err(e) = w.eval(&js) {
+                tracing::warn!("eval failed: {e}");
+            }
+        }
+    })
+}
+
+/// SOCKS5 handler：从当前会话代的 mux 开流，首帧 TargetAddr。
+fn socks_handler(
+    mux: Arc<tokio::sync::RwLock<Option<Arc<dyn Mux>>>>,
+) -> impl Fn(wsieve_proto::addr::AddrPort) -> futures::future::BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>>
+       + Clone + Send + 'static {
+    move |target| {
+        let mux = mux.clone();
+        Box::pin(async move {
+            let guard = mux.read().await;
+            let Some(mux) = guard.clone() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no session",
+                ));
+            };
+            drop(guard);
+            let mut stream: MuxStream = mux
+                .open()
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let frame = encode_addr(&target);
+            stream
+                .write_all(&frame)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(bridge_duplex(stream).await)
+        })
+    }
+}
+
+/// 把 MuxStream 包成 socks5::serve 要的 DuplexStream：开一条本地 duplex，
+/// 两个桥接任务做双向 copy。首帧已由调用方写入，这里只搬字节。
+async fn bridge_duplex(stream: MuxStream) -> tokio::io::DuplexStream {
+    let (local, mut remote_end) = tokio::io::duplex(64 * 1024);
+    let mut stream = stream;
+    tokio::spawn(async move {
+        // remote_end <-> stream；local 返回给 socks5 层
+        let _ = tokio::io::copy_bidirectional(&mut remote_end, &mut stream).await;
+    });
+    local
+}
+
+/// 主循环：建会话 → 供 SOCKS5 → 死了重来（带退避）。
+pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&cfg.socks_listen).await?;
+    tracing::info!("SOCKS5 listening on {}", cfg.socks_listen);
+
+    let mux_slot: Arc<tokio::sync::RwLock<Option<Arc<dyn Mux>>>> =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let session_dead = Arc::new(Notify::new());
+
+    // SOCKS5 服务任务
+    tokio::spawn({
+        let mux_slot = mux_slot.clone();
+        async move {
+            let _ = wsieve_socks5::serve(listener, socks_handler(mux_slot)).await;
+        }
+    });
+
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        // 1. 等 WebView / emitter 就绪：本代 core 注册后等首个心跳
+        let transport = WebViewTransport::new(eval_fn(app.clone()));
+        let core = Arc::new(TransportCore::new_beat_pending());
+        transport.set_core(core.clone());
+        app.manage(CurrentCore(core.clone()));
+
+        emit_status(&app, "waiting for webview heartbeat");
+        if !wait_first_heartbeat(&core, Duration::from_secs(60)).await {
+            emit_status(&app, "webview heartbeat timeout");
+        }
+
+        // 2. 死亡监视：心跳超时 → 标死 → 会话重来（spec §9.1）
+        {
+            let core = core.clone();
+            let session_dead = session_dead.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(crate::bridge::HEARTBEAT_STALE).await;
+                    if core.heartbeat_stale() {
+                        core.mark_dead("heartbeat stale").await;
+                        session_dead.notify_one();
+                        return;
+                    }
+                    if core.is_dead() {
+                        session_dead.notify_one();
+                        return;
+                    }
+                }
+            });
+        }
+
+        // 3. 握手 + mux
+        emit_status(&app, "handshaking");
+        let attempt: anyhow::Result<Box<dyn Mux>> = async {
+            let (conn, neg) = XhttpConn::connect(
+                transport.clone(),
+                &UpstreamCfg {
+                    server_pub: cfg.server_pub,
+                    client_priv: cfg.client_priv,
+                    mux_prefs: cfg.mux_prefs.clone(),
+                },
+            )
+            .await?;
+            if neg.fallback {
+                emit_status(&app, "WARN: mux fallback (server did not honor prefs)");
+            }
+            let io: MuxStream = Box::new(conn);
+            let mux = mux_factory(neg.mux_id, io).await?;
+            Ok(mux)
+        }
+        .await;
+
+        match attempt {
+            Ok(mux) => {
+                backoff = Duration::from_millis(100);
+                emit_status(&app, "connected");
+                *mux_slot.write().await = Some(Arc::from(mux));
+                // 会话死亡信号：XhttpConn 内部断开时其流全部失败，但主循环
+                // 通过心跳/transport 死亡感知。等通知。
+                session_dead.notified().await;
+                emit_status(&app, "session dead, reloading");
+                *mux_slot.write().await = None;
+            }
+            Err(e) => {
+                tracing::warn!("session attempt failed: {e:#}");
+            }
+        }
+
+        // 4. 拆干净 + 重载页面（emitter 随 initialization_script 重注入）
+        core.mark_dead("session teardown").await;
+        if let Some(w) = app.get_webview_window("main") {
+            let _ = w.eval("window.location.reload()");
+        }
+        emit_status(&app, &format!("retrying in {:?}", backoff));
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// 首个心跳：`TransportCore::new_with_beat_pending` 把 last_heartbeat 初始化
+/// 为「远古」，因此 stale()==false ⇔ 已收到过真实心跳。
+async fn wait_first_heartbeat(core: &Arc<TransportCore>, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if !core.heartbeat_stale() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    !core.heartbeat_stale()
+}
+
