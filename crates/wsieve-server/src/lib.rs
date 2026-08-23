@@ -316,6 +316,13 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
 fn spawn_keepalive(state: Arc<AppState>, sid: Sid) {
     tokio::spawn(async move {
         use rand::Rng;
+        // 统一退出清理：会话侧表（noise/downlink_tx/downlink_rx）与 SessionStore
+        // 条目对齐，防止 GC 后的孤儿条目慢泄漏（评审 Important #1）。
+        async fn cleanup(state: &Arc<AppState>, sid: &Sid) {
+            state.noise.lock().await.remove(sid);
+            state.downlink_tx.lock().await.remove(sid);
+            state.downlink_rx.lock().await.remove(sid);
+        }
         loop {
             let delay_ms =
                 rand::rng().random_range(state.keepalive.min_ms..=state.keepalive.max_ms);
@@ -324,7 +331,8 @@ fn spawn_keepalive(state: Arc<AppState>, sid: Sid) {
             let plain = {
                 let mut noise_guard = state.noise.lock().await;
                 let Some(noise) = noise_guard.get_mut(&sid) else {
-                    return; // 会话已不存在
+                    cleanup(&state, &sid).await; // 会话已不存在
+                    return;
                 };
                 let mut rng = rand::rng();
                 let plain = match encode_frame(&Frame::Padding, &mut rng) {
@@ -342,10 +350,12 @@ fn spawn_keepalive(state: Arc<AppState>, sid: Sid) {
             };
             let dl = state.downlink_tx.lock().await;
             let Some(tx) = dl.get(&sid) else {
+                cleanup(&state, &sid).await;
                 return;
             };
             if tx.send(Bytes::from(plain)).await.is_err() {
-                return; // GET 已断开
+                cleanup(&state, &sid).await; // GET 已断开
+                return;
             }
         }
     });
