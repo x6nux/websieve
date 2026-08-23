@@ -4,3 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+wsieve-proto = { path = "../wsieve-proto" }
+wsieve-transport = { path = "../wsieve-transport" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+dashmap = "6"
+lru = "0.12"
+tracing = "0.1"
+base64 = "0.22"
+snow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
