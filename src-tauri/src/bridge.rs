@@ -206,13 +206,33 @@ impl HttpTransport for WebViewTransport {
         }
         let id = core.alloc_request_id();
         let rx = core.register_stream(id).await;
+        // 路径转义：{path:?} 的 Rust Debug 转义对非 ASCII 会产 `\u{...}`，
+        // 非合法 JS。实际 path 均为本项目 ASCII 常量，这里换成显式 JS 字面量
+        // 转义（引号/反斜杠），消除隐患。
+        let js_path: String = path.chars().map(|c| match c {
+            '\\' => "\\\\".to_string(),
+            '"' => "\\\"".to_string(),
+            c if (c as u32) < 0x20 || (c as u32) > 0x7e => format!("\\u{:04x}", c as u32),
+            c => c.to_string(),
+        }).collect();
         let js = format!(
-            "window.__wsieve && window.__wsieve.openStream({id}, {path:?});"
+            "window.__wsieve && window.__wsieve.openStream({id}, \"{js_path}\");"
         );
         (self.inner.eval)(js);
+        // 流被 drop（XhttpConn 会话死亡）时通知 JS 取消下载（spec §6.5）：
+        // reader.cancel() 先、controller.abort() 后（emitter 侧钉死顺序）。
+        let inner = Arc::clone(&self.inner);
+        let cancel = move || {
+            (inner.eval)(format!("window.__wsieve && window.__wsieve.cancelStream({id});"));
+        };
+        let inner_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         use futures::StreamExt as _;
-        Ok(tokio_stream::wrappers::ReceiverStream::new(rx)
+        Ok(inner_stream
             .take_while(|item: &anyhow::Result<Bytes>| futures::future::ready(item.is_ok()))
+            .chain(futures::stream::once(async move {
+                cancel();
+                Err(anyhow::anyhow!("stream ended"))
+            }))
             .boxed())
     }
 }

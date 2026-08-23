@@ -89,12 +89,12 @@ async fn wsieve_heartbeat(state: tauri::State<'_, proxy::CurrentCore>) -> Result
 }
 
 /// 上行 POST 结果与下行 chunk 的统一二进制入口。
-/// 帧格式（16B 头，全大端）：
-///   u32 magic = 0x57534945 ("WSIE")
-///   u8  kind  = 1 post_ok / 2 post_err / 3 chunk / 4 stream_end / 5 stream_err
-///   u32 request_id
-///   u16 status（仅 kind=1）
-///   u32 reserved
+/// 帧格式（16B 头，全大端，与 emitter.js 的 frame() 逐字段对齐）：
+///   [0..4]  magic "WSIE"
+///   [4]     kind = 1 post_ok / 2 post_err / 3 chunk / 4 stream_end / 5 stream_err
+///   [5..9]  u32 request_id
+///   [9..11] u16 status（仅 kind=1）
+///   [11..16] 保留（填充至 16B）
 /// 之后为原始字节（kind=1 的 body / kind=3 的 chunk，其余无 payload）。
 #[tauri::command]
 async fn wsieve_raw_post(state: tauri::State<'_, proxy::CurrentCore>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
