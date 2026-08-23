@@ -151,12 +151,13 @@ impl tokio::io::AsyncWrite for H2Stream {
         }
         let mut capacity = self.send.as_ref().expect("send half").capacity();
         if capacity == 0 {
-            self.send.as_mut().expect("send half").reserve_capacity(buf.len());
+            self.send
+                .as_mut()
+                .expect("send half")
+                .reserve_capacity(buf.len());
             capacity = match self.send.as_mut().expect("send half").poll_capacity(cx) {
                 Poll::Ready(Some(Ok(n))) => n,
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::other(e)))
-                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(std::io::Error::other(e))),
                 Poll::Ready(None) => {
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -176,17 +177,11 @@ impl tokio::io::AsyncWrite for H2Stream {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(())) // h2 内部自动刷新
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         if !self.shutdown_sent {
             self.send
                 .as_mut()
@@ -201,7 +196,9 @@ impl tokio::io::AsyncWrite for H2Stream {
 
 impl Drop for H2Stream {
     fn drop(&mut self) {
-        let Some(mut send) = self.send.take() else { return };
+        let Some(mut send) = self.send.take() else {
+            return;
+        };
         let recv = self.recv.take();
         if !self.shutdown_sent {
             // 未正常关闭就 Drop：显式取消，释放对端资源
@@ -230,9 +227,7 @@ impl tokio::io::AsyncRead for H2Stream {
         if self.buffer.is_empty() {
             match self.recv.as_mut().expect("recv half").poll_data(cx) {
                 Poll::Ready(Some(Ok(chunk))) => self.buffer = chunk,
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(std::io::Error::other(e)))
-                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(std::io::Error::other(e))),
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
                 Poll::Pending => return Poll::Pending,
             }
@@ -254,4 +249,3 @@ impl tokio::io::AsyncRead for H2Stream {
         Poll::Ready(Ok(()))
     }
 }
-

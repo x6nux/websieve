@@ -153,6 +153,13 @@ impl XhttpConn {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
 
+        if msg2.fallback {
+            tracing::warn!(
+                "服务端不支持 {:?}，已回退 yamux（性能可能下降）",
+                cfg.mux_prefs.first()
+            );
+        }
+
         // 启动后台任务
         let transport_clone = transport.clone();
         tokio::spawn(async move {

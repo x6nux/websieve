@@ -72,9 +72,7 @@ pub fn encode_addr(a: &AddrPort) -> Vec<u8> {
 /// 解码。返回地址与消耗的字节数；尾部多余字节（同一 frame 里的后续数据）被忽略但通过
 /// `consumed` 上报，调用方自行切片。
 pub fn decode_addr(b: &[u8]) -> Result<(AddrPort, usize), AddrError> {
-    let need = |have: usize, need: usize| -> AddrError {
-        AddrError::Truncated { need, have }
-    };
+    let need = |have: usize, need: usize| -> AddrError { AddrError::Truncated { need, have } };
     if b.is_empty() {
         return Err(need(0, 1));
     }
@@ -130,7 +128,10 @@ mod tests {
 
     #[test]
     fn roundtrip_v4() {
-        let a = AddrPort { addr: TargetAddr::V4([1, 2, 3, 4]), port: 80 };
+        let a = AddrPort {
+            addr: TargetAddr::V4([1, 2, 3, 4]),
+            port: 80,
+        };
         let b = encode_addr(&a);
         assert_eq!(&b, &[0x01, 1, 2, 3, 4, 0, 80]);
         let (d, n) = decode_addr(&b).unwrap();
@@ -140,7 +141,10 @@ mod tests {
 
     #[test]
     fn roundtrip_domain() {
-        let a = AddrPort { addr: TargetAddr::Domain("example.com".into()), port: 443 };
+        let a = AddrPort {
+            addr: TargetAddr::Domain("example.com".into()),
+            port: 443,
+        };
         let (d, n) = decode_addr(&encode_addr(&a)).unwrap();
         assert_eq!(d, a);
         assert_eq!(n, 1 + 1 + 11 + 2);
@@ -148,7 +152,10 @@ mod tests {
 
     #[test]
     fn roundtrip_v6() {
-        let a = AddrPort { addr: TargetAddr::V6([0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), port: 22 };
+        let a = AddrPort {
+            addr: TargetAddr::V6([0x20, 0x01, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            port: 22,
+        };
         let (d, n) = decode_addr(&encode_addr(&a)).unwrap();
         assert_eq!(d, a);
         assert_eq!(n, 19);
@@ -156,7 +163,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_atyp() {
-        assert!(matches!(decode_addr(&[0x02, 1, 2, 3, 4, 0, 80]), Err(AddrError::BadAtyp(0x02))));
+        assert!(matches!(
+            decode_addr(&[0x02, 1, 2, 3, 4, 0, 80]),
+            Err(AddrError::BadAtyp(0x02))
+        ));
     }
 
     #[test]
@@ -164,16 +174,32 @@ mod tests {
         assert!(decode_addr(&[]).is_err());
         assert!(decode_addr(&[0x01, 1]).is_err());
         assert!(decode_addr(&[0x03, 5, b'a']).is_err());
-        assert!(decode_addr(&vec![0x04].iter().copied().chain(std::iter::repeat(0u8).take(15)).collect::<Vec<u8>>()[..]).is_err());
+        assert!(decode_addr(
+            &vec![0x04]
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(0u8).take(15))
+                .collect::<Vec<u8>>()[..]
+        )
+        .is_err());
         assert!(decode_addr(&[0x01, 1, 2, 3, 4, 0]).is_err()); // 缺 port 低字节
     }
 
     #[test]
     fn trailing_bytes_reported_in_consumed() {
-        let mut b = encode_addr(&AddrPort { addr: TargetAddr::V4([9, 9, 9, 9]), port: 53 });
+        let mut b = encode_addr(&AddrPort {
+            addr: TargetAddr::V4([9, 9, 9, 9]),
+            port: 53,
+        });
         b.extend_from_slice(b"extra payload");
         let (d, n) = decode_addr(&b).unwrap();
-        assert_eq!(d, AddrPort { addr: TargetAddr::V4([9, 9, 9, 9]), port: 53 });
+        assert_eq!(
+            d,
+            AddrPort {
+                addr: TargetAddr::V4([9, 9, 9, 9]),
+                port: 53
+            }
+        );
         assert_eq!(n, 7);
         assert_eq!(&b[n..], b"extra payload");
     }

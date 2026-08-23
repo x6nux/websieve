@@ -2624,6 +2624,9 @@ dependencies = [
 [[package]]
 name = "wsieve-server"
 version = "0.1.0"
+dependencies = [
+ "wsieve-proto",
+]
 
 [[package]]
 name = "wsieve-socks5"

@@ -333,13 +333,18 @@ async fn h2mux_capacity_exhaustion_blocks_not_errors() {
     let data = pattern_for(7, LEN);
 
     let writer = tokio::spawn(async move {
-        c.write_all(&data).await.expect("write should block, not error");
+        c.write_all(&data)
+            .await
+            .expect("write should block, not error");
         c.shutdown().await.ok();
     });
 
     // 服务端先睡 300ms 再读——期间 writer 不应出错退出
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!writer.is_finished(), "writer must still be pending on full window");
+    assert!(
+        !writer.is_finished(),
+        "writer must still be pending on full window"
+    );
 
     let mut got = 0usize;
     let mut chunk = [0u8; 8192];
@@ -353,4 +358,3 @@ async fn h2mux_capacity_exhaustion_blocks_not_errors() {
     assert_eq!(got, LEN, "all data after window release");
     writer.await.expect("writer join");
 }
-

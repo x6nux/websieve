@@ -11,12 +11,18 @@ fn roundtrip(a: AddrPort) {
 
 #[test]
 fn roundtrip_v4() {
-    roundtrip(AddrPort { addr: TargetAddr::V4([192, 168, 1, 1]), port: 8443 });
+    roundtrip(AddrPort {
+        addr: TargetAddr::V4([192, 168, 1, 1]),
+        port: 8443,
+    });
 }
 
 #[test]
 fn roundtrip_domain() {
-    roundtrip(AddrPort { addr: TargetAddr::Domain("example.com".into()), port: 443 });
+    roundtrip(AddrPort {
+        addr: TargetAddr::Domain("example.com".into()),
+        port: 443,
+    });
 }
 
 #[test]
@@ -46,10 +52,19 @@ fn rejects_truncated() {
 #[test]
 fn trailing_bytes_reported_in_consumed() {
     // mux 流首个 Data frame 里地址后可跟后续 payload：解码忽略但上报 consumed
-    let mut bytes = encode_addr(&AddrPort { addr: TargetAddr::V4([9, 9, 9, 9]), port: 53 });
+    let mut bytes = encode_addr(&AddrPort {
+        addr: TargetAddr::V4([9, 9, 9, 9]),
+        port: 53,
+    });
     bytes.extend_from_slice(b"extra payload");
     let (decoded, consumed) = decode_addr(&bytes).unwrap();
-    assert_eq!(decoded, AddrPort { addr: TargetAddr::V4([9, 9, 9, 9]), port: 53 });
+    assert_eq!(
+        decoded,
+        AddrPort {
+            addr: TargetAddr::V4([9, 9, 9, 9]),
+            port: 53
+        }
+    );
     assert_eq!(consumed, 7);
     assert_eq!(&bytes[consumed..], b"extra payload");
 }
