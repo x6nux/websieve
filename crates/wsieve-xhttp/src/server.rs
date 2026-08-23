@@ -78,6 +78,12 @@ const ATTACH_WINDOW_MS: u64 = 30_000;
 const UPSTREAM_IDLE_MS: u64 = 180_000;
 const MAX_BUFFERED_POSTS: usize = 30;
 
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionStore {
     pub fn new() -> Self {
         let inner = SessionStoreInner {
@@ -116,7 +122,7 @@ impl SessionStore {
     pub async fn push_post(&self, sid: &Sid, seq: u64, body: Bytes) -> Result<(), SessionGone> {
         let mut inner = self.inner.lock().await;
 
-        let session = inner.sessions.get_mut(&sid).ok_or(SessionGone)?;
+        let session = inner.sessions.get_mut(sid).ok_or(SessionGone)?;
 
         // 去重：seq < next_seq（已消费）或已在 heap → 丢弃，仍 Ok
         if seq < session.next_seq || session.heap.contains_key(&seq) {
@@ -132,7 +138,7 @@ impl SessionStore {
         // 检查缓冲上限：有空洞 + 堆大小 ≥ 30 → GC
         let has_hole = session.heap.keys().next().map(|k| *k != session.next_seq).unwrap_or(false);
         if has_hole && session.heap.len() > MAX_BUFFERED_POSTS {
-            inner.sessions.remove(&sid);
+            inner.sessions.remove(sid);
             inner.notify.notify_one();
             return Err(SessionGone);
         }

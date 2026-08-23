@@ -60,7 +60,7 @@ impl HttpTransport for ReqwestTransport {
         use futures::StreamExt;
         let s = resp
             .bytes_stream()
-            .map(|r| r.map_err(|e| anyhow::Error::new(e)));
+            .map(|r| r.map_err(anyhow::Error::new));
         Ok(s.boxed())
     }
 }
