@@ -37,11 +37,11 @@ impl Drop for DownlinkHandle {
         let store = self.store.clone();
         let sid = self.sid;
 
-        // 异步处理 GC
+        // 异步处理 GC（下行断开 → 立即回收，spec §9.4）
         tokio::spawn(async move {
             let mut inner = store.lock().await;
-            if inner.sessions.remove(&sid).is_some() {
-                inner.notify.notify_one();
+            if let Some(session) = inner.sessions.remove(&sid) {
+                session.notify.notify_one();
             }
         });
     }
@@ -59,13 +59,17 @@ struct Session {
     /// 创建时间（attach 窗口）
     created_at: Instant,
 
-    /// 读 waker
-    read_waker: Option<Waker>,
+    /// 本会话专属唤醒（数据到达/会话死亡）。per-session 是关键：
+    /// 全局 Notify 的 notify_one 会被无关会话的读者抢走造成唤醒丢失
+    /// （评审 Critical #1）。单读者下 permit 语义正确。
+    notify: Arc<Notify>,
 }
 
 struct SessionStoreInner {
     sessions: BTreeMap<Sid, Session>,
-    /// 会话增删/数据到达的全局通知（与 read_waker 配对）
+    /// 保留字段：会话表增删的全局通知（数据到达走 per-session Notify，
+    /// 见 Session::notify）。
+    #[allow(dead_code)]
     notify: Arc<Notify>,
 }
 
@@ -115,10 +119,9 @@ impl SessionStore {
                 attached: false,
                 last_upstream_at: Instant::now(),
                 created_at: Instant::now(),
-                read_waker: None,
+                notify: Arc::new(Notify::new()),
             },
         );
-        inner.notify.notify_one();
     }
 
     /// 推送 POST body（seq 已解析）
@@ -146,28 +149,27 @@ impl SessionStore {
             .map(|k| *k != session.next_seq)
             .unwrap_or(false);
         if has_hole && session.heap.len() > MAX_BUFFERED_POSTS {
-            inner.sessions.remove(sid);
-            inner.notify.notify_one();
+            let dead = inner.sessions.remove(sid).unwrap();
+            dead.notify.notify_one();
             return Err(SessionGone);
         }
 
-        // 唤醒读任务（新数据到达）
-        if let Some(waker) = session.read_waker.take() {
-            waker.wake();
-        }
-        inner.notify.notify_one();
-        #[cfg(any())]
-        eprintln!("");
+        // 唤醒本会话的读任务（精准唤醒，见 Session::notify 注释）
+        session.notify.notify_one();
         Ok(())
     }
 
     /// 读取数据（阻塞直到有数据或会话死亡）。
     /// 返回 0 表示 body 为空 POST（心跳）；调用方继续读即可。
     pub async fn read(&self, sid: &Sid, out: &mut [u8]) -> Result<usize, SessionGone> {
-        // Notify 句柄必须在 block 外持有：`Notified` future 借用 Notify 本体
+        // 本会话专属 Notify 句柄在锁外持有（Notified future 借用 Notify 本体）。
+        // 会话删除（SessionGone）由每次循环回查 sessions map 发现。
         let notify = {
             let inner = self.inner.lock().await;
-            Arc::clone(&inner.notify)
+            match inner.sessions.get(sid) {
+                Some(s) => Arc::clone(&s.notify),
+                None => return Err(SessionGone),
+            }
         };
         loop {
             {
@@ -191,7 +193,8 @@ impl SessionStore {
                 }
             }
 
-            // 无数据：挂起直到数据到达或会话被删除（两者都 notify）
+            // 无数据：挂起直到本会话数据到达或被删除（kill/GC 同样
+            // notify 本会话的 Notify；SessionGone 由循环回查发现）
             notify.notified().await;
         }
     }
@@ -200,11 +203,8 @@ impl SessionStore {
     pub async fn kill(&self, sid: &Sid) {
         let mut inner = self.inner.lock().await;
         if let Some(session) = inner.sessions.remove(sid) {
-            if let Some(w) = session.read_waker {
-                w.wake();
-            }
+            session.notify.notify_one();
         }
-        inner.notify.notify_one();
     }
 
     /// 存活会话数（测试/监控用）。
@@ -218,12 +218,9 @@ impl SessionStore {
         let sids: Vec<Sid> = inner.sessions.keys().copied().collect();
         for sid in sids {
             if let Some(session) = inner.sessions.remove(&sid) {
-                if let Some(w) = session.read_waker {
-                    w.wake();
-                }
+                session.notify.notify_one();
             }
         }
-        inner.notify.notify_one();
     }
 
     /// 绑定下行（返回句柄）
@@ -273,17 +270,10 @@ impl SessionStore {
                 }
             }
 
-            let mut woken = false;
             for sid in to_remove {
                 if let Some(session) = inner.sessions.remove(&sid) {
-                    if let Some(w) = session.read_waker {
-                        w.wake();
-                        woken = true;
-                    }
+                    session.notify.notify_one();
                 }
-            }
-            if woken {
-                inner.notify.notify_one();
             }
         }
     }
