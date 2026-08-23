@@ -16,3 +16,7 @@ smux = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-yamux = "0.3"
 wsieve-proto = { version = "0.1.0", path = "../wsieve-proto" }
+
+[dev-dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
