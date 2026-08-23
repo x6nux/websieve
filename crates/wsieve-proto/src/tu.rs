@@ -51,7 +51,7 @@ pub fn decode_frame(plain: &[u8]) -> Result<Frame, TuError> {
     }
     match ty {
         TYPE_DATA => Ok(Frame::Data(plain[FRAME_HEADER..FRAME_HEADER + p_len].to_vec())),
-        TYPE_PADDING => Ok(Frame::Padding),
+        TYPE_PADDING if p_len == 0 => Ok(Frame::Padding),
         other => Err(TuError::UnknownType(other)),
     }
 }
