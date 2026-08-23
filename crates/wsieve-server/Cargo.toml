@@ -5,3 +5,18 @@ edition = "2021"
 
 [dependencies]
 wsieve-proto = { version = "0.1.0", path = "../wsieve-proto" }
+wsieve-xhttp = { version = "0.1.0", path = "../wsieve-xhttp" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+bytes = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+snow = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+reqwest = { workspace = true }
+futures = { workspace = true }
