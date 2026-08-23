@@ -29,7 +29,7 @@ impl TokioYamux {
             tokio_yamux::Session::new_client(io, config)
         };
         let control = session.control();
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(64); // 容量 64：未 accept 的流超过此数时驱动任务背压（流不会丢，只是 open 侧变慢）
         let driver = tokio::spawn(async move {
             use futures::StreamExt;
             let mut session = session;

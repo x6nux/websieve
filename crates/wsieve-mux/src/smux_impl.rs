@@ -14,11 +14,9 @@ pub struct SmuxImpl {
 
 impl SmuxImpl {
     pub async fn new(io: MuxStream, server: bool) -> Result<Self> {
-        // 回环测试拉长 keepalive，避免空闲 ping 噪音
-        let config = smux::Config {
-            keep_alive_interval: std::time::Duration::from_secs(3600),
-            ..Default::default()
-        };
+        // 默认 keepalive：下层 XhttpConn 有自己的 TU 心跳（spec §6.5），
+        // 这里不额外叠加传输层 ping
+        let config = smux::Config::default();
         let session = if server {
             smux::Session::server(io, config).await?
         } else {

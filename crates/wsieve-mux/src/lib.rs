@@ -1,4 +1,6 @@
 //! 多路复用层（spec §7.1-§7.3）：`Mux` trait + 四个三方 crate 的薄适配。
+//! 注意：muxado 适配器含 sentinel 字节 workaround（懒 SYN），仅限本系统
+//! factory 配对使用，不可与第三方 raw muxado 端点互通。
 //!
 //! `Mux` 必须是 object-safe（运行时协商决定用哪种 mux）。
 
