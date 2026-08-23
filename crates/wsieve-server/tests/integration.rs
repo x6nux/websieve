@@ -346,7 +346,7 @@ async fn probing_equivalence() {
     // (c) 随机路径扫描
     let scan = c.get(format!("{base}/wp-admin/setup-config.php")).send().await.unwrap();
 
-    let norm = |mut r: reqwest::Response| async move {
+    let norm = |r: reqwest::Response| async move {
         let status = r.status().as_u16();
         let mut headers = Vec::new();
         for (k, v) in r.headers().iter() {
