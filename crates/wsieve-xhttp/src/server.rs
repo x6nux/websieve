@@ -6,7 +6,7 @@ use std::task::Waker;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
-use tokio::time::{Instant, interval, Duration};
+use tokio::time::{interval, Duration, Instant};
 
 /// 会话 ID（128-bit）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -107,14 +107,17 @@ impl SessionStore {
     /// 创建会话（握手成功后调用）
     pub async fn create(&self, sid: Sid) {
         let mut inner = self.inner.lock().await;
-        inner.sessions.insert(sid, Session {
-            next_seq: 0,
-            heap: BTreeMap::new(),
-            attached: false,
-            last_upstream_at: Instant::now(),
-            created_at: Instant::now(),
-            read_waker: None,
-        });
+        inner.sessions.insert(
+            sid,
+            Session {
+                next_seq: 0,
+                heap: BTreeMap::new(),
+                attached: false,
+                last_upstream_at: Instant::now(),
+                created_at: Instant::now(),
+                read_waker: None,
+            },
+        );
         inner.notify.notify_one();
     }
 
@@ -136,7 +139,12 @@ impl SessionStore {
         session.heap.insert(seq, body.clone());
 
         // 检查缓冲上限：有空洞 + 堆大小 ≥ 30 → GC
-        let has_hole = session.heap.keys().next().map(|k| *k != session.next_seq).unwrap_or(false);
+        let has_hole = session
+            .heap
+            .keys()
+            .next()
+            .map(|k| *k != session.next_seq)
+            .unwrap_or(false);
         if has_hole && session.heap.len() > MAX_BUFFERED_POSTS {
             inner.sessions.remove(sid);
             inner.notify.notify_one();
@@ -219,13 +227,18 @@ impl SessionStore {
 
             for (&sid, session) in &inner.sessions {
                 // GC 1: attach 窗口
-                if !session.attached && now.duration_since(session.created_at) > Duration::from_millis(ATTACH_WINDOW_MS) {
+                if !session.attached
+                    && now.duration_since(session.created_at)
+                        > Duration::from_millis(ATTACH_WINDOW_MS)
+                {
                     to_remove.push(sid);
                     continue;
                 }
 
                 // GC 2: 上行空闲
-                if now.duration_since(session.last_upstream_at) > Duration::from_millis(UPSTREAM_IDLE_MS) {
+                if now.duration_since(session.last_upstream_at)
+                    > Duration::from_millis(UPSTREAM_IDLE_MS)
+                {
                     to_remove.push(sid);
                 }
             }

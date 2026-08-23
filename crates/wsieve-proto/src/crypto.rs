@@ -42,10 +42,17 @@ impl Cipher for AesGcmCipher {
     }
 
     fn encrypt(&self, nonce: u64, authtext: &[u8], plaintext: &[u8], out: &mut [u8]) -> usize {
-        let cipher = self.cipher.as_ref().expect("AesGcmCipher used before set()");
+        let cipher = self
+            .cipher
+            .as_ref()
+            .expect("AesGcmCipher used before set()");
         out[..plaintext.len()].copy_from_slice(plaintext);
         let tag = cipher
-            .encrypt_in_place_detached(&gcm_nonce(nonce).into(), authtext, &mut out[..plaintext.len()])
+            .encrypt_in_place_detached(
+                &gcm_nonce(nonce).into(),
+                authtext,
+                &mut out[..plaintext.len()],
+            )
             .expect("aes-gcm encrypt cannot fail on valid inputs");
         out[plaintext.len()..plaintext.len() + 16].copy_from_slice(&tag);
         plaintext.len() + 16
@@ -58,7 +65,10 @@ impl Cipher for AesGcmCipher {
         ciphertext: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        let cipher = self.cipher.as_ref().expect("AesGcmCipher used before set()");
+        let cipher = self
+            .cipher
+            .as_ref()
+            .expect("AesGcmCipher used before set()");
         if ciphertext.len() < 16 {
             return Err(Error::Decrypt);
         }
@@ -145,10 +155,7 @@ fn builder<'a>() -> Builder<'a> {
 }
 
 /// IK 发起方：需要服务端静态公钥 + 本地静态私钥。
-pub fn build_client(
-    server_static_pub: &[u8],
-    client_priv: &[u8],
-) -> Result<HandshakeState, Error> {
+pub fn build_client(server_static_pub: &[u8], client_priv: &[u8]) -> Result<HandshakeState, Error> {
     builder()
         .local_private_key(client_priv)?
         .remote_public_key(server_static_pub)?

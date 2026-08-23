@@ -96,7 +96,11 @@ pub fn decode_msg1(bytes: &[u8]) -> Result<Msg1, HelloError> {
         .iter()
         .map(|&b| MuxId::from_u8(b).ok_or(HelloError::BadMuxId(b)))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Msg1 { version, ts_ms, mux_prefs })
+    Ok(Msg1 {
+        version,
+        ts_ms,
+        mux_prefs,
+    })
 }
 
 pub fn encode_msg2(m: &Msg2) -> Vec<u8> {
@@ -113,5 +117,8 @@ pub fn decode_msg2(bytes: &[u8]) -> Result<Msg2, HelloError> {
         1 => true,
         v => return Err(HelloError::BadFallback(v)),
     };
-    Ok(Msg2 { chosen_mux_id, fallback })
+    Ok(Msg2 {
+        chosen_mux_id,
+        fallback,
+    })
 }

@@ -1,5 +1,5 @@
-use std::collections::HashSet;
 use sealed::Seal;
+use std::collections::HashSet;
 use wsieve_proto::crypto::*;
 
 fn seal<T: sealed::Seal>(h: &mut T, payload: &[u8]) -> Vec<u8> {

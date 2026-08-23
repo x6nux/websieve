@@ -9,10 +9,10 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use wsieve_transport::{HttpTransport, PostReply};
 use wsieve_proto::crypto::{build_server, gen_keypair};
-use wsieve_proto::hello::{Msg2, MuxId, encode_msg2};
+use wsieve_proto::hello::{encode_msg2, Msg2, MuxId};
 use wsieve_proto::tu::{Frame, MAX_PAYLOAD};
+use wsieve_transport::{HttpTransport, PostReply};
 use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
 
 /// 录制的一条上行请求
@@ -25,7 +25,14 @@ struct RecordedPost {
 impl RecordedPost {
     fn seq(&self) -> u64 {
         // path 形如 /api/sync?n=<seq>&sid=<...>
-        let n = self.path.split("n=").nth(1).unwrap().split('&').next().unwrap();
+        let n = self
+            .path
+            .split("n=")
+            .nth(1)
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
         n.parse().unwrap()
     }
 }
@@ -92,19 +99,31 @@ impl HttpTransport for FakeTransport {
             let mut buf = vec![0u8; 65535];
             server.read_message(&msg1_cipher, &mut buf)?;
 
-            let msg2 = encode_msg2(&Msg2 { chosen_mux_id: MuxId::Yamux, fallback: false });
+            let msg2 = encode_msg2(&Msg2 {
+                chosen_mux_id: MuxId::Yamux,
+                fallback: false,
+            });
             let mut out = vec![0u8; 65535];
             let n = server.write_message(&msg2, &mut out)?;
 
             let mut reply = Vec::with_capacity(2 + n);
             reply.extend_from_slice(&(n as u16).to_be_bytes());
             reply.extend_from_slice(&out[..n]);
-            Ok(PostReply { status: 200, body: Bytes::from(reply) })
+            Ok(PostReply {
+                status: 200,
+                body: Bytes::from(reply),
+            })
         } else {
             // 脚本化失败：fail_first 计数
-            let prev = self.fail_first.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                if v > 0 { Some(v - 1) } else { None }
-            });
+            let prev = self
+                .fail_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    if v > 0 {
+                        Some(v - 1)
+                    } else {
+                        None
+                    }
+                });
             if matches!(prev, Ok(_)) {
                 return Err(anyhow::anyhow!("scripted transport error"));
             }
@@ -113,7 +132,10 @@ impl HttpTransport for FakeTransport {
             if let Some((status, body)) = guard.clone() {
                 return Ok(PostReply { status, body });
             }
-            Ok(PostReply { status: 204, body: Bytes::new() })
+            Ok(PostReply {
+                status: 204,
+                body: Bytes::new(),
+            })
         }
     }
 
@@ -188,7 +210,10 @@ async fn handshake_garbage_reply_kills() {
     #[async_trait::async_trait]
     impl HttpTransport for BadTransport {
         async fn post(&self, _p: &str, _b: Bytes) -> anyhow::Result<PostReply> {
-            Ok(PostReply { status: 404, body: Bytes::from("not found") })
+            Ok(PostReply {
+                status: 404,
+                body: Bytes::from("not found"),
+            })
         }
         async fn get_stream(
             &self,
@@ -200,7 +225,11 @@ async fn handshake_garbage_reply_kills() {
     let (client_priv, _) = gen_keypair();
     let result = XhttpConn::connect(
         Arc::new(BadTransport),
-        &UpstreamCfg { server_pub, client_priv, mux_prefs: vec![MuxId::Yamux] },
+        &UpstreamCfg {
+            server_pub,
+            client_priv,
+            mux_prefs: vec![MuxId::Yamux],
+        },
     )
     .await;
     assert!(result.is_err());
@@ -257,17 +286,26 @@ async fn write_frames_become_tus() {
                 let mut server = build_server(&self.server_priv)?;
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
-                let msg2 = encode_msg2(&Msg2 { chosen_mux_id: MuxId::Yamux, fallback: false });
+                let msg2 = encode_msg2(&Msg2 {
+                    chosen_mux_id: MuxId::Yamux,
+                    fallback: false,
+                });
                 let mut out = vec![0u8; 65535];
                 let n = server.write_message(&msg2, &mut out)?;
                 let mut reply = Vec::with_capacity(2 + n);
                 reply.extend_from_slice(&(n as u16).to_be_bytes());
                 reply.extend_from_slice(&out[..n]);
                 *self.server_state.lock().await = Some(server.into_transport_mode()?);
-                return Ok(PostReply { status: 200, body: Bytes::from(reply) });
+                return Ok(PostReply {
+                    status: 200,
+                    body: Bytes::from(reply),
+                });
             }
             self.posts.lock().unwrap().push((path.to_string(), body));
-            Ok(PostReply { status: 204, body: Bytes::new() })
+            Ok(PostReply {
+                status: 204,
+                body: Bytes::new(),
+            })
         }
         async fn get_stream(
             &self,
@@ -284,7 +322,11 @@ async fn write_frames_become_tus() {
     });
 
     let (client_priv, _) = gen_keypair();
-    let cfg = UpstreamCfg { server_pub, client_priv, mux_prefs: vec![MuxId::Yamux] };
+    let cfg = UpstreamCfg {
+        server_pub,
+        client_priv,
+        mux_prefs: vec![MuxId::Yamux],
+    };
     let (mut conn, _neg) = XhttpConn::connect(rt.clone(), &cfg).await.unwrap();
 
     // 写 70000 字节（> 64516 单 TU 上限 → 至少 2 个 TU）
@@ -316,7 +358,10 @@ async fn write_frames_become_tus() {
 
     // 单 POST body ≤ 1MB（15 TU × MAX_PAYLOAD 上限）
     for (_, body) in &posts {
-        assert!(body.len() <= 15 * (MAX_PAYLOAD + 3 + 16 + 2), "1MB per-POST cap");
+        assert!(
+            body.len() <= 15 * (MAX_PAYLOAD + 3 + 16 + 2),
+            "1MB per-POST cap"
+        );
     }
 }
 
@@ -342,13 +387,19 @@ async fn window_capped_at_8() {
                 let mut server = build_server(&self.server_priv)?;
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
-                let msg2 = encode_msg2(&Msg2 { chosen_mux_id: MuxId::Yamux, fallback: false });
+                let msg2 = encode_msg2(&Msg2 {
+                    chosen_mux_id: MuxId::Yamux,
+                    fallback: false,
+                });
                 let mut out = vec![0u8; 65535];
                 let n = server.write_message(&msg2, &mut out)?;
                 let mut reply = Vec::with_capacity(2 + n);
                 reply.extend_from_slice(&(n as u16).to_be_bytes());
                 reply.extend_from_slice(&out[..n]);
-                return Ok(PostReply { status: 200, body: Bytes::from(reply) });
+                return Ok(PostReply {
+                    status: 200,
+                    body: Bytes::from(reply),
+                });
             }
             let cur = self.outstanding.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_outstanding.fetch_max(cur, Ordering::SeqCst);
@@ -358,7 +409,10 @@ async fn window_capped_at_8() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             self.outstanding.fetch_sub(1, Ordering::SeqCst);
-            Ok(PostReply { status: 204, body: Bytes::new() })
+            Ok(PostReply {
+                status: 204,
+                body: Bytes::new(),
+            })
         }
         async fn get_stream(
             &self,
@@ -377,7 +431,11 @@ async fn window_capped_at_8() {
     });
 
     let (client_priv, _) = gen_keypair();
-    let cfg = UpstreamCfg { server_pub, client_priv, mux_prefs: vec![MuxId::Yamux] };
+    let cfg = UpstreamCfg {
+        server_pub,
+        client_priv,
+        mux_prefs: vec![MuxId::Yamux],
+    };
     let (mut conn, _neg) = XhttpConn::connect(st.clone(), &cfg).await.unwrap();
 
     // 写足量数据：64KB 聚合块 × 20 → 至少 20 个 POST 想发，窗口只能 8
@@ -390,7 +448,11 @@ async fn window_capped_at_8() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let max = st.max_outstanding.load(Ordering::SeqCst);
-    assert!(max <= 8, "in-flight window must be capped at 8, got {}", max);
+    assert!(
+        max <= 8,
+        "in-flight window must be capped at 8, got {}",
+        max
+    );
     assert!(max >= 1, "something must have been sent");
 
     st.released.store(true, Ordering::SeqCst);
@@ -409,12 +471,19 @@ async fn retry_same_seq_same_bytes() {
     conn.flush().await.unwrap();
 
     let recs = wait_for_records(&t, 2).await;
-    assert!(recs.len() >= 2, "need first attempt + retry, got {}", recs.len());
+    assert!(
+        recs.len() >= 2,
+        "need first attempt + retry, got {}",
+        recs.len()
+    );
     let first = &recs[0];
     let second = &recs[1];
     assert_eq!(first.path, second.path, "same path (same seq in query)");
     assert_eq!(first.seq(), second.seq(), "same seq");
-    assert_eq!(first.body, second.body, "byte-identical body (no re-encryption)");
+    assert_eq!(
+        first.body, second.body,
+        "byte-identical body (no re-encryption)"
+    );
 }
 
 #[tokio::test]
@@ -463,7 +532,10 @@ async fn downlink_frames_flow() {
                 let mut server = build_server(&self.server_priv)?;
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
-                let msg2 = encode_msg2(&Msg2 { chosen_mux_id: MuxId::Yamux, fallback: false });
+                let msg2 = encode_msg2(&Msg2 {
+                    chosen_mux_id: MuxId::Yamux,
+                    fallback: false,
+                });
                 let mut out = vec![0u8; 65535];
                 let n = server.write_message(&msg2, &mut out)?;
                 let mut reply = Vec::with_capacity(2 + n);
@@ -471,9 +543,15 @@ async fn downlink_frames_flow() {
                 reply.extend_from_slice(&out[..n]);
                 let st = server.into_transport_mode()?;
                 *self.state.lock().await = Some(st);
-                return Ok(PostReply { status: 200, body: Bytes::from(reply) });
+                return Ok(PostReply {
+                    status: 200,
+                    body: Bytes::from(reply),
+                });
             }
-            Ok(PostReply { status: 204, body: Bytes::new() })
+            Ok(PostReply {
+                status: 204,
+                body: Bytes::new(),
+            })
         }
         async fn get_stream(
             &self,
@@ -511,7 +589,11 @@ async fn downlink_frames_flow() {
     });
 
     let (client_priv, _) = gen_keypair();
-    let cfg = UpstreamCfg { server_pub, client_priv, mux_prefs: vec![MuxId::Yamux] };
+    let cfg = UpstreamCfg {
+        server_pub,
+        client_priv,
+        mux_prefs: vec![MuxId::Yamux],
+    };
     let (mut conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
 
     let mut got = Vec::new();
@@ -523,7 +605,9 @@ async fn downlink_frames_flow() {
             got.extend_from_slice(&buf[..n]);
         }
     };
-    tokio::time::timeout(deadline, read_all).await.expect("downlink data within deadline");
+    tokio::time::timeout(deadline, read_all)
+        .await
+        .expect("downlink data within deadline");
     assert_eq!(&got, b"abcdef", "Data frames concatenated, Padding skipped");
 }
 
@@ -546,17 +630,26 @@ async fn idle_heartbeat_sends_padding() {
                 let mut server = build_server(&self.server_priv)?;
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
-                let msg2 = encode_msg2(&Msg2 { chosen_mux_id: MuxId::Yamux, fallback: false });
+                let msg2 = encode_msg2(&Msg2 {
+                    chosen_mux_id: MuxId::Yamux,
+                    fallback: false,
+                });
                 let mut out = vec![0u8; 65535];
                 let n = server.write_message(&msg2, &mut out)?;
                 let mut reply = Vec::with_capacity(2 + n);
                 reply.extend_from_slice(&(n as u16).to_be_bytes());
                 reply.extend_from_slice(&out[..n]);
                 *self.server_state.lock().await = Some(server.into_transport_mode()?);
-                return Ok(PostReply { status: 200, body: Bytes::from(reply) });
+                return Ok(PostReply {
+                    status: 200,
+                    body: Bytes::from(reply),
+                });
             }
             self.posts.lock().unwrap().push((path.to_string(), body));
-            Ok(PostReply { status: 204, body: Bytes::new() })
+            Ok(PostReply {
+                status: 204,
+                body: Bytes::new(),
+            })
         }
         async fn get_stream(
             &self,
@@ -573,7 +666,11 @@ async fn idle_heartbeat_sends_padding() {
     });
 
     let (client_priv, _) = gen_keypair();
-    let cfg = UpstreamCfg { server_pub, client_priv, mux_prefs: vec![MuxId::Yamux] };
+    let cfg = UpstreamCfg {
+        server_pub,
+        client_priv,
+        mux_prefs: vec![MuxId::Yamux],
+    };
     let (conn, _neg) = XhttpConn::connect(ht.clone(), &cfg).await.unwrap();
 
     // 空闲 70s（> 60s 心跳阈值）

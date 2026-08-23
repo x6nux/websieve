@@ -19,13 +19,13 @@ use futures::StreamExt;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::{Instant, interval};
+use tokio::time::{interval, Instant};
 
-use wsieve_transport::HttpTransport;
+use snow::TransportState;
 use wsieve_proto::crypto::build_client;
 use wsieve_proto::hello::{decode_msg2, encode_msg1, MuxId};
 use wsieve_proto::tu::{decode_frame, encode_frame, Frame, TuDecoder, MAX_PAYLOAD};
-use snow::TransportState;
+use wsieve_transport::HttpTransport;
 
 const MAX_INFLIGHT: usize = 8;
 const AGGREGATE_MS: u64 = 4;
@@ -159,15 +159,18 @@ impl XhttpConn {
             Self::background_task(shared, transport_clone, cmd_rx, event_tx).await;
         });
 
-        Ok((Self {
-            cmd_tx,
-            event_rx,
-            read_buffer: Vec::new(),
-            dead: false,
-        }, Negotiated {
-            mux_id: msg2.chosen_mux_id,
-            fallback: msg2.fallback,
-        }))
+        Ok((
+            Self {
+                cmd_tx,
+                event_rx,
+                read_buffer: Vec::new(),
+                dead: false,
+            },
+            Negotiated {
+                mux_id: msg2.chosen_mux_id,
+                fallback: msg2.fallback,
+            },
+        ))
     }
 
     async fn background_task<T: HttpTransport + 'static>(
@@ -186,7 +189,13 @@ impl XhttpConn {
         let shared_clone = shared.clone();
         let downlink_event_tx = event_tx.clone();
         tokio::spawn(async move {
-            Self::downlink_task(transport_clone, downlink_path, shared_clone, downlink_event_tx).await;
+            Self::downlink_task(
+                transport_clone,
+                downlink_path,
+                shared_clone,
+                downlink_event_tx,
+            )
+            .await;
         });
 
         loop {
@@ -262,7 +271,14 @@ impl XhttpConn {
         st.last_flush = Instant::now();
         let sid_b64 = st.sid_b64.clone();
 
-        Self::spawn_send(transport.clone(), shared.clone(), sid_b64, seq, body, event_tx.clone());
+        Self::spawn_send(
+            transport.clone(),
+            shared.clone(),
+            sid_b64,
+            seq,
+            body,
+            event_tx.clone(),
+        );
     }
 
     fn spawn_send<T: HttpTransport + 'static>(
@@ -363,7 +379,9 @@ impl XhttpConn {
     fn encode_single_tu(st: &mut SharedState, frame: &Frame) -> Bytes {
         let plain = encode_frame(frame, &mut rand::rng()).expect("padding frame encodes");
         let mut cipher_buf = vec![0u8; 65535];
-        let cipher_len = st.noise.write_message(&plain, &mut cipher_buf)
+        let cipher_len = st
+            .noise
+            .write_message(&plain, &mut cipher_buf)
             .expect("transport encrypt");
         let mut tu = Vec::with_capacity(2 + cipher_len);
         tu.extend_from_slice(&(cipher_len as u16).to_be_bytes());
@@ -529,12 +547,10 @@ impl AsyncWrite for XhttpConn {
         match self.cmd_tx.try_send(Command::WriteData(data)) {
             Ok(_) => Poll::Ready(Ok(buf.len())),
             Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "channel closed",
-                )))
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "channel closed",
+            ))),
         }
     }
 

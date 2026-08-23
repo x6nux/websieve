@@ -58,9 +58,7 @@ impl HttpTransport for ReqwestTransport {
             anyhow::bail!("GET {path} -> {}", status.as_u16());
         }
         use futures::StreamExt;
-        let s = resp
-            .bytes_stream()
-            .map(|r| r.map_err(anyhow::Error::new));
+        let s = resp.bytes_stream().map(|r| r.map_err(anyhow::Error::new));
         Ok(s.boxed())
     }
 }

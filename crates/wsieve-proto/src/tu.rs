@@ -50,7 +50,9 @@ pub fn decode_frame(plain: &[u8]) -> Result<Frame, TuError> {
         return Err(TuError::Truncated);
     }
     match ty {
-        TYPE_DATA => Ok(Frame::Data(plain[FRAME_HEADER..FRAME_HEADER + p_len].to_vec())),
+        TYPE_DATA => Ok(Frame::Data(
+            plain[FRAME_HEADER..FRAME_HEADER + p_len].to_vec(),
+        )),
         TYPE_PADDING if p_len == 0 => Ok(Frame::Padding),
         other => Err(TuError::UnknownType(other)),
     }
@@ -62,7 +64,9 @@ pub struct TuDecoder {
 
 impl TuDecoder {
     pub fn new() -> Self {
-        Self { buf: Vec::with_capacity(MAX_CIPHERTEXT + 2) }
+        Self {
+            buf: Vec::with_capacity(MAX_CIPHERTEXT + 2),
+        }
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {

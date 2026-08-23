@@ -1,9 +1,9 @@
 //! SessionStore 服务端测试。spec §9.4。
 
-use std::time::Duration;
 use bytes::Bytes;
+use std::time::Duration;
 use tokio::time::timeout;
-use wsieve_xhttp::server::{SessionStore, SessionGone, Sid};
+use wsieve_xhttp::server::{SessionGone, SessionStore, Sid};
 
 #[tokio::test]
 async fn reorder_and_dedup() {
@@ -14,26 +14,37 @@ async fn reorder_and_dedup() {
     s.create(sid).await;
 
     // 乱序推送：2, 0, 1
-    s.push_post(&sid, 2, Bytes::copy_from_slice(b"cc")).await.unwrap();
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"aa")).await.unwrap();
-    s.push_post(&sid, 1, Bytes::copy_from_slice(b"bb")).await.unwrap();
+    s.push_post(&sid, 2, Bytes::copy_from_slice(b"cc"))
+        .await
+        .unwrap();
+    s.push_post(&sid, 0, Bytes::copy_from_slice(b"aa"))
+        .await
+        .unwrap();
+    s.push_post(&sid, 1, Bytes::copy_from_slice(b"bb"))
+        .await
+        .unwrap();
 
     // 读取：应该按序返回 aa, bb, cc
     let mut buf = vec![0u8; 10];
     let mut total_n = 0;
 
     while total_n < 6 {
-        let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf[total_n..]))
-            .await
-            .expect("data already buffered; read returns immediately")
-            .unwrap();
+        let n = timeout(
+            Duration::from_millis(100),
+            s.read(&sid, &mut buf[total_n..]),
+        )
+        .await
+        .expect("data already buffered; read returns immediately")
+        .unwrap();
         total_n += n;
     }
 
     assert_eq!(&buf[..6], b"aabbcc");
 
     // 重复推送 seq 0 → 应该被去重，仍 Ok，不增加数据
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"AA")).await.unwrap();
+    s.push_post(&sid, 0, Bytes::copy_from_slice(b"AA"))
+        .await
+        .unwrap();
 
     // 再次读取：应该没有新数据（缓冲已空）
     let n = timeout(Duration::from_millis(10), s.read(&sid, &mut buf)).await;
@@ -89,7 +100,9 @@ async fn gc_upstream_idle_reset_by_post() {
 
     // 过 100s 后来一个 POST（seq 0，落在 next_seq 上）
     tokio::time::advance(Duration::from_secs(100)).await;
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"xx")).await.unwrap();
+    s.push_post(&sid, 0, Bytes::copy_from_slice(b"xx"))
+        .await
+        .unwrap();
 
     // 再过 100s（自 POST 起仅 100s < 180s）→ 会话仍活着
     tokio::time::advance(Duration::from_secs(100)).await;

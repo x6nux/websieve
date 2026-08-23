@@ -36,7 +36,10 @@ fn msg1_rejects_wrong_length() {
 #[test]
 fn msg2_roundtrip() {
     for fallback in [false, true] {
-        let m2 = Msg2 { chosen_mux_id: MuxId::Picomux, fallback };
+        let m2 = Msg2 {
+            chosen_mux_id: MuxId::Picomux,
+            fallback,
+        };
         let bytes = encode_msg2(&m2);
         assert_eq!(decode_msg2(&bytes).unwrap(), m2);
     }
