@@ -15,8 +15,15 @@ snow = { workspace = true }
 blake3 = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
+reqwest = { workspace = true }
 base64 = "0.22"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+wsieve-mux = { version = "0.1.0", path = "../wsieve-mux" }
+wsieve-transport = { version = "0.1.0", path = "../wsieve-transport" }
 
 [dev-dependencies]
-reqwest = { workspace = true }
 futures = { workspace = true }

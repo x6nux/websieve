@@ -13,6 +13,8 @@
 //! 保活任务下次 tick 自然退出）。
 
 pub mod disguise;
+pub mod remote;
+pub mod tls;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,7 +33,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 use wsieve_proto::crypto::build_server;
 use wsieve_proto::hello::{decode_msg1, encode_msg2, ts_in_window, MuxId, Msg2, TS_WINDOW_MS};
-use wsieve_proto::tu::{encode_frame, Frame};
 use wsieve_xhttp::server::{SessionStore, Sid};
 
 /// spec §6.3：已见 msg1 缓存默认容量 4096，条目寿命 = ts 窗口时长。
@@ -59,12 +60,19 @@ pub struct ServerKeys {
     pub whitelist: HashSet<[u8; 32]>,
 }
 
+/// 伪装配置：默认内嵌 nginx 页；配置 upstream 后未认证请求反代到上游（spec §8）。
+#[derive(Clone, Default)]
+pub struct DisguiseCfg {
+    /// 反代上游基址（如 `https://example.com`）。None = 内嵌页模式。
+    pub upstream: Option<String>,
+    /// Alt-Svc 广播端口（§6.8 第 3 层铺路；None = 不广播）。
+    pub alt_svc_port: Option<u16>,
+}
+
 /// 共享状态（公开构造，测试直连）。
 pub struct AppState {
     pub store: SessionStore,
     pub keys: ServerKeys,
-    /// sid → 会话 Noise 状态（上行解密 / 下行加密共用）。
-    noise: Mutex<HashMap<Sid, TransportState>>,
     /// sid → 下行 TU 字节通道发送端（保活/会话任务生产，GET /api/events 消费）。
     downlink_tx: Mutex<HashMap<Sid, mpsc::Sender<Bytes>>>,
     /// sid → 下行接收端（attach 时取出、转成响应体流）。
@@ -75,6 +83,7 @@ pub struct AppState {
     seen_capacity: usize,
     pub enabled_mux: Vec<MuxId>,
     pub keepalive: KeepaliveRange,
+    pub disguise: DisguiseCfg,
 }
 
 impl AppState {
@@ -84,16 +93,26 @@ impl AppState {
         keepalive: KeepaliveRange,
         seen_capacity: usize,
     ) -> Arc<Self> {
+        Self::with_disguise(keys, enabled_mux, keepalive, seen_capacity, DisguiseCfg::default())
+    }
+
+    pub fn with_disguise(
+        keys: ServerKeys,
+        enabled_mux: Vec<MuxId>,
+        keepalive: KeepaliveRange,
+        seen_capacity: usize,
+        disguise: DisguiseCfg,
+    ) -> Arc<Self> {
         let state = Arc::new(Self {
             store: SessionStore::new(), // 自带 GC 任务（attach 30s / 上行空闲 180s）
             keys,
-            noise: Mutex::new(HashMap::new()),
             downlink_tx: Mutex::new(HashMap::new()),
             downlink_rx: Mutex::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             seen_capacity,
             enabled_mux,
             keepalive,
+            disguise,
         });
         spawn_seen_sweep(state.clone());
         state
@@ -145,12 +164,44 @@ fn parse_sid(s: &str) -> Option<Sid> {
     Some(Sid(URL_SAFE_NO_PAD.decode(s).ok()?.try_into().ok()?))
 }
 
-async fn disguise_resp(method: &str, path: &str) -> Response {
-    disguise::handle(method, path).await
+async fn disguise_resp(state: &Arc<AppState>, req: axum::http::Request<Body>) -> Response {
+    let alt_svc = state.disguise.alt_svc_port;
+    let mut resp = match &state.disguise.upstream {
+        Some(base) => {
+            let method = req.method().as_str().to_string();
+            let uri = req
+                .uri()
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| "/".into());
+            let headers = req
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string()))
+                })
+                .collect();
+            let body = axum::body::to_bytes(req.into_body(), 16 << 20)
+                .await
+                .unwrap_or_default();
+            disguise::handle_upstream(method, uri, headers, body, base).await
+        }
+        None => {
+            let method = req.method().as_str().to_string();
+            let path = req.uri().path().to_string();
+            disguise::handle_static(&method, &path).await
+        }
+    };
+    if let Some(p) = alt_svc {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma=86400")) {
+            resp.headers_mut().insert(header::ALT_SVC, v);
+        }
+    }
+    resp
 }
 
 /// 唯一入口：任何方法任何路径。
-async fn fallback(State(state): State<Arc<AppState>>, req: axum::http::Request<Body>) -> Response {
+async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Request<Body>) -> Response {
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let uri = req.uri().clone();
@@ -158,9 +209,9 @@ async fn fallback(State(state): State<Arc<AppState>>, req: axum::http::Request<B
     if method == "POST" && path == "/api/sync" {
         let n = query_param(&uri, "n").and_then(|v| v.parse::<u64>().ok());
         let sid = query_param(&uri, "sid").and_then(|s| parse_sid(&s));
-        let body = match axum::body::to_bytes(req.into_body(), 1 << 20).await {
+        let body = match axum::body::to_bytes(std::mem::replace(&mut req, axum::http::Request::builder().uri("/").body(Body::empty()).unwrap()).into_body(), 1 << 20).await {
             Ok(b) => b,
-            Err(_) => return disguise_resp(&method, &path).await,
+            Err(_) => return disguise_resp(&state, req).await,
         };
         match (n, sid) {
             (Some(0), Some(sid)) => handshake(&state, sid, &body, &method, &path).await,
@@ -172,19 +223,31 @@ async fn fallback(State(state): State<Arc<AppState>>, req: axum::http::Request<B
                         .body(Body::empty())
                         .unwrap()
                 } else {
-                    disguise_resp(&method, &path).await
+                    disguise_resp(&state, bad_req()).await
                 }
             }
-            _ => disguise_resp(&method, &path).await,
+            _ => disguise_resp(&state, bad_req()).await,
         }
     } else if method == "GET" && path == "/api/events" {
         let Some(sid) = query_param(&uri, "sid").and_then(|s| parse_sid(&s)) else {
-            return disguise_resp(&method, &path).await;
+            return disguise_resp(&state, req).await;
         };
         attach(&state, sid, &method, &path).await
     } else {
-        disguise_resp(&method, &path).await
+        disguise_resp(&state, req).await
     }
+}
+
+/// 失败路径重建一个最小请求（伪装处理器需要原始请求形态；失败时 body 已消费）。
+
+
+/// 失败路径的最小请求（body 已消费的场合）。
+fn bad_req() -> axum::http::Request<Body> {
+    axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri("/api/sync")
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// n=0 握手。任一失败 → 伪装处理器（与垃圾请求同路径、响应无差别）。
@@ -195,7 +258,17 @@ async fn handshake(
     method: &str,
     path: &str,
 ) -> Response {
-    let fail = || async { disguise_resp(method, path).await };
+    let fail = || async {
+        disguise_resp(
+            state,
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    };
 
     // 首个 TU：u16 BE 长度前缀 + Noise msg1 密文。
     if body.len() < 2 {
@@ -268,11 +341,10 @@ async fn handshake(
 
     // 建会话（SessionStore 管 seq/GC；Noise 与下行通道入旁路表）。
     state.store.create(sid).await;
-    let (dl_tx, dl_rx) = mpsc::channel::<Bytes>(64);
-    state.noise.lock().await.insert(sid, transport);
+    let (dl_tx, dl_rx) = mpsc::channel::<Bytes>(256);
     state.downlink_tx.lock().await.insert(sid, dl_tx.clone());
     state.downlink_rx.lock().await.insert(sid, dl_rx);
-    spawn_keepalive(state.clone(), sid);
+    spawn_session(state.clone(), sid, chosen, transport);
 
     // 200 + TU(msg2)。
     let mut resp_body = Vec::with_capacity(2 + msg2_cipher.len());
@@ -287,7 +359,17 @@ async fn handshake(
 
 /// GET /api/events：挂载 + TU 字节流。
 async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Response {
-    let fail = || async { disguise_resp(method, path).await };
+    let fail = || async {
+        disguise_resp(
+            state,
+            axum::http::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    };
     // 挂载（已挂载/无会话 → Err → 伪装）。句柄持有至响应流结束。
     let _downlink = match state.store.attach_downlink(&sid).await {
         Ok(h) => h,
@@ -310,51 +392,152 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
         .unwrap()
 }
 
-/// 会话保活任务：每区间随机延迟，向下行通道写一个真实加密的 PADDING TU
-/// （spec §6.5）。Task 13 内这是下行流的唯一生产者；Task 15 的 mux/remote
-/// 数据流将与本任务并存于同一通道。
-fn spawn_keepalive(state: Arc<AppState>, sid: Sid) {
+/// 会话任务（Task 15 全栈接线）：SessionStore 上行（重排后的 TU 字节）↔
+/// NoiseStream ↔ mux ↔ remote 拨号泵。
+///
+/// 结构：两条独立管道——上行泵把 SessionStore::read 的字节写进 up 管道
+/// （NoiseStream 读半解密给 mux）；mux 下行输出经 NoiseStream 加密写进
+/// dl 管道，下行泵读出送 GET 响应通道。保活 PADDING TU 经 PadHandle
+/// 进入 dl 管道，与数据 TU 的顺序由 state 锁串行化，nonce 序不乱。
+///
+/// 启动即跑（不等 GET attach）：下行通道有界缓冲（256 TU），客户端正常
+/// 情况毫秒级 attach；30s attach 窗口内不 attach 则会话被 GC，本任务随
+/// SessionStore::read 返回 SessionGone 退出——背压停滞与死亡二选一，可接受。
+fn spawn_session(state: Arc<AppState>, sid: Sid, chosen: MuxId, transport: TransportState) {
+    tokio::spawn(async move {
+        let (up_pump_side, up_noise_side) = tokio::io::duplex(8192);
+        let (dl_noise_side, dl_pump_side) = tokio::io::duplex(8192);
+        let noise = wsieve_proto::noise_stream::NoiseStream::new(
+            transport,
+            PairIo {
+                read: up_noise_side,
+                write: dl_noise_side,
+            },
+        );
+        let pad = noise.pad_handle();
+        spawn_keepalive(state.clone(), sid, pad);
+
+        // 上行泵：SessionStore::read（阻塞到数据/会话死亡）→ up 管道。
+        {
+            let state = state.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut up = up_pump_side;
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match state.store.read(&sid, &mut buf).await {
+                        Ok(n) if n > 0 => {
+                            if up.write_all(&buf[..n]).await.is_err() {
+                                break; // 会话任务已退出
+                            }
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break, // SessionGone：会话 GC/被杀
+                    }
+                }
+                let _ = up.shutdown().await;
+            });
+        }
+
+        // 下行泵：dl 管道密文 TU → GET 响应通道。通道满 = 背压 = mux 写停滞。
+        {
+            let tx = dl_tx_clone(&state, &sid).await;
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt as _;
+                let mut src = dl_pump_side;
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    match src.read(&mut buf).await {
+                        Ok(0) | Err(_) => break, // 会话任务退出（mux 关闭）
+                        Ok(n) => {
+                            if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                                return; // GET 断开
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // mux + remote：NoiseStream 即 mux 的底层流。
+        let io: wsieve_mux::MuxStream = Box::new(noise);
+        if let Ok(mux) = wsieve_mux::mux_server_factory(chosen, io).await {
+            remote::session_loop(mux).await;
+        }
+        // 会话终结：清理旁路表 + 杀会话（上行泵随 SessionGone 退出）。
+        state.downlink_tx.lock().await.remove(&sid);
+        state.downlink_rx.lock().await.remove(&sid);
+        state.store.kill(&sid).await;
+    });
+}
+
+/// 读侧来自 up 管道、写侧进 dl 管道的组合 IO（NoiseStream 的底层）。
+struct PairIo {
+    read: tokio::io::DuplexStream,
+    write: tokio::io::DuplexStream,
+}
+
+impl tokio::io::AsyncRead for PairIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.read).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for PairIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.write).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
+    }
+}
+
+/// 取会话下行通道发送端（spawn 时条目必然存在：handshake 刚插入）。
+async fn dl_tx_clone(state: &Arc<AppState>, sid: &Sid) -> mpsc::Sender<Bytes> {
+    state
+        .downlink_tx
+        .lock()
+        .await
+        .get(sid)
+        .cloned()
+        .unwrap_or_else(|| mpsc::channel(1).0)
+}
+
+/// 会话保活任务（spec §6.5）：每区间随机延迟，经 PadHandle 向同一 Noise
+/// nonce 序列写一个真实加密的 PADDING TU（Task 15：与 mux 数据流同管道）。
+fn spawn_keepalive(
+    state: Arc<AppState>,
+    sid: Sid,
+    pad: wsieve_proto::noise_stream::PadHandle,
+) {
     tokio::spawn(async move {
         use rand::Rng;
-        // 统一退出清理：会话侧表（noise/downlink_tx/downlink_rx）与 SessionStore
-        // 条目对齐，防止 GC 后的孤儿条目慢泄漏（评审 Important #1）。
-        async fn cleanup(state: &Arc<AppState>, sid: &Sid) {
-            state.noise.lock().await.remove(sid);
-            state.downlink_tx.lock().await.remove(sid);
-            state.downlink_rx.lock().await.remove(sid);
-        }
         loop {
             let delay_ms =
                 rand::rng().random_range(state.keepalive.min_ms..=state.keepalive.max_ms);
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
-            let plain = {
-                let mut noise_guard = state.noise.lock().await;
-                let Some(noise) = noise_guard.get_mut(&sid) else {
-                    cleanup(&state, &sid).await; // 会话已不存在
-                    return;
-                };
-                let mut rng = rand::rng();
-                let plain = match encode_frame(&Frame::Padding, &mut rng) {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                let mut cipher_buf = vec![0u8; 65535];
-                let Ok(cipher_len) = noise.write_message(&plain, &mut cipher_buf) else {
-                    return;
-                };
-                let mut tu = Vec::with_capacity(2 + cipher_len);
-                tu.extend_from_slice(&(cipher_len as u16).to_be_bytes());
-                tu.extend_from_slice(&cipher_buf[..cipher_len]);
-                tu
-            };
-            let dl = state.downlink_tx.lock().await;
-            let Some(tx) = dl.get(&sid) else {
-                cleanup(&state, &sid).await;
-                return;
-            };
-            if tx.send(Bytes::from(plain)).await.is_err() {
-                cleanup(&state, &sid).await; // GET 已断开
+            if pad.write_padding().await.is_err() {
+                // 会话任务已退出（管道断）：清理 + 杀会话
+                state.downlink_tx.lock().await.remove(&sid);
+                state.downlink_rx.lock().await.remove(&sid);
+                state.store.kill(&sid).await;
                 return;
             }
         }

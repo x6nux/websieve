@@ -231,28 +231,31 @@ async fn full_attach_streams_real_padding() {
     assert_eq!(resp.headers()["cache-control"], "no-store");
     assert_eq!(resp.headers()["x-accel-buffering"], "no");
 
-    // 读流直到攒够一个完整 TU，解密须得 PADDING 帧。
+    // 读流直到解密出一个 PADDING 帧（Task 15 后 mux 数据帧与保活帧同流，
+    // 语义是「keepalive 在产出真实可解密的 PADDING TU」——逐 TU 扫描）。
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
+    let mut client = client;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let chunk = stream.next().await.unwrap().unwrap();
             buf.extend_from_slice(&chunk);
-            if buf.len() >= 2 {
+            while buf.len() >= 2 {
                 let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-                if buf.len() >= 2 + len {
+                if buf.len() < 2 + len {
                     break;
                 }
+                let mut plain = vec![0u8; 65535];
+                let n = client.read_message(&buf[2..2 + len], &mut plain).unwrap();
+                if decode_frame(&plain[..n]).unwrap() == Frame::Padding {
+                    return; // 命中保活帧
+                }
+                buf.drain(..2 + len); // 数据帧（mux 控制/子流），继续扫
             }
         }
     })
     .await
     .expect("10s 内应收到至少一个保活 TU");
-    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    let mut client = client;
-    let mut plain = vec![0u8; 65535];
-    let n = client.read_message(&buf[2..2 + len], &mut plain).unwrap();
-    assert_eq!(decode_frame(&plain[..n]).unwrap(), Frame::Padding);
 }
 
 /// 8. 二次 GET /api/events（已挂载）→ 伪装。
