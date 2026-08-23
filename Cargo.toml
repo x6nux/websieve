@@ -19,3 +19,6 @@ rand = "0.9"
 snow = "0.10"
 blake3 = "1"
 aes-gcm = "0.10"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+axum = "0.8"
