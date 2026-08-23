@@ -42,7 +42,10 @@ async fn matrix(name: &str, id: MuxId) {
             let (c, s) = make_pair(id).await;
             open_and_echo(name, c, s).await;
         }
-        MuxId::H2mux => unreachable!(),
+        MuxId::H2mux => {
+            let (c, s) = make_pair(id).await;
+            open_and_echo(name, c, s).await;
+        }
     }
 }
 
@@ -79,6 +82,11 @@ async fn muxado_open_and_echo() {
 #[tokio::test]
 async fn picomux_open_and_echo() {
     matrix("picomux", MuxId::Picomux).await;
+}
+
+#[tokio::test]
+async fn h2mux_open_and_echo() {
+    matrix("h2mux", MuxId::H2mux).await;
 }
 
 // ---------- 用例 2：32 条并发流，各写 4KB 独立模式 ----------
@@ -158,6 +166,11 @@ async fn muxado_concurrent_streams() {
 #[tokio::test]
 async fn picomux_concurrent_streams() {
     concurrent_streams("picomux", MuxId::Picomux).await;
+}
+
+#[tokio::test]
+async fn h2mux_concurrent_streams() {
+    concurrent_streams("h2mux", MuxId::H2mux).await;
 }
 
 // ---------- 用例 3：慢流不饿死快流 ----------
@@ -251,6 +264,11 @@ async fn picomux_slow_stream_does_not_starve_fast() {
     slow_stream_does_not_starve_fast("picomux", MuxId::Picomux).await;
 }
 
+#[tokio::test]
+async fn h2mux_slow_stream_does_not_starve_fast() {
+    slow_stream_does_not_starve_fast("h2mux", MuxId::H2mux).await;
+}
+
 // ---------- 用例 4：关闭传播 ----------
 // 客户端 shutdown() 一条流 → 服务端 read 得到 EOF（Ok(0)）或 io 错误，
 // 两种都算关闭成功（各 crate 语义不同），但必须"终止"而不是永久挂起。
@@ -294,3 +312,45 @@ async fn muxado_close_propagates() {
 async fn picomux_close_propagates() {
     close_propagates("picomux", MuxId::Picomux).await;
 }
+
+#[tokio::test]
+async fn h2mux_close_propagates() {
+    close_propagates("h2mux", MuxId::H2mux).await;
+}
+
+// ---------- h2mux 专项：发送窗口耗尽应挂起而非报错 ----------
+// 客户端写超过初始流控窗口的数据且服务端暂不读：write 必须挂起而非报错，
+// 窗口释放后数据完整到达。
+
+#[tokio::test]
+async fn h2mux_capacity_exhaustion_blocks_not_errors() {
+    use std::time::Duration;
+
+    let (client, server) = make_pair(MuxId::H2mux).await;
+    let (mut c, mut s) = stream_pair(client.as_ref(), server.as_ref()).await;
+
+    const LEN: usize = 512 * 1024; // 远超初始流控窗口
+    let data = pattern_for(7, LEN);
+
+    let writer = tokio::spawn(async move {
+        c.write_all(&data).await.expect("write should block, not error");
+        c.shutdown().await.ok();
+    });
+
+    // 服务端先睡 300ms 再读——期间 writer 不应出错退出
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!writer.is_finished(), "writer must still be pending on full window");
+
+    let mut got = 0usize;
+    let mut chunk = [0u8; 8192];
+    while got < LEN {
+        match s.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => panic!("read error: {e}"),
+        }
+    }
+    assert_eq!(got, LEN, "all data after window release");
+    writer.await.expect("writer join");
+}
+

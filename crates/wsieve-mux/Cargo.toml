@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
 futures.workspace = true
+h2 = "0.4"
+http = "1"
 muxado = "0.5"
 picomux = "0.2"
 smux = "0.2"
