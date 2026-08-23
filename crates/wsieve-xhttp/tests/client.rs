@@ -12,7 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wsieve_transport::{HttpTransport, PostReply};
 use wsieve_proto::crypto::{build_server, gen_keypair};
 use wsieve_proto::hello::{Msg2, MuxId, encode_msg2};
-use wsieve_proto::tu::{Frame, TuDecoder, MAX_PAYLOAD};
+use wsieve_proto::tu::{Frame, MAX_PAYLOAD};
 use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
 
 /// 录制的一条上行请求
