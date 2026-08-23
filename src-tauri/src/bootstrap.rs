@@ -6,6 +6,7 @@
 
 use crate::emitter_src::EMITTER_JS;
 use wsieve_proto::hello::MuxId;
+use wsieve_xhttp::DEFAULT_MUX;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -38,8 +39,8 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
             })
             .collect(),
         Err(_) => vec![
+            DEFAULT_MUX,
             MuxId::Yamux,
-            MuxId::Smux,
             MuxId::Muxado,
             MuxId::Picomux,
             MuxId::H2mux,
