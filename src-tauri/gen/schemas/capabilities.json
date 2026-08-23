@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"emitter（initialization_script 注入）需要 core IPC 原语；窗口由 setup 代码创建，因此挂在 main 窗口","remote":{"urls":["http://127.0.0.1:*","http://**:*","https://**:*"]},"local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:webview:default","core:window:default","default","allow-wsieve-heartbeat","allow-wsieve-raw-post","allow-wsieve-raw-stream"]}}

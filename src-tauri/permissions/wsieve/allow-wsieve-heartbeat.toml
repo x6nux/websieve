@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-wsieve-heartbeat"
+description = "Allows the emitter heartbeat command"
+commands.allow = ["wsieve_heartbeat"]

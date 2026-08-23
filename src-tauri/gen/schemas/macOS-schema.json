@@ -177,6 +177,30 @@
       "description": "Permission identifier",
       "oneOf": [
         {
+          "description": "emitter IPC: heartbeat + raw frame channels (app commands)\n#### This default permission set includes:\n\n- `allow-wsieve-heartbeat`\n- `allow-wsieve-raw-post`\n- `allow-wsieve-raw-stream`",
+          "type": "string",
+          "const": "default",
+          "markdownDescription": "emitter IPC: heartbeat + raw frame channels (app commands)\n#### This default permission set includes:\n\n- `allow-wsieve-heartbeat`\n- `allow-wsieve-raw-post`\n- `allow-wsieve-raw-stream`"
+        },
+        {
+          "description": "Allows the emitter heartbeat command",
+          "type": "string",
+          "const": "allow-wsieve-heartbeat",
+          "markdownDescription": "Allows the emitter heartbeat command"
+        },
+        {
+          "description": "Allows the emitter upstream POST result command",
+          "type": "string",
+          "const": "allow-wsieve-raw-post",
+          "markdownDescription": "Allows the emitter upstream POST result command"
+        },
+        {
+          "description": "Allows the emitter downlink chunk command",
+          "type": "string",
+          "const": "allow-wsieve-raw-stream",
+          "markdownDescription": "Allows the emitter downlink chunk command"
+        },
+        {
           "description": "Default core plugins set.\n#### This default permission set includes:\n\n- `core:path:default`\n- `core:event:default`\n- `core:window:default`\n- `core:webview:default`\n- `core:app:default`\n- `core:image:default`\n- `core:resources:default`\n- `core:menu:default`\n- `core:tray:default`",
           "type": "string",
           "const": "core:default",

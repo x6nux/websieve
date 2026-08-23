@@ -54,11 +54,17 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
     })
 }
 
-/// 注入 emitter 的 initialization script。base64(EMITTER_JS) 编成 data:
-/// URL，避开在 JS 字符串里转义源码的坑。
+/// 注入 emitter 的 initialization script。
+///
+/// 双层 base64：内层是 emitter 源码，外层再编一次，使 `window.atob()` 的
+/// 输出恰好是合法的 emitter 源码文本，经 `<script>.textContent` 直接执行。
+/// 不用 `src=data:` 子资源——WKWebView 会拦截 data: URL 的脚本加载
+/// （Task 18 E2E 实测：onload/onerror 均不触发）。
 pub fn loader_js() -> String {
     let b64 = crate::bridge::bs64_encode(EMITTER_JS.as_bytes());
-    format!(
-        r#"(function(){{var s=document.createElement('script');s.src='data:text/javascript;base64,{b64}';document.head?document.head.appendChild(s):document.currentScript.parentNode.appendChild(s);}})();"#
-    )
+    let b64_b64 = crate::bridge::bs64_encode(b64.as_bytes());
+    let js = format!(
+        r#"(function(){{var t=document.createElement('script');t.textContent=window.atob(window.atob('{b64_b64}'));(document.head||document.documentElement).appendChild(t);}})();"#
+    );
+    js
 }

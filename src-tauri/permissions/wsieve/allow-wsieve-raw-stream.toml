@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-wsieve-raw-stream"
+description = "Allows the emitter downlink chunk command"
+commands.allow = ["wsieve_raw_stream"]

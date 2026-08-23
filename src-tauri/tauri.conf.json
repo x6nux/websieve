@@ -6,17 +6,7 @@
   "build": {},
   "app": {
     "withGlobalTauri": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "websieve",
-        "width": 420,
-        "height": 200,
-        "resizable": true,
-        "visible": true,
-        "backgroundThrottling": "disabled"
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-wsieve-raw-post"
+description = "Allows the emitter upstream POST result command"
+commands.allow = ["wsieve_raw_post"]

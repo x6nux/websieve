@@ -5727,6 +5727,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tauri-utils",
  "tokio",
  "tokio-stream",
  "tracing",

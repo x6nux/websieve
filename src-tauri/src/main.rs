@@ -49,6 +49,9 @@ fn main() {
             .title("websieve")
             .inner_size(480.0, 320.0)
             .visible(true)
+            // spec §3.4：后台节流压制——macOS WKWebView 后台/隐藏时挂起
+            // JS 定时器与 fetch（Task 18 E2E 实测心跳/流分块会停摆）。
+            .background_throttling(tauri_utils::config::BackgroundThrottlingPolicy::Disabled)
             // spec §3.4：后台节流压制（macOS 14+ 生效）
             .initialization_script(bootstrap::loader_js())
             .build()?;

@@ -1,0 +1,8 @@
+"$schema" = "schemas/schema.json"
+[default]
+description = "emitter IPC: heartbeat + raw frame channels (app commands)"
+permissions = [
+  "allow-wsieve-heartbeat",
+  "allow-wsieve-raw-post",
+  "allow-wsieve-raw-stream",
+]
