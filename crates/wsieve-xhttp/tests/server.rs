@@ -13,14 +13,14 @@ async fn reorder_and_dedup() {
     // 创建会话（握手状态占位符）
     s.create(sid).await;
 
-    // 乱序推送：2, 0, 1
-    s.push_post(&sid, 2, Bytes::copy_from_slice(b"cc"))
+    // 乱序推送：3, 1, 2（数据 seq 从 1 起：n=0 是握手，spec §6.4）
+    s.push_post(&sid, 3, Bytes::copy_from_slice(b"cc"))
         .await
         .unwrap();
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"aa"))
+    s.push_post(&sid, 1, Bytes::copy_from_slice(b"aa"))
         .await
         .unwrap();
-    s.push_post(&sid, 1, Bytes::copy_from_slice(b"bb"))
+    s.push_post(&sid, 2, Bytes::copy_from_slice(b"bb"))
         .await
         .unwrap();
 
@@ -41,8 +41,8 @@ async fn reorder_and_dedup() {
 
     assert_eq!(&buf[..6], b"aabbcc");
 
-    // 重复推送 seq 0 → 应该被去重，仍 Ok，不增加数据
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"AA"))
+    // 重复推送 seq 1 → 应该被去重，仍 Ok，不增加数据
+    s.push_post(&sid, 1, Bytes::copy_from_slice(b"AA"))
         .await
         .unwrap();
 
@@ -100,7 +100,7 @@ async fn gc_upstream_idle_reset_by_post() {
 
     // 过 100s 后来一个 POST（seq 0，落在 next_seq 上）
     tokio::time::advance(Duration::from_secs(100)).await;
-    s.push_post(&sid, 0, Bytes::copy_from_slice(b"xx"))
+    s.push_post(&sid, 1, Bytes::copy_from_slice(b"xx"))
         .await
         .unwrap();
 
@@ -109,11 +109,11 @@ async fn gc_upstream_idle_reset_by_post() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     tokio::task::yield_now().await;
 
-    // 读得到 POST 的数据（会话活着，且 seq 0 可消费）
+    // 读得到 POST 的数据（会话活着，且 seq 1 可消费）
     let mut buf = vec![0u8; 10];
     let n = timeout(Duration::from_millis(100), s.read(&sid, &mut buf))
         .await
-        .expect("session alive, seq 0 buffered")
+        .expect("session alive, seq 1 buffered")
         .unwrap();
     assert_eq!(&buf[..n], b"xx");
 
@@ -133,11 +133,11 @@ async fn buffer_overflow_kills() {
 
     s.create(sid).await;
 
-    // 推送 31 个乱序 POST（seq 1..=31，缺 0）
-    // 第 31 个应该返回 SessionGone
-    for i in 1..=31 {
+    // 推送 31 个乱序 POST（seq 2..=32，缺 1=next_seq，空洞）
+    // 堆积超上限（30）且有空洞 → SessionGone
+    for i in 2..=32 {
         let result = s.push_post(&sid, i, Bytes::from(vec![0u8; 10])).await;
-        if i == 31 {
+        if i == 32 {
             assert!(matches!(result, Err(SessionGone)));
         } else {
             result.unwrap();

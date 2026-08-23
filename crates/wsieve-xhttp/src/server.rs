@@ -110,7 +110,7 @@ impl SessionStore {
         inner.sessions.insert(
             sid,
             Session {
-                next_seq: 0,
+                next_seq: 1, // n=0 是握手 POST，数据 seq 从 1 起（spec §6.4）
                 heap: BTreeMap::new(),
                 attached: false,
                 last_upstream_at: Instant::now(),
@@ -156,10 +156,13 @@ impl SessionStore {
             waker.wake();
         }
         inner.notify.notify_one();
+        #[cfg(any())]
+        eprintln!("");
         Ok(())
     }
 
-    /// 读取数据（阻塞直到有数据或会话死亡）
+    /// 读取数据（阻塞直到有数据或会话死亡）。
+    /// 返回 0 表示 body 为空 POST（心跳）；调用方继续读即可。
     pub async fn read(&self, sid: &Sid, out: &mut [u8]) -> Result<usize, SessionGone> {
         // Notify 句柄必须在 block 外持有：`Notified` future 借用 Notify 本体
         let notify = {
@@ -171,11 +174,19 @@ impl SessionStore {
                 let mut inner = self.inner.lock().await;
                 let session = inner.sessions.get_mut(sid).ok_or(SessionGone)?;
 
-                // 尝试从堆中取 next_seq
-                if let Some(b) = session.heap.remove(&session.next_seq) {
+                // 尝试从堆中取 next_seq；body 超过 out 容量时保留剩余部分，
+                // 下次 read 继续吐（绝不丢字节）
+                if let Some(mut b) = session.heap.remove(&session.next_seq) {
+                    if b.len() > out.len() {
+                        let n = out.len();
+                        out.copy_from_slice(&b[..n]);
+                        b = b.slice(n..);
+                        session.heap.insert(session.next_seq, b);
+                        return Ok(n);
+                    }
                     session.next_seq += 1;
-                    let n = out.len().min(b.len());
-                    out[..n].copy_from_slice(&b[..n]);
+                    let n = b.len();
+                    out[..n].copy_from_slice(&b);
                     return Ok(n);
                 }
             }
@@ -191,6 +202,25 @@ impl SessionStore {
         if let Some(session) = inner.sessions.remove(sid) {
             if let Some(w) = session.read_waker {
                 w.wake();
+            }
+        }
+        inner.notify.notify_one();
+    }
+
+    /// 存活会话数（测试/监控用）。
+    pub async fn session_count(&self) -> usize {
+        self.inner.lock().await.sessions.len()
+    }
+
+    /// 杀死全部会话（测试/管理用）。
+    pub async fn kill_all(&self) {
+        let mut inner = self.inner.lock().await;
+        let sids: Vec<Sid> = inner.sessions.keys().copied().collect();
+        for sid in sids {
+            if let Some(session) = inner.sessions.remove(&sid) {
+                if let Some(w) = session.read_waker {
+                    w.wake();
+                }
             }
         }
         inner.notify.notify_one();

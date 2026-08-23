@@ -238,9 +238,6 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
     }
 }
 
-/// 失败路径重建一个最小请求（伪装处理器需要原始请求形态；失败时 body 已消费）。
-
-
 /// 失败路径的最小请求（body 已消费的场合）。
 fn bad_req() -> axum::http::Request<Body> {
     axum::http::Request::builder()
@@ -371,7 +368,7 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
         .await
     };
     // 挂载（已挂载/无会话 → Err → 伪装）。句柄持有至响应流结束。
-    let _downlink = match state.store.attach_downlink(&sid).await {
+    let handle = match state.store.attach_downlink(&sid).await {
         Ok(h) => h,
         Err(_) => return fail().await,
     };
@@ -379,16 +376,19 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
         return fail().await;
     };
 
-    let stream = ReceiverStream::new(dl_rx);
+    // 句柄随流存活：map 闭包 move 捕获 handle，Body 消费完毕（流结束/客户端
+    // 断开）时闭包 drop → DownlinkHandle::Drop → 异步 GC 会话。
+    let stream = ReceiverStream::new(dl_rx).map(move |b| {
+        let _keep = &handle;
+        Ok::<Bytes, std::io::Error>(b)
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(header::SERVER, "nginx")
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-store")
         .header("x-accel-buffering", "no")
-        .body(Body::from_stream(
-            stream.map(Result::<Bytes, std::io::Error>::Ok),
-        ))
+        .body(Body::from_stream(stream))
         .unwrap()
 }
 
@@ -405,8 +405,8 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
 /// SessionStore::read 返回 SessionGone 退出——背压停滞与死亡二选一，可接受。
 fn spawn_session(state: Arc<AppState>, sid: Sid, chosen: MuxId, transport: TransportState) {
     tokio::spawn(async move {
-        let (up_pump_side, up_noise_side) = tokio::io::duplex(8192);
-        let (dl_noise_side, dl_pump_side) = tokio::io::duplex(8192);
+        let (up_pump_side, up_noise_side) = tokio::io::duplex(65536);
+        let (dl_noise_side, dl_pump_side) = tokio::io::duplex(65536);
         let noise = wsieve_proto::noise_stream::NoiseStream::new(
             transport,
             PairIo {
@@ -432,7 +432,9 @@ fn spawn_session(state: Arc<AppState>, sid: Sid, chosen: MuxId, transport: Trans
                             }
                         }
                         Ok(_) => continue,
-                        Err(_) => break, // SessionGone：会话 GC/被杀
+                        Err(_) => {
+                            break;
+                        }
                     }
                 }
                 let _ = up.shutdown().await;

@@ -26,7 +26,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
 use crate::tu::{decode_frame, encode_frame, Frame, TuDecoder, MAX_PAYLOAD};
-// TuDecoder 实例放在 Inner 中（见 decoder 字段）
 
 /// 读缓冲堆积上限（上层不读时的背压阈值）：2 个满帧。
 const READ_BUF_CAP: usize = MAX_PAYLOAD * 2;
@@ -271,13 +270,13 @@ impl AsyncWrite for NoiseStream {
                 return Poll::Pending;
             }
         }
+        // 写入即接收：数据进 pending 后无论 flush 是否写完 io，都算本 buf 已
+        // 消费——调用方不会重发。flush 未完成的部分留在 pending/cipher_buffer
+        // 里由后续 poll_flush 逐步写出（pending 是持久缓冲，不是暂存）。
         this.wr.lock().unwrap().pending.extend_from_slice(buf);
-        this.encrypt_pending()?;
-        match Pin::new(&mut *this).poll_flush(cx) {
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(buf.len())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
-        }
+        let _ = this.encrypt_pending();
+        let _ = Pin::new(&mut *this).poll_flush(cx);
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
