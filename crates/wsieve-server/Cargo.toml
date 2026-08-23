@@ -28,3 +28,4 @@ wsieve-transport = { version = "0.1.0", path = "../wsieve-transport" }
 [dev-dependencies]
 futures = { workspace = true }
 async-trait = { workspace = true }
+wsieve-socks5 = { version = "0.1.0", path = "../wsieve-socks5" }

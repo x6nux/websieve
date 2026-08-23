@@ -2792,6 +2792,7 @@ dependencies = [
  "tower",
  "wsieve-mux",
  "wsieve-proto",
+ "wsieve-socks5",
  "wsieve-transport",
  "wsieve-xhttp",
 ]
