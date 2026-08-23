@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wsieve-proto",
+    "crates/wsieve-transport",
+    "crates/wsieve-xhttp",
+    "crates/wsieve-mux",
+    "crates/wsieve-server",
+    "crates/wsieve-socks5",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+rand = "0.9"
+snow = "0.10"
+blake3 = "1"
+aes-gcm = "0.10"
