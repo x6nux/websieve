@@ -159,11 +159,13 @@ pub fn build_server(server_priv: &[u8]) -> Result<HandshakeState, Error> {
 }
 
 /// 生成 X25519 静态密钥对：(私钥 32B, 公钥 32B)。
+/// StaticSecret 启用 zeroize feature，drop 时自动擦除（含内部 seed）。
 pub fn gen_keypair() -> ([u8; 32], [u8; 32]) {
     use rand::RngCore;
-    let mut seed = [0u8; 32];
-    rand::rng().fill_bytes(&mut seed);
-    let priv_key = StaticSecret::from(seed);
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    rand::rng().fill_bytes(&mut seed[..]);
+    let priv_key = StaticSecret::from(*seed);
     let pub_key = PublicKey::from(&priv_key);
     (priv_key.to_bytes(), pub_key.to_bytes())
+    // seed 是 Zeroizing，drop 时自动擦除
 }
