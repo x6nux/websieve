@@ -31,6 +31,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Ledger {
     tcps: HashMap<u64, BTreeSet<String>>,
     protos: HashMap<u64, String>,
+    /// path -> 收到的 OPTIONS 次数（CORS 预检）。
+    preflights: HashMap<String, usize>,
 }
 
 impl Ledger {
@@ -40,6 +42,10 @@ impl Ledger {
 
     fn note_proto(&mut self, tcp: u64, proto: &str) {
         self.protos.insert(tcp, proto.to_string());
+    }
+
+    fn note_preflight(&mut self, path: &str) {
+        *self.preflights.entry(path.to_string()).or_insert(0) += 1;
     }
 
     /// 承载过会话的 TCP 里协商到 h2 的条数。h2 是「多会话挤一条 TCP」的
@@ -113,6 +119,18 @@ for (let i = 0; i < N; i++) {{
   }}, 500);
 }}
 log('opened ' + N + ' sessions');
+// Content-Type 对照：text/plain 属 CORS 简单请求白名单，不该产生预检；
+// application/octet-stream 不在白名单，每个新 origin 应产生一次预检。
+if (ALT) {{
+  fetch(ALT + '/ct/plain?sid=ctplain', {{
+    method: 'POST', body: new Uint8Array([1,2,3]),
+    headers: {{ 'Content-Type': 'text/plain' }},
+  }}).then(() => log('ct/plain sent')).catch(e => log('ct/plain err ' + e));
+  fetch(ALT + '/ct/binary?sid=ctbinary', {{
+    method: 'POST', body: new Uint8Array([1,2,3]),
+    headers: {{ 'Content-Type': 'application/octet-stream' }},
+  }}).then(() => log('ct/binary sent')).catch(e => log('ct/binary err ' + e));
+}}
 </script>"#
     )
 }
@@ -169,9 +187,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(secs)).await;
         println!("{}", l.lock().unwrap().verdict());
-        for (tcp, sids) in l.lock().unwrap().tcps.iter() {
-            if !sids.is_empty() {
-                println!("TCP#{tcp} sids={:?}", sids);
+        {
+            let g = l.lock().unwrap();
+            for (tcp, sids) in g.tcps.iter() {
+                if !sids.is_empty() {
+                    println!("TCP#{tcp} sids={:?}", sids);
+                }
+            }
+            if !g.preflights.is_empty() || !g.tcps.is_empty() {
+                println!("--- CORS 预检（OPTIONS）计数 ---");
+                for name in ["/ct/plain", "/ct/binary"] {
+                    println!("{name}: {}", g.preflights.get(name).copied().unwrap_or(0));
+                }
             }
         }
         std::process::exit(0);
@@ -270,7 +297,13 @@ async fn serve_tls(
                     println!("TCP#{tcp_id} <- {s}");
                 }
             }
-            Ok::<_, std::convert::Infallible>(respond(&path_q, sessions, &alt))
+            let method = req.method().clone();
+            if method == hyper::Method::OPTIONS {
+                let p = path_q.split('?').next().unwrap_or("").to_string();
+                l.lock().unwrap().note_preflight(&p);
+                println!("TCP#{tcp_id} OPTIONS {p}  ← 预检发生了");
+            }
+            Ok::<_, std::convert::Infallible>(respond(&method, &path_q, sessions, &alt))
         }
     });
     // auto builder：按 ALPN 结果自动走 h1 或 h2 —— 与真实 CDN 边缘一致。
@@ -279,7 +312,24 @@ async fn serve_tls(
         .await;
 }
 
-fn respond(path_q: &str, sessions: usize, alt_origin: &str) -> hyper::Response<axum::body::Body> {
+fn respond(
+    method: &hyper::Method,
+    path_q: &str,
+    sessions: usize,
+    alt_origin: &str,
+) -> hyper::Response<axum::body::Body> {
+    if method == hyper::Method::OPTIONS {
+        // 预检应答：允许 content-type，否则 octet-stream 那条会被浏览器拦下，
+        // 我们就看不到「预检之后请求确实发出」的对照。
+        return hyper::Response::builder()
+            .status(204)
+            .header("access-control-allow-origin", "*")
+            .header("access-control-allow-methods", "GET, POST, OPTIONS")
+            .header("access-control-allow-headers", "content-type")
+            .header("access-control-max-age", "86400")
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
     if path_q.starts_with("/api/events") {
         // 长挂流：永不结束，占住这条流/连接 —— 复刻 XHTTP 下行。
         let s = futures::stream::unfold((), |_| async {
