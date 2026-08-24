@@ -8,3 +8,292 @@ pub mod edit;
 pub mod model;
 
 pub use model::{Config, Dns, DnsCache, GeoxUrl, Proxy, Tun};
+
+use std::collections::HashSet;
+use std::path::Path;
+
+use serde_saphyr::{MessageFormatter, UserMessageFormatter};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("读取 {path} 失败：{source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("第 {line} 行第 {column} 列 YAML 语法错误：{message}")]
+    Syntax {
+        line: u64,
+        column: u64,
+        message: String,
+    },
+    #[error(
+        "不支持的出站类型 {kind}（节点「{name}」）。\
+         websieve 只支持自有协议，type 必须是 websieve。\
+         若这是从 Clash 配置粘贴来的，其中的 ss / vmess / trojan 等节点无法使用"
+    )]
+    UnsupportedProxyType { name: String, kind: String },
+    #[error("出站名重复：{0}。规则用名字引用出站，重名会产生歧义")]
+    DuplicateProxyName(String),
+}
+
+/// 从字符串读取配置。
+///
+/// 出错时给出**行号**——这是 UI 能把光标定到错处的唯一依据。行号取自
+/// serde-saphyr 的结构化 `Error::location()`，不是从错误文本里刮出来的：
+/// 刮文本会随上游措辞变化而静默失效，留下一个恒为 0 的假行号。
+pub fn load_str(s: &str) -> Result<Config, ConfigError> {
+    serde_saphyr::from_str::<Config>(s).map_err(|e| {
+        // format_message 给出**不含**位置后缀、也不含 ASCII 代码片段的裸消息；
+        // 位置由我们自己拼进中文模板，免得出现中英夹杂的两套坐标。
+        // 用 User 版而非 Default 版：这条消息直达终端用户，不该带内部细节。
+        let message = UserMessageFormatter.format_message(&e).into_owned();
+        // location() 在极少数无位置信息的错误上返回 None（如从 reader 读取时的
+        // 某些 IO 场景），退化为 0 —— UI 据此决定是否高亮某一行。
+        let (line, column) = e.location().map_or((0, 0), |l| (l.line(), l.column()));
+        ConfigError::Syntax {
+            line,
+            column,
+            message,
+        }
+    })
+}
+
+/// 从文件读取配置。
+pub fn load_file(path: &Path) -> Result<Config, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    load_str(&text)
+}
+
+impl Config {
+    /// 出站名集合，交给 `wsieve_route::RuleSet::build` 做规则引用校验。
+    pub fn outbound_names(&self) -> HashSet<String> {
+        self.proxies.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// 规则原文列表，交给 `wsieve_route::RuleSet::build` 解析。
+    /// 本 crate 只把规则当字符串，不认识其语义。
+    pub fn rule_lines(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.value.clone()).collect()
+    }
+
+    /// 配置自身的校验。规则的校验在 wsieve-route 里做 ——
+    /// 本 crate 刻意不认识规则语义。
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for p in &self.proxies {
+            if p.kind != "websieve" {
+                return Err(ConfigError::UnsupportedProxyType {
+                    name: p.name.clone(),
+                    kind: p.kind.clone(),
+                });
+            }
+            if !seen.insert(p.name.as_str()) {
+                return Err(ConfigError::DuplicateProxyName(p.name.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = r#"
+mixed-port: 7890
+proxies:
+  - name: "日本节点"
+    type: websieve
+    url: https://example.com/
+    server-pub: "aa"
+    client-priv: "bb"
+rules:
+  - MATCH,日本节点
+"#;
+
+    #[test]
+    fn parses_minimal_config() {
+        let c = load_str(MINIMAL).unwrap();
+        assert_eq!(c.mixed_port, 7890);
+        assert_eq!(c.proxies.len(), 1);
+        assert_eq!(c.proxies[0].name, "日本节点");
+        assert_eq!(c.rules.len(), 1);
+        assert_eq!(c.rules[0].value, "MATCH,日本节点");
+    }
+
+    #[test]
+    fn omitted_fields_get_defaults() {
+        let c = load_str(MINIMAL).unwrap();
+        assert_eq!(c.mode, "rule");
+        assert_eq!(c.shard_base_port, 18443);
+        assert_eq!(c.dns.timeout_ms, 2000);
+        assert_eq!(c.carrier, "shared");
+    }
+
+    #[test]
+    fn proxy_level_defaults_apply() {
+        // extra-sessions / mux-prefs 省略时要有值，否则条带数会是 0
+        let c = load_str(MINIMAL).unwrap();
+        assert_eq!(c.proxies[0].extra_sessions, 3);
+        assert_eq!(c.proxies[0].mux_prefs, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rules_carry_line_numbers() {
+        // MINIMAL 首行是空行，故 rules: 在第 9 行、第一条规则在第 10 行。
+        // 断言精确值而非 > 0：Task 14 的定点改写全靠这个行号，
+        // 差一行就会改错别人的规则。
+        let c = load_str(MINIMAL).unwrap();
+        assert_eq!(c.rules[0].defined.line(), 10, "第一条规则应在第 10 行");
+    }
+
+    #[test]
+    fn rule_line_numbers_survive_leading_comments() {
+        // 注释与空行不能把行号算歪 —— 这正是定点改写要跨过的东西
+        let cfg = "rules:\n  # 先走直连\n  - DOMAIN,a.com,DIRECT\n\n  # 兜底\n  - MATCH,DIRECT\n";
+        let c = load_str(cfg).unwrap();
+        assert_eq!(c.rules.len(), 2);
+        assert_eq!(c.rules[0].defined.line(), 3);
+        assert_eq!(c.rules[1].defined.line(), 6);
+    }
+
+    #[test]
+    fn syntax_error_reports_a_line_number() {
+        let bad = "mixed-port: 7890\n  bad-indent: true\n";
+        let e = load_str(bad).unwrap_err();
+        match e {
+            ConfigError::Syntax { line, .. } => assert!(line > 0, "应给出行号"),
+            other => panic!("应是语法错，实为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_error_line_points_at_the_actual_offender() {
+        // 同一个错搬到不同行，行号必须跟着走。断言精确值而非 > 0：
+        // 一个恒返回 1（或任何常数）的实现能过 `> 0`，却对 UI 毫无用处。
+        for (line_no, pad) in [(1u64, ""), (3, "mode: rule\nallow-lan: true\n")] {
+            let bad = format!("{pad}geo-update-interval: not-a-number\n");
+            let e = load_str(&bad).unwrap_err();
+            match e {
+                ConfigError::Syntax { line, message, .. } => {
+                    assert_eq!(line, line_no, "行号应随出错位置移动，实为第 {line} 行");
+                    assert!(message.contains("u32"), "应说明为何不合法：{message}");
+                }
+                other => panic!("应是语法错，实为 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn missing_field_error_points_at_the_incomplete_mapping() {
+        // 缺字段时，serde-saphyr 给的是**该映射最后一行**的位置（此处第 3 行的
+        // `typ`），而非缺失字段本该出现的位置 —— 后者本来就不存在于文件里。
+        // 记下这个语义：UI 高亮这一行是对的，但别指望它指向 `type` 该在的地方。
+        let bad = "proxies:\n  - name: x\n    typ: websieve\nmode: rule\n";
+        let e = load_str(bad).unwrap_err();
+        match e {
+            ConfigError::Syntax { line, message, .. } => {
+                assert_eq!(line, 3, "应指向该序列项的末行，实为第 {line} 行");
+                assert!(message.contains("type"), "应点名缺失的字段：{message}");
+            }
+            other => panic!("应是语法错，实为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_error_message_is_rendered_without_ascii_snippet() {
+        // format_message 给的是裸消息。若误用 Display，错误里会混进
+        // 多行 ASCII 代码片段和一套英文行列坐标，与中文模板打架。
+        let bad = "proxies:\n\t- name: x\n";
+        let e = load_str(bad).unwrap_err();
+        let text = e.to_string();
+        assert!(!text.contains("-->"), "不该带代码片段：{text}");
+        assert!(!text.contains("at line"), "不该带第二套坐标：{text}");
+        assert!(text.starts_with("第 2 行第 2 列"), "位置应在句首：{text}");
+    }
+
+    #[test]
+    fn unsupported_proxy_type_is_named_explicitly() {
+        let cfg = r#"
+proxies:
+  - name: "别人的节点"
+    type: vmess
+    url: https://x.com/
+    server-pub: "aa"
+    client-priv: "bb"
+rules:
+  - MATCH,别人的节点
+"#;
+        let c = load_str(cfg).unwrap();
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("vmess"), "要点名不支持的类型：{e}");
+        assert!(e.contains("别人的节点"), "要点名是哪个节点：{e}");
+    }
+
+    #[test]
+    fn duplicate_proxy_names_are_rejected() {
+        // 规则用名字引用出站，重名会让引用产生歧义
+        let cfg = r#"
+proxies:
+  - name: "A"
+    type: websieve
+    url: https://x.com/
+    server-pub: "aa"
+    client-priv: "bb"
+  - name: "A"
+    type: websieve
+    url: https://y.com/
+    server-pub: "cc"
+    client-priv: "dd"
+rules:
+  - MATCH,A
+"#;
+        let e = load_str(cfg).unwrap().validate().unwrap_err().to_string();
+        assert!(e.contains('A'), "{e}");
+    }
+
+    #[test]
+    fn valid_config_passes_validation() {
+        load_str(MINIMAL).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn outbound_names_are_exposed_for_rule_validation() {
+        let c = load_str(MINIMAL).unwrap();
+        let names = c.outbound_names();
+        assert!(names.contains("日本节点"));
+    }
+
+    #[test]
+    fn rule_lines_strips_spans_for_the_route_crate() {
+        let c = load_str(MINIMAL).unwrap();
+        assert_eq!(c.rule_lines(), vec!["MATCH,日本节点".to_string()]);
+    }
+
+    #[test]
+    fn load_file_reads_from_disk() {
+        let path = std::env::temp_dir().join("wsieve-config-load-file-test.yaml");
+        std::fs::write(&path, MINIMAL).unwrap();
+        let c = load_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(c.mixed_port, 7890);
+        assert_eq!(c.rules[0].value, "MATCH,日本节点");
+    }
+
+    #[test]
+    fn missing_file_reports_the_path() {
+        let path = std::env::temp_dir().join("wsieve-config-definitely-absent.yaml");
+        let e = load_file(&path).unwrap_err();
+        match e {
+            ConfigError::Io { path: p, .. } => {
+                assert!(p.contains("wsieve-config-definitely-absent"), "{p}")
+            }
+            other => panic!("应是 IO 错，实为 {other:?}"),
+        }
+    }
+}
