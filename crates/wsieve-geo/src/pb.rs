@@ -40,6 +40,12 @@ impl<'a> Reader<'a> {
             if shift >= 64 {
                 return Err(PbError::VarintOverflow);
             }
+            // protobuf 的 u64 varint 最多 10 字节：前 9 个各贡献 7 位（63 位），
+            // 第 10 个只剩 1 位可用。此时若高位非零，说明这个数超出 u64 ——
+            // 必须报错，不能让 << 63 把它们静默移出去。
+            if shift == 63 && b & 0x7f > 1 {
+                return Err(PbError::VarintOverflow);
+            }
             v |= ((b & 0x7f) as u64) << shift;
             if b & 0x80 == 0 {
                 return Ok(v);
@@ -143,5 +149,24 @@ mod tests {
         // 11 个带续位的字节 —— 超过 u64 能表示的范围
         let mut r = Reader::new(&[0xFF; 11]);
         assert!(r.varint().is_err());
+    }
+
+    #[test]
+    fn overlong_tenth_byte_errors_instead_of_truncating() {
+        // 10 字节 varint 的第 10 字节只能是 0 或 1。给 0x02 意味着
+        // 这个数超出 u64，必须报错而不是把高位静默移出去。
+        let mut buf = vec![0xFF; 9];
+        buf.push(0x02);
+        let mut r = Reader::new(&buf);
+        assert!(matches!(r.varint(), Err(PbError::VarintOverflow)));
+    }
+
+    #[test]
+    fn maximal_valid_varint_still_decodes() {
+        // 反向守住：合法的 u64::MAX（第 10 字节为 0x01）不能被误判为溢出
+        let mut buf = vec![0xFF; 9];
+        buf.push(0x01);
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.varint().unwrap(), u64::MAX);
     }
 }
