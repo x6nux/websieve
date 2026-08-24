@@ -2778,6 +2778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsieve-route"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "thiserror",
+ "wsieve-geo",
+ "wsieve-proto",
+]
+
+[[package]]
 name = "wsieve-server"
 version = "0.1.0"
 dependencies = [

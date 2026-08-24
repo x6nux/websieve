@@ -1,0 +1,13 @@
+[package]
+name = "wsieve-route"
+version = "0.1.0"
+edition = "2021"
+description = "Clash 语法规则解析与两阶段路由引擎（纯同步、无网络）"
+
+[dependencies]
+wsieve-proto = { path = "../wsieve-proto" }
+wsieve-geo = { path = "../wsieve-geo" }
+thiserror = { workspace = true }
+ipnet = "2"
+
+[dev-dependencies]
