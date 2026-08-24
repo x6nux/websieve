@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/wsieve-geo",
     "crates/wsieve-proto",
     "crates/wsieve-transport",
     "crates/wsieve-xhttp",
