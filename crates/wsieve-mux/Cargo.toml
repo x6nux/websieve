@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow.workspace = true
+rand.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

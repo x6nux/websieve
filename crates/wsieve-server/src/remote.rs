@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use wsieve_mux::stripe_runtime::{StripeCfg, StripeConn, StripeListener};
+use wsieve_mux::stripe_runtime::{ConnRegistry, SessionGroup, StripeCfg, StripeConn, StripeListener};
 use wsieve_mux::{Mux, MuxStream};
 use wsieve_proto::addr::{AddrPort, TargetAddr};
 
@@ -14,8 +14,21 @@ use wsieve_proto::addr::{AddrPort, TargetAddr};
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 会话级 accept 循环：StripeListener 按 conn_id 路由 lane / 建新 conn。
-pub async fn session_loop(mux: Box<dyn Mux>) {
-    let listener = StripeListener::new(Arc::from(mux), StripeCfg::with_env());
+/// `registry` 跨会话共享（多 TCP 条带：同一 conn 的 lane 可能来自任意会话）。
+/// 会话死亡只让其上的 lane 断开；conn 存活与否取决于自身 lane 全断/CLOSE，
+/// 与任一单会话无关。
+///
+/// `group` 是本会话所属的会话组（同一客户端 msg1.group_id 的全部会话）。
+/// 新 conn 的下行 lane 在组内会话上轮转打开 —— 这是下行条带真正跨 TCP
+/// 的地方：钉死在单会话上时下载全程只吃一个拥塞窗口。
+/// 传入的 `mux` 由调用方持有 Arc（组表存 Weak），组成员的存活期即会话
+/// 本身的存活期。
+pub async fn session_loop(
+    mux: Arc<dyn Mux>,
+    registry: Arc<ConnRegistry>,
+    group: Arc<SessionGroup>,
+) {
+    let listener = StripeListener::with_group(mux, StripeCfg::with_env(), registry, group);
     listener.run(serve_conn).await;
 }
 

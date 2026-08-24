@@ -84,6 +84,13 @@ pub struct AppState {
     pub enabled_mux: Vec<MuxId>,
     pub keepalive: KeepaliveRange,
     pub disguise: DisguiseCfg,
+    /// 条带 conn 全局表（跨 XHTTP 会话共享）：多 TCP 条带时同一 conn 的
+    /// lane 可能来自任意会话。conn 存活不依赖任一单会话。
+    pub stripe_registry: Arc<wsieve_mux::stripe_runtime::ConnRegistry>,
+    /// 会话组表：msg1.group_id → 同一客户端的全部 XHTTP 会话。服务端据此
+    /// 把下行 lane 铺到组内任意会话（= 任意 TCP）上，下载才能吃到多个
+    /// 拥塞窗口。单会话客户端 = 只有一个成员的组，行为不变。
+    pub session_groups: Arc<wsieve_mux::stripe_runtime::SessionGroups>,
 }
 
 impl AppState {
@@ -113,6 +120,8 @@ impl AppState {
             enabled_mux,
             keepalive,
             disguise,
+            stripe_registry: Arc::new(wsieve_mux::stripe_runtime::ConnRegistry::new()),
+            session_groups: Arc::new(wsieve_mux::stripe_runtime::SessionGroups::new()),
         });
         spawn_seen_sweep(state.clone());
         state
@@ -341,7 +350,7 @@ async fn handshake(
     let (dl_tx, dl_rx) = mpsc::channel::<Bytes>(256);
     state.downlink_tx.lock().await.insert(sid, dl_tx.clone());
     state.downlink_rx.lock().await.insert(sid, dl_rx);
-    spawn_session(state.clone(), sid, chosen, transport);
+    spawn_session(state.clone(), sid, chosen, transport, msg1.group_id);
 
     // 200 + TU(msg2)。
     let mut resp_body = Vec::with_capacity(2 + msg2_cipher.len());
@@ -403,7 +412,13 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
 /// 启动即跑（不等 GET attach）：下行通道有界缓冲（256 TU），客户端正常
 /// 情况毫秒级 attach；30s attach 窗口内不 attach 则会话被 GC，本任务随
 /// SessionStore::read 返回 SessionGone 退出——背压停滞与死亡二选一，可接受。
-fn spawn_session(state: Arc<AppState>, sid: Sid, chosen: MuxId, transport: TransportState) {
+fn spawn_session(
+    state: Arc<AppState>,
+    sid: Sid,
+    chosen: MuxId,
+    transport: TransportState,
+    group_id: u128,
+) {
     tokio::spawn(async move {
         let (up_pump_side, up_noise_side) = tokio::io::duplex(65536);
         let (dl_noise_side, dl_pump_side) = tokio::io::duplex(65536);
@@ -464,7 +479,16 @@ fn spawn_session(state: Arc<AppState>, sid: Sid, chosen: MuxId, transport: Trans
         // mux + remote：NoiseStream 即 mux 的底层流。
         let io: wsieve_mux::MuxStream = Box::new(noise);
         if let Ok(mux) = wsieve_mux::mux_server_factory(chosen, io).await {
-            remote::session_loop(mux).await;
+            let mux: Arc<dyn wsieve_mux::Mux> = Arc::from(mux);
+            // 会话组登记：同一 group_id 的会话构成一组，新 conn 的下行 lane
+            // 在组内轮转开 → 下载跨多条 TCP（多拥塞窗口）。组表存 Weak，
+            // 本处的 Arc 是唯一强引用，会话任务退出即释放。
+            let group = state.session_groups.join(group_id, &mux);
+            // 注意：会话死亡不清理 stripe_registry——conn 由自身 lane
+            // EOF/CLOSE 机制终结，跨会话存活的 conn 不得被会话拆除带走。
+            remote::session_loop(mux.clone(), state.stripe_registry.clone(), group).await;
+            // 会话拆除：退出会话组（组空则删组条目）。
+            state.session_groups.leave(group_id, &mux);
         }
         // 会话终结：清理旁路表 + 杀会话（上行泵随 SessionGone 退出）。
         state.downlink_tx.lock().await.remove(&sid);

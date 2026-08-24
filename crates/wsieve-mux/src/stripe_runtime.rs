@@ -868,6 +868,151 @@ fn spawn_registry_cleanup(registry: Arc<ConnRegistry>, conn: &Arc<StripeConn>) {
     });
 }
 
+// ---------------- 服务端：会话组 ----------------
+
+/// 一个客户端的全部 XHTTP 会话（同一 msg1.group_id）。服务端据此把下行
+/// lane 铺到组内任意会话上——每个会话是独立 TCP，即独立拥塞窗口
+/// （aria2 效应）。组只在服务端存在，客户端侧由 `StripeDialer::sessions`
+/// 承担同样职责。
+///
+/// 成员用 `Weak<dyn Mux>`：会话拆除时其 `Arc<dyn Mux>` 由 session_loop 释放，
+/// 组表内的 Weak 自然失效，不会把已死会话的 mux（及其驱动任务、缓冲区）
+/// 钉在内存里。取用时 upgrade 失败即摘除，无需依赖 deregister 的及时性
+/// （deregister 仍然做，只是不再是唯一回收路径）。
+#[derive(Default)]
+pub struct SessionGroup {
+    members: Mutex<Vec<std::sync::Weak<dyn Mux>>>,
+    rr: AtomicU64,
+}
+
+impl SessionGroup {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 加入一个会话 mux（幂等）。
+    pub fn insert(&self, mux: &Arc<dyn Mux>) {
+        let mut m = self.members.lock().unwrap();
+        m.retain(|w| w.strong_count() > 0);
+        if m.iter().any(|w| w.upgrade().is_some_and(|a| Arc::ptr_eq(&a, mux))) {
+            return;
+        }
+        m.push(Arc::downgrade(mux));
+    }
+
+    /// 摘除一个会话 mux（会话拆除时调用）。
+    pub fn remove(&self, mux: &Arc<dyn Mux>) {
+        let mut m = self.members.lock().unwrap();
+        m.retain(|w| match w.upgrade() {
+            Some(a) => !Arc::ptr_eq(&a, mux),
+            None => false, // 顺带清理已失效的 Weak
+        });
+    }
+
+    /// 当前存活成员数。
+    pub fn len(&self) -> usize {
+        let mut m = self.members.lock().unwrap();
+        m.retain(|w| w.strong_count() > 0);
+        m.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// 存活成员快照（按轮转起点旋转，供逐个尝试）。
+    fn live_rotated(&self) -> Vec<Arc<dyn Mux>> {
+        let mut m = self.members.lock().unwrap();
+        m.retain(|w| w.strong_count() > 0);
+        let live: Vec<Arc<dyn Mux>> = m.iter().filter_map(|w| w.upgrade()).collect();
+        drop(m);
+        if live.is_empty() {
+            return live;
+        }
+        let start = (self.rr.fetch_add(1, Ordering::Relaxed) as usize) % live.len();
+        let mut out = Vec::with_capacity(live.len());
+        out.extend_from_slice(&live[start..]);
+        out.extend_from_slice(&live[..start]);
+        out
+    }
+}
+
+/// group_id → 会话组表（AppState 级）。
+#[derive(Default)]
+pub struct SessionGroups {
+    map: Mutex<std::collections::HashMap<u128, Arc<SessionGroup>>>,
+}
+
+impl SessionGroups {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 取（或建）一个组，并把 mux 登记进去。返回组句柄，会话的 accept
+    /// 循环把它传给 `StripeListener`，新 conn 的下行 lane 即可跨组开。
+    pub fn join(&self, group_id: u128, mux: &Arc<dyn Mux>) -> Arc<SessionGroup> {
+        let g = {
+            let mut map = self.map.lock().unwrap();
+            map.entry(group_id)
+                .or_insert_with(|| Arc::new(SessionGroup::new()))
+                .clone()
+        };
+        g.insert(mux);
+        g
+    }
+
+    /// 会话拆除：从组内摘除该 mux；组空则删除组条目（否则 group_id 表
+    /// 随客户端重连无限增长）。
+    pub fn leave(&self, group_id: u128, mux: &Arc<dyn Mux>) {
+        let g = self.map.lock().unwrap().get(&group_id).cloned();
+        let Some(g) = g else { return };
+        g.remove(mux);
+        if g.is_empty() {
+            let mut map = self.map.lock().unwrap();
+            // 复查：leave 与 join 并发时可能刚有新成员进来
+            if map
+                .get(&group_id)
+                .is_some_and(|e| Arc::ptr_eq(e, &g) && e.is_empty())
+            {
+                map.remove(&group_id);
+            }
+        }
+    }
+
+    /// 当前组数（诊断/测试）。
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 组感知的 lane opener（服务端下行）：在组内存活会话上轮转开 lane，
+/// 逐个尝试直到成功。组为空 / 全部失败 → 回落到 conn 到达的那个会话
+/// （`fallback`），它至少是这条 conn 已经在用的那条 TCP。
+fn group_lane_opener(
+    conn_id: u64,
+    group: Arc<SessionGroup>,
+    fallback: Arc<dyn Mux>,
+) -> LaneOpener {
+    Arc::new(move |dir| {
+        let group = group.clone();
+        let fallback = fallback.clone();
+        Box::pin(async move {
+            for mux in group.live_rotated() {
+                match open_lane_on(&mux, conn_id, dir).await {
+                    Ok(s) => return Ok(s),
+                    // 开失败 = 该会话已死：摘除后继续试下一个
+                    Err(_) => group.remove(&mux),
+                }
+            }
+            open_lane_on(&fallback, conn_id, dir).await
+        })
+    })
+}
+
 // ---------------- 客户端：StripeDialer ----------------
 
 /// 客户端拨号器：分配 conn_id，建首 lane（OPEN + TargetAddr），后台归并
@@ -885,6 +1030,12 @@ pub struct StripeDialer {
 impl StripeDialer {
     pub fn dbg_conn(&self, id: u64) -> Option<Arc<StripeConn>> {
         self.registry.get(id)
+    }
+
+    /// 本拨号器的 conn 表。额外会话的入站 lane 若不经 `attach_session`
+    /// 而由调用方自建 accept 泵（诊断/测试），需要用它调 `join_inbound`。
+    pub fn registry(&self) -> Arc<ConnRegistry> {
+        self.registry.clone()
     }
 
     /// 当前挂载的会话 mux 数（含主会话）。
@@ -1079,12 +1230,13 @@ impl StripeDialer {
 
 /// 服务端监听器：accept mux 流 → 按 conn_id 路由 / 建新 conn（OPEN 带 addr）。
 /// `registry` 由外部注入——多会话条带要求跨会话共享同一张表（conn 的 lane
-/// 可能来自任意会话）。StripeConn 的加 lane 始终走本监听器所属会话的 mux
-/// （服务端单会话开 lane，见结构设计说明）。
+/// 可能来自任意会话）。`group` 为本会话所属的会话组（同一客户端的全部
+/// XHTTP 会话）：新 conn 的下行 lane 在组内轮转开，从而跨多条 TCP。
 pub struct StripeListener {
     mux: Arc<dyn Mux>,
     cfg: StripeCfg,
     registry: Arc<ConnRegistry>,
+    group: Option<Arc<SessionGroup>>,
 }
 
 /// 路由一条入站 mux 流的结果。
@@ -1178,12 +1330,25 @@ impl StripeListener {
             mux,
             cfg,
             registry: Arc::new(ConnRegistry::new()),
+            group: None,
         })
     }
 
     /// 共享 registry 版（多会话条带）：多个会话的监听器归并到同一张表。
+    /// 无会话组 → 下行 lane 只能开在本会话上（单会话行为）。
     pub fn with_registry(mux: Arc<dyn Mux>, cfg: StripeCfg, registry: Arc<ConnRegistry>) -> Arc<Self> {
-        Arc::new(Self { mux, cfg, registry })
+        Arc::new(Self { mux, cfg, registry, group: None })
+    }
+
+    /// 共享 registry + 会话组版：新 conn 的下行 lane 在组内会话上轮转开，
+    /// 从而跨多条 TCP（多拥塞窗口）。组只有一个成员时等价于单会话。
+    pub fn with_group(
+        mux: Arc<dyn Mux>,
+        cfg: StripeCfg,
+        registry: Arc<ConnRegistry>,
+        group: Arc<SessionGroup>,
+    ) -> Arc<Self> {
+        Arc::new(Self { mux, cfg, registry, group: Some(group) })
     }
 
     /// accept 循环（每会话一个）。`on_new(conn, addr)`：新 conn 建立时拨目标。
@@ -1200,9 +1365,10 @@ impl StripeListener {
             let registry = self.registry.clone();
             let mux = self.mux.clone();
             let cfg = self.cfg.clone();
+            let group = self.group.clone();
             let on_new = on_new.clone();
             tokio::spawn(async move {
-                let _ = route_inbound_with_cfg(&registry, mux, cfg, stream, |conn, addr| {
+                let _ = route_inbound_full(&registry, mux, group, cfg, stream, |conn, addr| {
                     on_new(conn, addr)
                 })
                 .await;
@@ -1211,10 +1377,26 @@ impl StripeListener {
     }
 }
 
-/// route_inbound 的 cfg 可注入版本（StripeListener 用会话级 cfg）。
+/// route_inbound 的 cfg 可注入版本（无会话组：下行 lane 固定在本会话）。
 pub async fn route_inbound_with_cfg<F>(
     registry: &Arc<ConnRegistry>,
     mux: Arc<dyn Mux>,
+    cfg: StripeCfg,
+    stream: MuxStream,
+    on_new: F,
+) -> io::Result<InboundLane>
+where
+    F: FnOnce(Arc<StripeConn>, AddrPort),
+{
+    route_inbound_full(registry, mux, None, cfg, stream, on_new).await
+}
+
+/// 完整版路由：`group` 为 Some 时新 conn 的下行 lane 在组内会话上轮转开
+/// （多 TCP 条带）；None 时退化为固定在本会话（单会话行为）。
+pub async fn route_inbound_full<F>(
+    registry: &Arc<ConnRegistry>,
+    mux: Arc<dyn Mux>,
+    group: Option<Arc<SessionGroup>>,
     cfg: StripeCfg,
     mut stream: MuxStream,
     on_new: F,
@@ -1236,7 +1418,12 @@ where
         return Ok(InboundLane::Dropped);
     }
     let (addr, early_data) = read_open_addr(&mut stream).await?;
-    let opener = single_mux_opener(header.conn_id, mux);
+    // 关键：下行 lane 不再钉死在 conn 到达的那条会话上。钉死意味着下载
+    // 全程只吃一个 TCP 拥塞窗口，上行条带、下行不条带——而基准测的是下载。
+    let opener = match group {
+        Some(g) => group_lane_opener(header.conn_id, g, mux),
+        None => single_mux_opener(header.conn_id, mux),
+    };
     let conn = StripeConn::new(header.conn_id, cfg, opener, Dir::Down, stream, Vec::new(), early_data);
     registry.insert(header.conn_id, conn.clone());
     // conn 接收方向终结后清表。registry 现在是 AppState 级全局表（跨会话

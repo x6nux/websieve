@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use wsieve_mux::stripe_runtime::{join_inbound, route_inbound_with_cfg, ConnRegistry, StripeCfg, StripeDialer, StripeListener};
+use wsieve_mux::stripe_runtime::{
+    join_inbound, route_inbound_full, route_inbound_with_cfg, ConnRegistry, SessionGroup,
+    SessionGroups, StripeCfg, StripeDialer, StripeListener,
+};
 use wsieve_mux::{mux_factory, mux_server_factory, Mux, MuxId, MuxStream};
 use wsieve_proto::addr::{AddrPort, TargetAddr};
 use wsieve_proto::stripe::CHUNK;
@@ -765,4 +768,152 @@ async fn connect_retries_past_dead_session() {
     }
     // 死会话应已被摘表（accept 循环退出 / open 失败两条路径任一触发）
     assert_eq!(dialer.session_count(), 1, "死会话应已从会话表摘除");
+}
+
+/// 服务端多会话泵（组感知版）：一个 mux + 共享 registry + 会话组。
+/// 新 conn 的下行 lane 在组内轮转开 → 跨会话（跨 TCP）。
+async fn serve_session_grouped(
+    server: Arc<dyn Mux>,
+    cfg: StripeCfg,
+    registry: Arc<ConnRegistry>,
+    group: Arc<SessionGroup>,
+) {
+    loop {
+        let Ok(stream) = server.accept().await else { return };
+        let reg = registry.clone();
+        let cfg = cfg.clone();
+        let mux = server.clone();
+        let g = group.clone();
+        tokio::spawn(async move {
+            let _ = route_inbound_full(&reg, mux, Some(g), cfg, stream, pump_conn).await;
+        });
+    }
+}
+
+/// 15. 组感知下行 opener：服务端把 DOWN lane 铺到组内两个会话上。
+/// 客户端只在会话 1 上开 conn（只用主会话），服务端升级下行 lane 时应
+/// 轮转到会话 2 —— 即客户端在会话 2 的 mux 上 accept 到 DOWN lane。
+/// 这是「下行也跨 TCP」的直接证据：修复前 opener 钉死在 conn 到达的会话。
+#[tokio::test]
+async fn group_opener_spreads_down_lanes_across_sessions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cfg = StripeCfg {
+        target_lanes: 4,
+        upgrade_bytes: 64 * 1024,
+        upgrade_rate_bps: 1,
+        upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
+    };
+    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let (c2, s2) = make_pair(MuxId::Yamux).await;
+
+    // 服务端：两个会话共享 registry，且同属一个会话组。
+    let registry = Arc::new(ConnRegistry::new());
+    let groups = Arc::new(SessionGroups::new());
+    let gid = 0xdead_beefu128;
+    let g1 = groups.join(gid, &s1);
+    let g2 = groups.join(gid, &s2);
+    assert!(Arc::ptr_eq(&g1, &g2), "同一 group_id 必须落到同一个组");
+    assert_eq!(g1.len(), 2, "组内应有两个会话");
+    assert_eq!(groups.len(), 1);
+    tokio::spawn(serve_session_grouped(s1.clone(), cfg.clone(), registry.clone(), g1));
+    tokio::spawn(serve_session_grouped(s2.clone(), cfg.clone(), registry.clone(), g2));
+
+    // 客户端：conn 只在会话 1 上发起（dialer 的主会话），会话 2 只挂一个
+    // 计数 accept 泵——服务端若仍把 DOWN lane 钉在会话 1，这个计数恒为 0。
+    let down_on_s2 = Arc::new(AtomicUsize::new(0));
+    let dialer = StripeDialer::new(c1, cfg.clone());
+    {
+        let c2 = c2.clone();
+        let reg = dialer.registry();
+        let cnt = down_on_s2.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(stream) = c2.accept().await else { return };
+                cnt.fetch_add(1, Ordering::Relaxed);
+                let reg = reg.clone();
+                tokio::spawn(async move {
+                    let _ = join_inbound(&reg, stream).await;
+                });
+            }
+        });
+    }
+
+    let port = echo_server().await.unwrap();
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+    let payload = pattern(4 * 1024 * 1024);
+    let mut ws = s.clone();
+    let writer = { let p = payload.clone(); tokio::spawn(async move { ws.write_all(&p).await.unwrap() }) };
+    let mut got = vec![0u8; payload.len()];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(60)).await.unwrap();
+    writer.await.unwrap();
+    assert_eq!(got, payload, "跨会话下行 lane 的重组必须字节一致");
+
+    assert!(
+        down_on_s2.load(Ordering::Relaxed) >= 1,
+        "服务端下行 lane 应铺到组内第二个会话上（实际 {}），\
+         否则下载仍只吃一个 TCP 拥塞窗口",
+        down_on_s2.load(Ordering::Relaxed)
+    );
+}
+
+/// 16. 会话组生命周期：leave 后组内成员减少；组空则组条目被删除
+/// （否则 group_id 表随客户端重连无限增长）。会话 mux 的 Arc 被释放时
+/// 组内 Weak 自然失效，不把死会话钉在内存里。
+#[tokio::test]
+async fn session_group_lifecycle() {
+    let groups = SessionGroups::new();
+    let (_c1, s1) = make_pair(MuxId::Yamux).await;
+    let (_c2, s2) = make_pair(MuxId::Yamux).await;
+    let gid = 42u128;
+    let g = groups.join(gid, &s1);
+    groups.join(gid, &s2);
+    assert_eq!(g.len(), 2);
+    // 幂等：同一 mux 重复 join 不增加成员
+    groups.join(gid, &s1);
+    assert_eq!(g.len(), 2);
+
+    groups.leave(gid, &s1);
+    assert_eq!(g.len(), 1);
+    assert_eq!(groups.len(), 1, "组还有成员，条目应保留");
+
+    groups.leave(gid, &s2);
+    assert_eq!(g.len(), 0);
+    assert_eq!(groups.len(), 0, "组空后条目必须删除，否则表无限增长");
+
+    // Weak 语义：不 leave 而直接释放 mux，成员也应自动失效
+    let (_c3, s3) = make_pair(MuxId::Yamux).await;
+    let g2 = groups.join(7, &s3);
+    assert_eq!(g2.len(), 1);
+    drop(s3);
+    assert_eq!(g2.len(), 0, "会话 mux 释放后组成员应自动失效（Weak）");
+}
+
+/// 单会话回归：extra_sessions=0 / 组只有一个成员时，行为与改动前一致。
+#[tokio::test]
+async fn group_of_one_behaves_like_single_session() {
+    let cfg = StripeCfg {
+        target_lanes: 4,
+        upgrade_bytes: 64 * 1024,
+        upgrade_rate_bps: 1,
+        upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
+    };
+    let (client, server) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    let groups = SessionGroups::new();
+    let g = groups.join(1, &server);
+    assert_eq!(g.len(), 1);
+    tokio::spawn(serve_session_grouped(server, cfg.clone(), registry.clone(), g));
+
+    let dialer = StripeDialer::new(client, cfg);
+    let port = echo_server().await.unwrap();
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+    let payload = pattern(4 * 1024 * 1024);
+    let mut ws = s.clone();
+    let writer = { let p = payload.clone(); tokio::spawn(async move { ws.write_all(&p).await.unwrap() }) };
+    let mut got = vec![0u8; payload.len()];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(60)).await.unwrap();
+    writer.await.unwrap();
+    assert_eq!(got, payload, "单成员组（= 单会话）必须无回归");
 }
