@@ -399,30 +399,28 @@ impl AsyncRead for StripeStreamHandle {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut st = self.inner.recv.lock().unwrap();
-        loop {
-            if !st.buf.is_empty() {
-                let n = st.buf.len().min(buf.remaining());
-                buf.put_slice(&st.buf[..n]);
-                let _ = st.buf.split_to(n);
-                return Poll::Ready(Ok(()));
-            }
-            if let Some(e) = &st.failed {
-                return Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())));
-            }
-            if let Some((final_off, reason)) = st.closed {
-                if st.contig >= final_off {
-                    return match reason {
-                        CloseReason::TargetEof => Poll::Ready(Ok(())), // 干净 EOF
-                        r => Poll::Ready(Err(io::Error::other(format!(
-                            "stripe conn closed: {r:?}"
-                        )))),
-                    };
-                }
-                // CLOSE 已到但仍有缺口：等 lane 读者终结状态
-            }
-            st.reader_waker = Some(cx.waker().clone());
-            return Poll::Pending;
+        if !st.buf.is_empty() {
+            let n = st.buf.len().min(buf.remaining());
+            buf.put_slice(&st.buf[..n]);
+            let _ = st.buf.split_to(n);
+            return Poll::Ready(Ok(()));
         }
+        if let Some(e) = &st.failed {
+            return Poll::Ready(Err(io::Error::new(e.kind(), e.to_string())));
+        }
+        if let Some((final_off, reason)) = st.closed {
+            if st.contig >= final_off {
+                return match reason {
+                    CloseReason::TargetEof => Poll::Ready(Ok(())), // 干净 EOF
+                    r => Poll::Ready(Err(io::Error::other(format!(
+                        "stripe conn closed: {r:?}"
+                    )))),
+                };
+            }
+            // CLOSE 已到但仍有缺口：等 lane 读者终结状态
+        }
+        st.reader_waker = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -562,8 +560,7 @@ fn feed(inner: &Arc<ConnInner>, off: u64, payload: Bytes) {
         st.buf.extend_from_slice(&payload[skip..]);
         st.contig = end;
         // 用空洞推进连续区
-        loop {
-            let Some((&k, _)) = st.holes.first_key_value() else { break };
+        while let Some((&k, _)) = st.holes.first_key_value() {
             if k > st.contig {
                 break;
             }
@@ -621,14 +618,13 @@ async fn send_task(
         loop {
             let next = {
                 let mut out = inner.out.lock().unwrap();
-                out.queue.pop_front().map(|b| {
+                out.queue.pop_front().inspect(|b| {
                     out.pending = out.pending.saturating_sub(b.len());
                     if out.pending < MAX_PENDING / 2 {
                         if let Some(w) = out.writer_waker.take() {
                             w.wake();
                         }
                     }
-                    b
                 })
             };
             let Some(bytes) = next else {
@@ -865,6 +861,7 @@ impl ConnRegistry {
 /// 因此顺序必须是「先建 Notified（注册），再复查持久标记」：
 ///   - 终结先发生 → 复查命中 → 立即清理；
 ///   - 终结后发生 → Notified 已注册 → 被唤醒 → 清理。
+///
 /// 两种顺序都无窗口。
 fn spawn_registry_cleanup(registry: Arc<ConnRegistry>, conn: &Arc<StripeConn>) {
     let conn_id = conn.conn_id();
