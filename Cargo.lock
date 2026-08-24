@@ -2781,6 +2781,7 @@ dependencies = [
  "blake3",
  "bytes",
  "futures",
+ "hyper",
  "hyper-util",
  "rand 0.9.5",
  "rand_chacha 0.9.0",

@@ -26,6 +26,9 @@ wsieve-mux = { version = "0.1.0", path = "../wsieve-mux" }
 wsieve-transport = { version = "0.1.0", path = "../wsieve-transport" }
 
 [dev-dependencies]
+# webkit_tcp_probe 需要直接用 hyper 的 auto builder（按 ALPN 走 h1/h2）来
+# 扮演 CDN 边缘；库代码本身经 axum 间接依赖 hyper，不需要直接引用。
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 rand_chacha = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
