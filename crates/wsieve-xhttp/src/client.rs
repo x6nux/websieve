@@ -45,6 +45,17 @@ pub struct UpstreamCfg {
     pub server_pub: [u8; 32],
     pub client_priv: [u8; 32],
     pub mux_prefs: Vec<MuxId>,
+    /// 会话组 id：同一客户端开的全部会话必须用同一值，服务端据此把它们
+    /// 归为一组并跨会话铺下行 lane。单会话场景随便一个随机值即可
+    /// （见 `random_group_id`）。
+    pub group_id: u128,
+}
+
+/// 生成一个会话组 id。客户端在启动时调用一次，之后所有会话复用。
+pub fn random_group_id() -> u128 {
+    let mut b = [0u8; 16];
+    rand::rng().fill_bytes(&mut b);
+    u128::from_be_bytes(b)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,7 +120,7 @@ impl XhttpConn {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64;
 
-        let hello = encode_msg1(now_ms, &cfg.mux_prefs);
+        let hello = encode_msg1(now_ms, cfg.group_id, &cfg.mux_prefs);
 
         let mut msg1_buf = vec![0u8; 65535];
         let msg1_len = client.write_message(&hello, &mut msg1_buf)?;

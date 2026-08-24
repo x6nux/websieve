@@ -171,6 +171,7 @@ async fn make_pair(
         server_pub,
         client_priv,
         mux_prefs: vec![MuxId::Yamux],
+        group_id: wsieve_xhttp::client::random_group_id(),
     };
     let (conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
     (t, conn)
@@ -229,6 +230,7 @@ async fn handshake_garbage_reply_kills() {
             server_pub,
             client_priv,
             mux_prefs: vec![MuxId::Yamux],
+            group_id: wsieve_xhttp::client::random_group_id(),
         },
     )
     .await;
@@ -326,6 +328,7 @@ async fn write_frames_become_tus() {
         server_pub,
         client_priv,
         mux_prefs: vec![MuxId::Yamux],
+        group_id: wsieve_xhttp::client::random_group_id(),
     };
     let (mut conn, _neg) = XhttpConn::connect(rt.clone(), &cfg).await.unwrap();
 
@@ -435,6 +438,7 @@ async fn window_capped_at_8() {
         server_pub,
         client_priv,
         mux_prefs: vec![MuxId::Yamux],
+        group_id: wsieve_xhttp::client::random_group_id(),
     };
     let (mut conn, _neg) = XhttpConn::connect(st.clone(), &cfg).await.unwrap();
 
@@ -593,6 +597,7 @@ async fn downlink_frames_flow() {
         server_pub,
         client_priv,
         mux_prefs: vec![MuxId::Yamux],
+        group_id: wsieve_xhttp::client::random_group_id(),
     };
     let (mut conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
 
@@ -670,6 +675,7 @@ async fn idle_heartbeat_sends_padding() {
         server_pub,
         client_priv,
         mux_prefs: vec![MuxId::Yamux],
+        group_id: wsieve_xhttp::client::random_group_id(),
     };
     let (conn, _neg) = XhttpConn::connect(ht.clone(), &cfg).await.unwrap();
 

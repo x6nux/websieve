@@ -1,9 +1,14 @@
 //! 握手载荷 msg1/msg2（spec §6.3 + §7.4），大端序：
 //!
 //! ```text
-//! msg1: u8 version=1 | u64 ts_ms | u8 mux_count(1..=5) | mux_count × u8 mux_id
+//! msg1: u8 version=1 | u64 ts_ms | u128 group_id | u8 mux_count(1..=5) | mux_count × u8 mux_id
 //! msg2: u8 chosen_mux_id | u8 fallback(0/1)
 //! ```
+//!
+//! `group_id`：客户端启动时随机生成一次，其发起的全部 XHTTP 会话（主会话
+//! + 全部额外会话）共用同一值。服务端据此把同一客户端的多条会话归为一组，
+//! 从而能把下行 lane 铺到组内任意会话上（多 TCP 条带 / aria2 效应）。
+//! 单会话客户端即「只有一个成员的组」，行为与改动前一致。
 
 use thiserror::Error;
 
@@ -51,6 +56,8 @@ pub enum HelloError {
 pub struct Msg1 {
     pub version: u8,
     pub ts_ms: u64,
+    /// 会话组 id：同一客户端的全部会话共用（服务端据此跨会话开下行 lane）。
+    pub group_id: u128,
     pub mux_prefs: Vec<MuxId>,
 }
 
@@ -65,10 +72,14 @@ pub fn ts_in_window(ts_ms: u64, now_ms: u64) -> bool {
     ts_ms.abs_diff(now_ms) <= TS_WINDOW_MS
 }
 
-pub fn encode_msg1(ts_ms: u64, mux_prefs: &[MuxId]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10 + mux_prefs.len());
+/// msg1 固定头长度：version(1) + ts_ms(8) + group_id(16) + mux_count(1)。
+const MSG1_HEAD: usize = 1 + 8 + 16 + 1;
+
+pub fn encode_msg1(ts_ms: u64, group_id: u128, mux_prefs: &[MuxId]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MSG1_HEAD + mux_prefs.len());
     out.push(1);
     out.extend_from_slice(&ts_ms.to_be_bytes());
+    out.extend_from_slice(&group_id.to_be_bytes());
     out.push(mux_prefs.len() as u8);
     for m in mux_prefs {
         out.push(*m as u8);
@@ -77,28 +88,30 @@ pub fn encode_msg1(ts_ms: u64, mux_prefs: &[MuxId]) -> Vec<u8> {
 }
 
 pub fn decode_msg1(bytes: &[u8]) -> Result<Msg1, HelloError> {
-    if bytes.len() < 10 {
-        return Err(HelloError::BadLength(10, bytes.len()));
+    if bytes.len() < MSG1_HEAD {
+        return Err(HelloError::BadLength(MSG1_HEAD, bytes.len()));
     }
     let version = bytes[0];
     if version != 1 {
         return Err(HelloError::BadVersion(version));
     }
     let ts_ms = u64::from_be_bytes(bytes[1..9].try_into().unwrap());
-    let mux_count = bytes[9] as usize;
+    let group_id = u128::from_be_bytes(bytes[9..25].try_into().unwrap());
+    let mux_count = bytes[25] as usize;
     if mux_count == 0 || mux_count > 5 {
-        return Err(HelloError::BadMuxCount(bytes[9]));
+        return Err(HelloError::BadMuxCount(bytes[25]));
     }
-    if bytes.len() != 10 + mux_count {
-        return Err(HelloError::BadLength(10 + mux_count, bytes.len()));
+    if bytes.len() != MSG1_HEAD + mux_count {
+        return Err(HelloError::BadLength(MSG1_HEAD + mux_count, bytes.len()));
     }
-    let mux_prefs = bytes[10..]
+    let mux_prefs = bytes[MSG1_HEAD..]
         .iter()
         .map(|&b| MuxId::from_u8(b).ok_or(HelloError::BadMuxId(b)))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Msg1 {
         version,
         ts_ms,
+        group_id,
         mux_prefs,
     })
 }
