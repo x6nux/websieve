@@ -17,6 +17,12 @@ pub struct AppConfig {
     pub socks_listen: String,
     /// 本地条带转发器的起始端口（会话 i 用 base+i）。见 `crate::shard`。
     pub shard_base_port: u16,
+    /// 是否显示传输 WebView 窗口。
+    ///
+    /// 该窗口加载的是服务端伪装页——它是**传输载体**而非用户界面（同源是
+    /// 传输前提，见 spec §6.7），日常运行没有理由摆在用户面前。默认隐藏，
+    /// 排障时置 `WSIEVE_SHOW_WINDOW=1` 打开看页面实际加载成什么样。
+    pub show_window: bool,
 }
 
 fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -54,6 +60,12 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
         // 高端口：绑定 <1024 需要 root，而 hosts 已经要一次管理员权限了，
         // 不该再多要一个。对外仍然只走 :443，本地端口不出网。
         .unwrap_or(18443);
+    // 传输 WebView 默认隐藏（见字段注释）。注意 macOS 的 WKWebView 在窗口
+    // 不可见时会挂起 JS 定时器与 fetch，靠建窗时的
+    // background_throttling(Disabled) 压制（macOS 14+ 生效）。
+    let show_window = std::env::var("WSIEVE_SHOW_WINDOW")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
     Ok(AppConfig {
         server_url,
         server_pub,
@@ -61,6 +73,7 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
         mux_prefs,
         socks_listen,
         shard_base_port,
+        show_window,
     })
 }
 

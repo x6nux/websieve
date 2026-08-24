@@ -49,6 +49,7 @@ fn main() {
         hosts::system_path(),
     ));
     let server_url = plan.page_url.clone();
+    let show_window = cfg.show_window;
     let session_bases = plan.session_bases.clone();
     // guard 持有 hosts 清理职责；进程正常退出时由 RunEvent::Exit 显式 drop，
     // 崩溃路径由下次启动的 clear_managed 兜底。
@@ -65,7 +66,9 @@ fn main() {
             )
             .title("websieve")
             .inner_size(480.0, 320.0)
-            .visible(true)
+            // 传输载体，不是用户界面（spec §6.7）。默认隐藏；
+            // WSIEVE_SHOW_WINDOW=1 可打开排障。
+            .visible(show_window)
             // spec §3.4：后台节流压制——macOS WKWebView 后台/隐藏时挂起
             // JS 定时器与 fetch（Task 18 E2E 实测心跳/流分块会停摆）。
             .background_throttling(tauri_utils::config::BackgroundThrottlingPolicy::Disabled)
