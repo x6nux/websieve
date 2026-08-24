@@ -12,8 +12,17 @@
 use serde::{Deserialize, Serialize};
 use serde_saphyr::Spanned;
 
+/// 顶层配置。
+///
+/// `deny_unknown_fields` 是刻意的：没有它，把 `mixed-port` 手误写成
+/// `mixed_port` 会**静默**退回默认值 7890 —— 文件上白纸黑字写着 9999，
+/// 端口却没变，而全程没有任何一条诊断。手写 YAML 最常见的错误恰恰是
+/// 键名拼错，若连它都不报，本 crate 花力气做行号诊断就失去了意义。
+///
+/// 注意它与 `default` 并不冲突：`default` 管的是「键**没出现**时取什么值」，
+/// 这里管的是「出现了一个我不认识的键」。两者一个都不能少。
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
     // ── 入口 ──
     pub mixed_port: u16,
@@ -69,7 +78,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Proxy {
     pub name: String,
     /// 只接受 "websieve"。其他类型（ss / vmess / trojan…）在校验期
@@ -94,7 +103,7 @@ fn default_mux_prefs() -> Vec<u8> {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Dns {
     pub enable: bool,
     pub listen: String,
@@ -124,7 +133,7 @@ impl Default for Dns {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct DnsCache {
     pub max: usize,
     pub negative_ttl_s: u64,
@@ -137,7 +146,7 @@ impl Default for DnsCache {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Tun {
     pub enable: bool,
     pub stack: String,
@@ -145,7 +154,7 @@ pub struct Tun {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct GeoxUrl {
     pub geoip: String,
     pub geosite: String,

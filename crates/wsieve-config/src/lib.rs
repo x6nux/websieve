@@ -258,6 +258,62 @@ rules:
     }
 
     #[test]
+    fn a_misspelled_key_is_an_error_not_a_silent_default() {
+        // 手写 YAML 最常见的错误就是键名拼错。没有 deny_unknown_fields 时，
+        // `mixed_port`（下划线）会静默退回默认值 7890 —— 文件上白纸黑字写着
+        // 9999，端口却没变，全程没有一条诊断。本 crate 花力气做行号诊断，
+        // 结果对最高频的那个错误一言不发，那才是最坏的结果。
+        let bad = "mixed_port: 9999\nrules:\n  - MATCH,DIRECT\n";
+        match load_str(bad).unwrap_err() {
+            ConfigError::Syntax { line, message, .. } => {
+                assert_eq!(line, 1, "行号要指向拼错的那一行，实为第 {line} 行");
+                assert!(message.contains("mixed_port"), "要点名是哪个键：{message}");
+                // 上游把合法键名一并列出来了，正好能提示用户「你想写的是这个」
+                assert!(message.contains("mixed-port"), "应提示正确的键名：{message}");
+            }
+            other => panic!("应是语法错，实为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_reports_the_line_it_sits_on() {
+        // 断言行号会**移动**，而不是恒为 1 —— 一个恒返回常数的实现能过
+        // 上一条测试，却对 UI 定位光标毫无用处。
+        let bad = "mode: rule\nallow-lan: true\nrules:\n  - MATCH,DIRECT\nbogus-key: x\n";
+        match load_str(bad).unwrap_err() {
+            ConfigError::Syntax { line, message, .. } => {
+                assert_eq!(line, 5, "行号应随出错位置移动，实为第 {line} 行");
+                assert!(message.contains("bogus-key"), "{message}");
+            }
+            other => panic!("应是语法错，实为 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_keys_in_nested_mappings_are_caught_too() {
+        // 拼错的键藏在 dns / proxies 下面时同样要报。`timeout_ms` 静默退回
+        // 2000 与 `mixed_port` 静默退回 7890 是同一个病，杀伤力也一样。
+        for (src, key, line_no, col_no) in [
+            ("dns:\n  enable: true\n  timeout_ms: 500\n", "timeout_ms", 3u64, 3u64),
+            (
+                "proxies:\n  - name: x\n    type: websieve\n    url: u\n    server-pub: a\n    client-priv: b\n    extra_sessions: 9\n",
+                "extra_sessions",
+                7,
+                5,
+            ),
+        ] {
+            match load_str(src).unwrap_err() {
+                ConfigError::Syntax { line, column, message } => {
+                    assert_eq!(line, line_no, "{key} 的行号应是 {line_no}，实为 {line}");
+                    assert_eq!(column, col_no, "{key} 的列号应指向键本身，实为 {column}");
+                    assert!(message.contains(key), "要点名是哪个键：{message}");
+                }
+                other => panic!("应是语法错，实为 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn valid_config_passes_validation() {
         load_str(MINIMAL).unwrap().validate().unwrap();
     }
