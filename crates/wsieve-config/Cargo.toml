@@ -1,0 +1,12 @@
+[package]
+name = "wsieve-config"
+version = "0.1.0"
+edition = "2021"
+description = "Clash 风格 YAML 配置的读取与保留注释的定点改写"
+
+[dependencies]
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
