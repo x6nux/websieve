@@ -18,15 +18,25 @@
 //! 「其余部分不变」不是靠小心翼翼地重建，而是靠**原样透传**：
 //! 非目标行连看都不看，直接 push 原字符串。
 //!
+//! 写出去的结果**由 YAML 自己复核**：拼好之后立刻 `load_str` 读回，确认目标行
+//! 恰好等于写入的值，不等就整体回滚成 `Err`（见 `verify_written`）。
+//! 这一步不是保险丝，是纪律的落点 —— 「不打扰用户手写的 YAML」这句承诺，
+//! 只有在「写进去的东西读得回来」成立时才有意义。
+//!
 //! 已知限制（都以报错或良性降级收场，不会损坏文件）：
 //!
 //! 1. **值里带空格又带 `#` 的引号规则**（`- "A #B"`）会被误判成行尾注释。
-//!    Clash 语法里字段中不出现空格，故实际写不出这种值。注意「值里含 `#`」
-//!    本身是安全的：注释起点按 YAML 真实规则判定（见 `find_comment_start`）
+//!    注意「值里含 `#`」本身是安全的：注释起点按 YAML 真实规则判定
+//!    （见 `find_comment_start`）。而写入这类值时，`verify_written` 会发现
+//!    读回来的是被截断的值并报错回滚 —— 实测 `MATCH,东京 #1` 正是这条路径。
+//!    出站名是用户自由输入的中文，这**不是**假想场景：曾以静默截断收场，
+//!    随后 `RuleSet::build` 报「引用了不存在的出站」，错处离现场很远
 //! 2. **流式序列**（`rules: [A, B]`）所有规则挤在一行，这里返回
 //!    `NotASequenceItem` 而非破坏文件。UI 应提示用户改用块式序列
 //! 3. **带引号的规则**（`- "DOMAIN,a.com,PROXY"`）被替换后引号会消失。
-//!    值仍能正确读回，是良性的，但看到的人可能会意外
+//!    多数情况下值仍能正确读回，是良性的；但**引号有时正是值合法的原因** ——
+//!    `- "MATCH,节点: 主力"` 去掉引号后 `: ` 会被当成映射，整份配置解析失败。
+//!    这类值同样由 `verify_written` 挡下并回滚，不会写出一份起不来的配置
 
 #[derive(Debug, thiserror::Error)]
 pub enum EditError {
@@ -38,10 +48,27 @@ pub enum EditError {
     ValueSpansLines(String),
     #[error("规则值不能为空。写进去会退化成裸 `-`，读回来就不再是一条规则")]
     EmptyValue,
+    #[error(
+        "改写后第 {line} 行读回来是 {got:?}，而不是写入的 {value:?}。已放弃本次改写 —— \
+         写出去的文件读回来不是原意，属于静默损坏"
+    )]
+    ValueNotPreserved { line: u64, value: String, got: String },
+    #[error(
+        "规则值 {value:?} 写进去会让整份配置无法解析：{message}。已放弃本次改写 —— \
+         这样的文件会让代理直接起不来"
+    )]
+    ValueBreaksFile { value: String, message: String },
+    #[error("改写后第 {line} 行不再是一条规则（写入的是 {value:?}）。已放弃本次改写")]
+    NotARuleAfterWrite { line: u64, value: String },
+    #[error("原文本身就无法解析：{message}。无从校验改写结果，已放弃本次改写")]
+    SourceNotParsable { message: String },
 }
 
 /// 把第 `line` 行（1-based）的规则值换成 `new_value`。
 /// 缩进、行尾注释、值与注释之间的对齐空白、行尾换行符（LF / CRLF）全部保留。
+///
+/// 成功返回意味着**结果已被 YAML 自己验过**：读回来第 `line` 行恰好是
+/// `new_value`。验不过就整体回滚成 `Err`，绝不写出半坏的文件（见 `verify_written`）。
 pub fn replace_rule_line(src: &str, line: u64, new_value: &str) -> Result<String, EditError> {
     check_new_value(new_value)?;
 
@@ -72,7 +99,68 @@ pub fn replace_rule_line(src: &str, line: u64, new_value: &str) -> Result<String
             out.push_str(l);
         }
     }
+    verify_written(src, &out, line, new_value)?;
     Ok(out)
+}
+
+/// 拿 YAML 自己当裁判：把拼好的结果读回来，确认第 `line` 行**恰好**是 `new_value`。
+///
+/// 为什么不改成「枚举危险字符然后拒绝」：那份清单永远列不全。YAML 的标量语法里
+/// 能改变含义的前缀与序列有一长串（`*` 别名、`&` 锚点、`#` 注释、`-` 嵌套序列、
+/// `: ` 映射、`[`/`{` 流式、`|`/`>` 块标量、前导空白被吞、`null`/`~` 退化成空值……），
+/// 而出站名是用户在 GUI 里随手敲的自由文本中文，覆盖不全就等于漏。
+/// 直接问 YAML「你读出来是不是我写的那个」，判据与真相同源，不会随清单遗漏而失效。
+///
+/// 这条校验挡下的是实测过的静默损坏，不是假想：
+///
+/// | 写入值            | 不校验的话           |
+/// |-------------------|----------------------|
+/// | `MATCH,东京 #1`   | 读回 `MATCH,东京`，被静默截断 |
+/// | `MATCH,节点: 主力`| 整份配置语法错，代理起不来（§12）|
+/// | `*anchor`         | 同上，`reference to unknown value` |
+/// | `- nested`        | 同上，值变成嵌套序列 |
+/// | `   MATCH,PROXY`  | 前导空白被吞 |
+///
+/// 上游 `wsieve-route` 明确承诺出站名按用户原样保留（大小写与内部空格都不改，
+/// 见 `wsieve-route/src/rule.rs` 的 `Target`），所以「带空格的中文出站名」
+/// 在那一层是**合法**的。两层对「什么是合法出站名」给出矛盾答案时，
+/// 该报错的是写这一层 —— 而不是让用户存一次就把配置存坏。
+fn verify_written(
+    src: &str,
+    out: &str,
+    line: u64,
+    new_value: &str,
+) -> Result<(), EditError> {
+    let cfg = match crate::load_str(out) {
+        Ok(c) => c,
+        Err(e) => {
+            // 先分清责任：原文本身就读不回来的话，这个语法错不是本次改写造成的。
+            // 混为一谈会让用户对着一个自己没碰过的字段找错。
+            if let Err(src_err) = crate::load_str(src) {
+                return Err(EditError::SourceNotParsable {
+                    message: src_err.to_string(),
+                });
+            }
+            return Err(EditError::ValueBreaksFile {
+                value: new_value.to_string(),
+                message: e.to_string(),
+            });
+        }
+    };
+    match cfg.rules.iter().find(|r| r.defined.line() == line) {
+        Some(r) if r.value == new_value => Ok(()),
+        Some(r) => Err(EditError::ValueNotPreserved {
+            line,
+            value: new_value.to_string(),
+            got: r.value.clone(),
+        }),
+        // 读得回整份配置，但第 line 行已经不是一条规则了 —— 例如值被 YAML
+        // 当成了别的结构。文件没坏，但这一条规则没了，同样不能写出去。
+        None => Err(EditError::NotARuleAfterWrite {
+            line,
+            value: new_value.to_string(),
+        }),
+    }
 }
 
 /// 删除第 `line` 行的规则，连同紧贴它上方的前导注释块一起删。
@@ -402,6 +490,123 @@ rules:
         assert_eq!(value, "MATCH,DIRECT\u{3000}", "全角空格是值的一部分");
         let same = replace_rule_line(src, 2, &value).unwrap();
         assert_eq!(same, src, "值尾的全角空格不该被当成对齐空白重复写出");
+    }
+
+    #[test]
+    fn a_value_that_would_be_silently_truncated_is_rejected() {
+        // 出站名是用户在 GUI 里敲的自由文本，`wsieve-route` 明确承诺按原样保留
+        // （含内部空格，见其 rule.rs 的 Target）。于是 `MATCH,东京 #1` 在那一层合法，
+        // 而写到 YAML 里 ` #` 会开启注释、值被截成 `MATCH,东京` —— 两层对
+        // 「什么是合法出站名」给出矛盾答案。这时候该报错的是写这一层。
+        //
+        // 不拦的话，损坏在很远的地方才显形：随后 RuleSet::build 报
+        // 「第 1 行引用了不存在的出站：东京」，用户对着自己没碰过的地方找错。
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        let e = replace_rule_line(src, 2, "MATCH,东京 #1").unwrap_err();
+        assert!(
+            matches!(&e, EditError::ValueNotPreserved { got, .. } if got == "MATCH,东京"),
+            "应报「读回来不是写进去的值」，实为 {e:?}"
+        );
+        let text = e.to_string();
+        assert!(text.contains("MATCH,东京 #1"), "要点名写入的值：{text}");
+    }
+
+    #[test]
+    fn a_value_that_would_break_the_whole_file_is_rejected() {
+        // 冒号加空格会被 YAML 当成映射，整份配置从此读不回来 ——
+        // 按设计文档 §12 那意味着代理根本起不来。用户在 GUI 里给节点
+        // 起名叫「节点: 主力」，存一次盘就把自己锁在门外。
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        let e = replace_rule_line(src, 2, "MATCH,节点: 主力").unwrap_err();
+        assert!(
+            matches!(e, EditError::ValueBreaksFile { .. }),
+            "应报「会让整份配置无法解析」，实为 {e:?}"
+        );
+    }
+
+    #[test]
+    fn yaml_special_prefixes_are_all_rejected_not_enumerated() {
+        // 这一组的共同点是「不能靠拉黑字符表覆盖」：YAML 里能改变标量含义的
+        // 前缀有一长串，逐个列举永远漏。判据交给 YAML 自己 ——
+        // 读回来不等于写进去的，一律回滚。
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        for bad in [
+            "*anchor",      // 别名引用
+            "&anchor x",    // 锚点定义
+            "- nested",     // 嵌套序列
+            "#leading",     // 整行变注释
+            "   MATCH,阿", // 前导空白被吞
+            "null",         // 退化成空值
+            "~",            // 同上
+            "[A, B]",       // 流式序列
+            "{a: b}",       // 流式映射
+        ] {
+            assert!(
+                replace_rule_line(src, 2, bad).is_err(),
+                "{bad:?} 读回来不是原值，必须回滚而不是写出去"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_rules_still_write_through() {
+        // 校验必须只拦真出问题的值。若把正常规则也一并拒了，
+        // 这个「保险」就把功能本身废掉了 —— 那比不加还坏。
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        for good in [
+            "MATCH,DIRECT",
+            "MATCH,日本节点",
+            "GEOSITE,category-ads,REJECT",
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            "DOMAIN-SUFFIX,例子.测试,DIRECT",
+            "MATCH,DIRECT#兜底", // `#` 前无空白，是值的一部分
+            "DST-PORT,443,日本节点",
+        ] {
+            let out = replace_rule_line(src, 2, good)
+                .unwrap_or_else(|e| panic!("正常规则 {good:?} 不该被拒：{e}"));
+            let back = crate::load_str(&out).unwrap();
+            assert_eq!(back.rules[0].value, good, "写进去的要能原样读回来");
+        }
+    }
+
+    #[test]
+    fn a_quoted_rule_that_needs_its_quotes_is_rejected_not_silently_broken() {
+        // `- "MATCH,节点: 主力"` 之所以合法，全靠那对引号。定点改写不重建引号，
+        // 于是同值替换会写出一个语法错的文件。这一条在校验落地前是**静默**的：
+        // 替换「成功」，下次加载才炸。
+        let src = "rules:\n  - \"MATCH,节点: 主力\"\n";
+        let c = crate::load_str(src).unwrap();
+        assert_eq!(c.rules[0].value, "MATCH,节点: 主力", "先钉住带引号时的取值");
+
+        let e = replace_rule_line(src, 2, &c.rules[0].value).unwrap_err();
+        assert!(
+            matches!(e, EditError::ValueBreaksFile { .. }),
+            "引号是这个值合法的唯一原因，丢掉引号必须报错而非照写：{e:?}"
+        );
+    }
+
+    #[test]
+    fn an_already_broken_source_is_named_as_such() {
+        // 原文自己就读不回来时，别把责任算到本次改写头上 ——
+        // 让用户对着一个他没碰过的字段找错，比不报错好不了多少。
+        let src = "rules:\n  - MATCH,DIRECT\nbogus: [\n";
+        let e = replace_rule_line(src, 2, "MATCH,PROXY").unwrap_err();
+        assert!(
+            matches!(e, EditError::SourceNotParsable { .. }),
+            "应点明是原文的问题，实为 {e:?}"
+        );
+        assert!(e.to_string().contains("原文"), "措辞要让用户知道错在哪：{e}");
+    }
+
+    #[test]
+    fn rejection_never_writes_a_half_broken_file() {
+        // 「回滚」的实质含义：调用方拿到 Err 时手里没有任何新文本，
+        // 不存在「写了一半」的中间态。用 Result 的形状把这一点钉死。
+        let src = "rules:\n  - MATCH,DIRECT\n  - GEOSITE,cn,DIRECT\n";
+        assert!(replace_rule_line(src, 2, "MATCH,节点: 主力").is_err());
+        // 原文是入参、不可变，失败后它当然还是原样 —— 这里连同断言一次，
+        // 免得将来有人改成「就地修改 &mut String」而悄悄破坏这个性质。
+        assert_eq!(src, "rules:\n  - MATCH,DIRECT\n  - GEOSITE,cn,DIRECT\n");
     }
 
     #[test]

@@ -251,6 +251,59 @@ fn a_comment_only_item_is_refused_by_both_layers_not_corrupted() {
 }
 
 #[test]
+fn a_value_the_writer_cannot_read_back_is_refused_across_the_whole_chain() {
+    // 本文件验的是完整链路，那就把「链路上两层对合法值的定义不一致」也验进来。
+    //
+    // wsieve-route 承诺出站名按用户原样保留（含内部空格与大小写），所以
+    // `MATCH,东京 #1`、`MATCH,节点: 主力` 在解析那一层都是合法的规则。
+    // 但写到 YAML 里，前者被 ` #` 截成 `MATCH,东京`，后者的 `: ` 让整份配置
+    // 解析失败 —— 按设计文档 §12，后者意味着代理直接起不来。
+    //
+    // 两层给出矛盾答案时，写这一层必须报错并回滚，不能存一次盘就把配置存坏。
+    let before = load_str(SRC).unwrap();
+    let line = before.rules[3].defined.line();
+
+    for bad in ["MATCH,东京 #1", "MATCH,节点: 主力", "*anchor", "   MATCH,PROXY"] {
+        let e = edit::replace_rule_line(SRC, line, bad)
+            .expect_err(&format!("{bad:?} 读回来不是原值，必须被拒"));
+        assert!(e.to_string().contains("放弃本次改写"), "错误要说明已回滚：{e}");
+    }
+
+    // 而正常的值照写，且读回来分毫不差 —— 校验不能把功能本身废掉
+    let out = edit::replace_rule_line(SRC, line, "MATCH,香港节点").unwrap();
+    let edited = only_line_that_changed(SRC, &out, line);
+    assert_eq!(edited, "  - MATCH,香港节点\n");
+    assert_eq!(load_str(&out).unwrap().rules[3].value, "MATCH,香港节点");
+}
+
+#[test]
+fn a_full_width_space_before_a_hash_survives_five_identity_saves() {
+    // U+3000 是中文输入法的日常产物。曾经它前面的 `#` 被误判成注释起点，
+    // 于是每存一次盘注释就翻一倍：五次之后 32 份，且每一轮都「成功」。
+    // 这里跑满五轮并逐轮要求逐字节等于原文 —— 指数累积的 bug 单轮不易看出。
+    let src = "\
+rules:
+  # 全角空格在值里，它后面的 # 不是注释
+  - MATCH,DIRECT\u{3000}#兜底
+  - GEOSITE,cn,DIRECT
+";
+    let c = load_str(src).unwrap();
+    assert_eq!(
+        c.rules[0].value, "MATCH,DIRECT\u{3000}#兜底",
+        "先钉住 YAML 的实际取值：U+3000 不是 s-white，`#` 不开注释"
+    );
+
+    let mut text = src.to_string();
+    for i in 1..=5 {
+        let cur = load_str(&text).unwrap();
+        let line = cur.rules[0].defined.line();
+        let v = cur.rules[0].value.clone();
+        text = edit::replace_rule_line(&text, line, &v).unwrap();
+        assert_eq!(text, src, "第 {i} 次保存后就该逐字节等于原文");
+    }
+}
+
+#[test]
 fn deleting_a_rule_takes_its_own_comment_and_leaves_the_rest_untouched() {
     // 删除是本阶段另一个写操作，同样要过往返验收：
     // 规则连同它的前导注释一起走，别人的注释一个字都不许少。
