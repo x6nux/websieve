@@ -283,13 +283,21 @@ impl StripeConn {
     }
 
     /// 接受一条入站 lane（首帧 ConnHeader 已由外层 accept 循环解析并消费）。
+    ///
+    /// 入站 lane 是**单向**的：对端 `maybe_upgrade` 开它是为了往我们这边发，
+    /// 且对端把自己那一侧的读半交给了 `drain_read_half`（读完即丢）。所以
+    /// 绝不能把它的写半并入本端发送集——写进去的数据会被对端静默丢弃，
+    /// 接收端则永远等不到那些 offset 而挂死。本端要加发送 lane 只能自己
+    /// 开（`maybe_upgrade` / `add_lanes`），双向各自升级、互不借用。
+    ///
+    /// 写半直接 drop：`tokio::io::split` 的底层流由读半继续持有，lane 不会
+    /// 因此关闭。
     pub fn accept_lane(&self, stream: MuxStream) {
         let mut st = self.inner.recv.lock().unwrap();
         st.live_lanes += 1;
         drop(st);
-        let (r, w) = tokio::io::split(stream);
+        let (r, _w) = tokio::io::split(stream);
         tokio::spawn(lane_reader(self.inner.clone(), r));
-        let _ = self.inner.try_add_lane(w);
     }
 
     /// 主动加发送 lane（发送任务自身也会按阈值自动加）。
@@ -604,6 +612,8 @@ async fn send_task(
 ) {
     let mut lanes = vec![LaneW { w: Some(initial_w), last_write: Instant::now() }];
     let mut up_off: u64 = 0;
+    // lane 轮转游标：跨队列项持续（见分发处注释）。
+    let mut lane_rr: u64 = 0;
     let start = Instant::now();
     let mut sent: u64 = 0;
     if !initial_bytes.is_empty() {
@@ -640,15 +650,20 @@ async fn send_task(
                 return;
             }
             let mut off = up_off;
-            let mut idx = 0usize;
             // 并行分发：每条 lane 攒好自己的帧批次，然后各 lane 的写入并发执行
             // （join_all + 每批次 move 进独立 future）。串行 await 会让窗口满的
             // lane 阻塞其他 lane（队头阻塞），多车道退化成单车道——这正是
             // 分片要解决的问题。每 lane 内部帧顺序天然保持（批次内顺序 write_all）。
+            //
+            // 轮转游标 `lane_rr` 必须跨队列项持续，不能每项从 0 重来：上游泵
+            // 用 64KiB 缓冲读取，而 CHUNK 也是 64KiB，于是每个队列项通常只切出
+            // 一个 chunk。游标每项归零 ⇒ 恒取 lane 0 ⇒ 全部流量压在一条 lane 上，
+            // 多 lane / 多会话形同虚设（实测 64MB 下载里 68MB 走了第一条 TCP，
+            // 其余每条只有几百字节）。
             let mut batches: Vec<Vec<u8>> = vec![Vec::new(); lanes.len()];
             for chunk in bytes.chunks(CHUNK) {
-                let li = idx % lanes.len();
-                idx += 1;
+                let li = (lane_rr % lanes.len() as u64) as usize;
+                lane_rr = lane_rr.wrapping_add(1);
                 encode_frame(off, chunk, &mut batches[li]);
                 off += chunk.len() as u64;
             }
@@ -676,6 +691,16 @@ async fn send_task(
                 }
                 if !ok {
                     failed = true;
+                }
+            }
+            // 本轮没分到数据的 lane：写半还留在 lane_ws 里，必须放回。
+            // 否则它被 drop → 该 lane 的写侧关闭 → 对端 lane_reader 读到 EOF
+            // → live_lanes 归零后整条 conn 被判终结。轮转游标持续化之前，
+            // 每批总是从 lane 0 开始填，靠后的 lane 几乎必然分到空批次，
+            // 于是升级出来的 lane 刚建好就被这里关掉——多 lane 从未真正成立。
+            for (li, w) in lane_ws.into_iter().enumerate() {
+                if let (Some(w), Some(l)) = (w, lanes.get_mut(li)) {
+                    l.w = Some(w);
                 }
             }
             if failed {

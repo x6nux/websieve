@@ -917,3 +917,90 @@ async fn group_of_one_behaves_like_single_session() {
     writer.await.unwrap();
     assert_eq!(got, payload, "单成员组（= 单会话）必须无回归");
 }
+
+/// 17. 字节级条带分布：升级到 4 lane 后，大流量必须真正摊到各 lane 上，
+/// 而不是全压在 lane 0。
+///
+/// 两个真实 bug 的回归守卫（两者都让「多 lane」名存实亡）：
+/// (a) 轮转游标每个队列项归零：上游泵 64KiB 缓冲 + CHUNK 64KiB ⇒ 每项通常
+///     只有一个 chunk ⇒ 恒取 lane 0。
+/// (b) 本轮分到空批次的 lane 写半未放回而被 drop ⇒ 该 lane 写侧关闭 ⇒
+///     对端读到 EOF ⇒ 升级出来的 lane 刚建好就没了。
+///
+/// 做法：服务端手工 accept，统计每条入站 lane 上收到的字节数。
+#[tokio::test]
+async fn upload_bytes_spread_across_lanes() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let cfg = StripeCfg {
+        target_lanes: 4,
+        upgrade_bytes: 64 * 1024,
+        upgrade_rate_bps: 1,
+        upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
+    };
+    let (client, server) = make_pair(MuxId::Yamux).await;
+
+    // 每条 lane 一个计数器：accept 到就一直读到 EOF，累计字节数。
+    let per_lane: Arc<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let per_lane = per_lane.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok(mut lane) = server.accept().await else { return };
+                let ctr = Arc::new(AtomicU64::new(0));
+                per_lane.lock().unwrap().push(ctr.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    loop {
+                        match lane.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                ctr.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let dialer = StripeDialer::new(client, cfg);
+    let mut s = dialer.connect(&local_addr(1)).await.unwrap();
+    let payload = pattern(8 * 1024 * 1024);
+    s.write_all(&payload).await.unwrap();
+    // 给发送任务时间排空（不读回，服务端侧只统计上行）
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let counts: Vec<u64> = per_lane
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
+    let total: u64 = counts.iter().sum();
+    assert!(
+        total >= payload.len() as u64,
+        "服务端应收到全部上行字节，实际 {total} / {}",
+        payload.len()
+    );
+    let busy = counts.iter().filter(|&&c| c >= 1024 * 1024).count();
+    assert!(
+        busy >= 3,
+        "8MB 上行应摊到多条 lane 上（≥1MB 的 lane 数应 ≥3），实际分布 {counts:?}"
+    );
+    // 最大 lane 不应独吞。注意首 lane 天然偏多：升级阈值触发之前的全部
+    // 流量都只能走它（本例约 4MB），之后才四路均分。所以断言点是「升级
+    // 之后确实均分」——用非首 lane 之间的均衡度衡量，而不是要求首 lane
+    // 也只占 1/4。修复前的病态分布是 [8MB, 0, 0, 0]，这里必然挂。
+    let mut rest = counts.clone();
+    let top = rest.iter().position(|c| *c == *counts.iter().max().unwrap()).unwrap();
+    rest.remove(top);
+    let rmin = *rest.iter().min().unwrap();
+    let rmax = *rest.iter().max().unwrap();
+    assert!(
+        rmin > 0 && rmax <= rmin * 2,
+        "升级后各 lane 应大致均分（非首 lane min={rmin} max={rmax}），\
+         total={total} 实际分布 {counts:?}"
+    );
+}

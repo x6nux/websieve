@@ -44,6 +44,15 @@ CLI_PRIV=$(xxd -p -c 64 "$WORK/client.key")
 
 echo "== 64MB target =="
 dd if=/dev/urandom of="$WORK/file.bin" bs=1048576 count=$MB 2>/dev/null
+# 端口占用检查：残留的 http.server / wsieve-server 会静默顶替本次的实例，
+# 结果是 curl 拿到 404（0.1s“完成”，看着像 600 MB/s）而非真实吞吐。
+for port in $SRV_PORT $RELAY_PORT $HTTP_PORT $SOCKS_PORT; do
+  if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "FATAL: 端口 $port 已被占用（残留进程？）——先清干净再跑，否则数据是假的" >&2
+    lsof -nP -iTCP:$port -sTCP:LISTEN >&2
+    exit 1
+  fi
+done
 (cd "$WORK" && python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 >/dev/null 2>&1) &
 PIDS+=($!)
 
@@ -80,7 +89,12 @@ run_one() { # loss sessions
   local ok=FAIL
   cmp -s "$WORK/file.bin" "$WORK/got.bin" && ok=OK
   local secs=$(echo "$t1 $t0" | awk '{printf "%.2f", $1-$2}')
-  local mbps=$(echo "$t1 $t0 $MB" | awk '{printf "%.1f", $3/($1-$2)}')
+  if [ "$ok" = OK ]; then
+    local mbps=$(echo "$t1 $t0 $MB" | awk '{printf "%.1f", $3/($1-$2)}')
+  else
+    # 失败时绝不报吞吐：字节数不对的“0.1 秒完成”会被误读成 600 MB/s。
+    local mbps="-"
+  fi
   printf "loss=%s%% sessions=%s  %s  %ss  %s MB/s\n" "$loss" "$sessions" "$ok" "$secs" "$mbps"
   kill $cli_pid $relay_pid 2>/dev/null || true
   sleep 0.5
