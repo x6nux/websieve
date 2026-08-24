@@ -12,5 +12,5 @@
 pub mod engine;
 pub mod rule;
 
-pub use engine::{Decision, RuleSet, Verdict};
+pub use engine::{BuildError, Decision, RuleSet, Verdict};
 pub use rule::{Mode, Rule, RuleError, RuleKind, Target};
