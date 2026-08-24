@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub client_priv: [u8; 32],
     pub mux_prefs: Vec<MuxId>,
     pub socks_listen: String,
+    /// 本地条带转发器的起始端口（会话 i 用 base+i）。见 `crate::shard`。
+    pub shard_base_port: u16,
 }
 
 fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -46,12 +48,19 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
             MuxId::H2mux,
         ],
     };
+    let shard_base_port = std::env::var("WSIEVE_SHARD_BASE_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        // 高端口：绑定 <1024 需要 root，而 hosts 已经要一次管理员权限了，
+        // 不该再多要一个。对外仍然只走 :443，本地端口不出网。
+        .unwrap_or(18443);
     Ok(AppConfig {
         server_url,
         server_pub,
         client_priv,
         mux_prefs,
         socks_listen,
+        shard_base_port,
     })
 }
 

@@ -167,11 +167,30 @@ struct TransportInner {
     core: std::sync::RwLock<Arc<TransportCore>>,
     /// eval 目标：把 JS 命令送进 webview（tauri `Webview::eval`）。
     eval: Box<dyn Fn(String) + Send + Sync>,
+    /// 请求基址（如 `https://x.com:18444`，无尾斜杠）。空 = 用相对路径，
+    /// 即页面自身 origin（单会话时的原语义）。
+    ///
+    /// 多会话条带靠它把各会话分到不同 origin（同域名不同端口）——h2 只在
+    /// 同 origin 内复用连接，分开 origin 才能拿到各自的 TCP 与拥塞窗口。
+    /// 代价是这些 fetch 变成跨源：会触发 preflight、带 CORS 头、
+    /// `Sec-Fetch-Site` 由 same-origin 变 same-site。这些全部在 TLS 内部，
+    /// 中间人只看到若干条到 :443 的连接且 SNI 相同，故不损伤对外伪装；
+    /// 且这些头仍由浏览器自然生成，不是我们伪造的。
+    base: String,
 }
 
 impl TransportInner {
     fn core(&self) -> Arc<TransportCore> {
         self.core.read().unwrap().clone()
+    }
+
+    /// 把协议层给的相对 path 变成实际请求 URL。
+    fn url(&self, path: &str) -> String {
+        if self.base.is_empty() {
+            path.to_string()
+        } else {
+            format!("{}{}", self.base, path)
+        }
     }
 }
 
@@ -185,9 +204,10 @@ impl HttpTransport for WebViewTransport {
         let id = core.alloc_request_id();
         let rx = core.register_post(id).await;
         let b64 = bs64_encode(&body);
+        let url = self.inner.url(path);
         // JS 侧 post() 完成后 invoke wsieve_post_result 回填。
         let js = format!(
-            "window.__wsieve && window.__wsieve.post({id}, {path:?}, {b64:?});"
+            "window.__wsieve && window.__wsieve.post({id}, {url:?}, {b64:?});"
         );
         (self.inner.eval)(js);
         match rx.await {
@@ -209,7 +229,7 @@ impl HttpTransport for WebViewTransport {
         // 路径转义：{path:?} 的 Rust Debug 转义对非 ASCII 会产 `\u{...}`，
         // 非合法 JS。实际 path 均为本项目 ASCII 常量，这里换成显式 JS 字面量
         // 转义（引号/反斜杠），消除隐患。
-        let js_path: String = path.chars().map(|c| match c {
+        let js_path: String = self.inner.url(path).chars().map(|c| match c {
             '\\' => "\\\\".to_string(),
             '"' => "\\\"".to_string(),
             c if (c as u32) < 0x20 || (c as u32) > 0x7e => format!("\\u{:04x}", c as u32),
@@ -240,10 +260,18 @@ impl HttpTransport for WebViewTransport {
 impl WebViewTransport {
     /// `eval` 闭包负责把 JS 命令送进 webview（tauri `Webview::eval`）。
     pub fn new(eval: Box<dyn Fn(String) + Send + Sync>) -> Arc<Self> {
+        Self::with_base(eval, String::new())
+    }
+
+    /// 带基址的构造：多会话条带下每个会话一个 origin（同域名不同端口）。
+    /// 各会话共享同一个 `TransportCore`（request_id 由它统一分配，全局唯一），
+    /// 因此 IPC 侧无需区分来源。
+    pub fn with_base(eval: Box<dyn Fn(String) + Send + Sync>, base: String) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(TransportInner {
                 core: std::sync::RwLock::new(Arc::new(TransportCore::new())),
                 eval,
+                base: base.trim_end_matches('/').to_string(),
             }),
         })
     }
@@ -274,6 +302,36 @@ pub fn bs64_encode(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_joins_base_and_path() {
+        let t = WebViewTransport::with_base(Box::new(|_| {}), "https://x.com:18444/".into());
+        // 尾斜杠必须归一，否则拼出 //api/sync 变成另一个路径
+        assert_eq!(t.inner.url("/api/sync?n=0"), "https://x.com:18444/api/sync?n=0");
+        let bare = WebViewTransport::new(Box::new(|_| {}));
+        assert_eq!(bare.inner.url("/api/sync?n=0"), "/api/sync?n=0");
+    }
+
+    #[tokio::test]
+    async fn post_evals_absolute_url_when_base_set() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let s2 = seen.clone();
+        let t = WebViewTransport::with_base(
+            Box::new(move |js| *s2.lock().unwrap() = js),
+            "https://x.com:18445".into(),
+        );
+        // post 会一直等 JS 回填，这里只关心 eval 出去的 JS，超时即可
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            t.post("/api/sync?n=1", Bytes::from_static(b"x")),
+        )
+        .await;
+        assert!(
+            seen.lock().unwrap().contains("https://x.com:18445/api/sync?n=1"),
+            "eval 出的 JS 应含绝对 URL: {}",
+            seen.lock().unwrap()
+        );
+    }
 
     #[test]
     fn b64_known_vectors() {

@@ -427,3 +427,131 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
         r.unwrap_or_else(|e| panic!("session {i} 任务失败: {e}"));
     }
 }
+
+/// CORS 头只出现在**认证成功**的响应上，且只对同域名的 Origin。
+///
+/// 多端口条带（客户端 hosts 劫持 + 本地转发）会让各会话落在同域名的不同端口，
+/// 于是 fetch 变成跨源，需要 CORS 头才能被 JS 读取。但 CORS 头出现在 nginx
+/// 默认页上本身就是可探测特征，所以：未认证请求走伪装路径、绝不带头；
+/// 非同域 Origin 也绝不带头。
+#[tokio::test]
+async fn cors_headers_only_on_authenticated_same_domain_responses() {
+    let rig = start_server().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{}", rig.addr);
+    let host = rig.addr.to_string();
+    // Origin 与 Host 同域名、端口不同 —— 正是条带产生的形态
+    let same_domain_origin = format!("http://{}:19999", rig.addr.ip());
+
+    // 1) 未认证的协议路径 → 走伪装，绝不带 CORS 头
+    let r = c
+        .post(format!("{base}/api/sync?n=7&sid=AAAAAAAAAAAAAAAAAAAAAA"))
+        .header("Origin", &same_domain_origin)
+        .header("Host", &host)
+        .body("garbage")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.headers().get("access-control-allow-origin").is_none(),
+        "未认证响应不得带 CORS 头（否则成为探测特征）"
+    );
+
+    // 2) 完全无关的路径（纯伪装页）→ 同样不带
+    let r = c
+        .get(format!("{base}/"))
+        .header("Origin", &same_domain_origin)
+        .header("Host", &host)
+        .send()
+        .await
+        .unwrap();
+    assert!(r.headers().get("access-control-allow-origin").is_none());
+
+    // 3) 认证成功的握手响应 → 带 CORS 头，且回显具体 Origin（非 `*`，
+    //    因为 emitter 用 credentials:'include'）
+    let transport = std::sync::Arc::new(CorsProbeTransport {
+        client: c.clone(),
+        base: base.clone(),
+        origin: same_domain_origin.clone(),
+        host: host.clone(),
+        seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let seen = transport.seen.clone();
+    let _ = XhttpConn::connect(
+        transport,
+        &UpstreamCfg {
+            server_pub: rig.server_pub,
+            client_priv: rig.client_priv,
+            mux_prefs: vec![MuxId::Smux],
+            group_id: wsieve_xhttp::client::random_group_id(),
+        },
+    )
+    .await
+    .expect("握手应成功");
+    let recorded = seen.lock().unwrap().clone();
+    let handshake_hdrs = recorded.first().expect("应记录到握手响应头");
+    assert_eq!(
+        handshake_hdrs.0.as_deref(),
+        Some(same_domain_origin.as_str()),
+        "认证成功的响应应回显具体 Origin"
+    );
+    assert_eq!(handshake_hdrs.1.as_deref(), Some("true"), "应允许携带凭据");
+}
+
+/// 记录响应 CORS 头的 transport（只用于上面的测试）。
+struct CorsProbeTransport {
+    client: reqwest::Client,
+    base: String,
+    origin: String,
+    host: String,
+    /// (allow-origin, allow-credentials)
+    seen: std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+}
+
+#[async_trait::async_trait]
+impl HttpTransport for CorsProbeTransport {
+    async fn post(&self, path: &str, body: bytes::Bytes) -> anyhow::Result<PostReply> {
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base, path))
+            .header("Origin", &self.origin)
+            .header("Host", &self.host)
+            .body(body)
+            .send()
+            .await?;
+        let status = resp.status().as_u16();
+        let hv = |n: &str| {
+            resp.headers()
+                .get(n)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        self.seen.lock().unwrap().push((
+            hv("access-control-allow-origin"),
+            hv("access-control-allow-credentials"),
+        ));
+        let body = resp.bytes().await?;
+        Ok(PostReply { status, body })
+    }
+
+    async fn get_stream(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<futures::stream::BoxStream<'static, anyhow::Result<bytes::Bytes>>> {
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base, path))
+            .header("Origin", &self.origin)
+            .header("Host", &self.host)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET {path} -> {}", resp.status().as_u16());
+        }
+        use futures::StreamExt;
+        Ok(resp
+            .bytes_stream()
+            .map(|r| r.map_err(anyhow::Error::new))
+            .boxed())
+    }
+}

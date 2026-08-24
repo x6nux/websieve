@@ -58,7 +58,12 @@
         method: 'POST',
         body: body,
         credentials: 'include',
-        headers: { 'Content-Type': 'application/octet-stream' },
+        // text/plain 是 CORS 简单请求的 Content-Type 白名单之一，
+        // application/octet-stream 不是 —— 后者会让每个新 origin 先发一次
+        // OPTIONS 预检。多端口条带下会话分散在多个 origin，预检开销与
+        // 「服务端要不要特殊响应 OPTIONS」的指纹面都不划算。body 仍是二进制，
+        // 服务端只读原始字节、不看此头。下行 GET 无自定义头，本就不触发预检。
+        headers: { 'Content-Type': 'text/plain' },
       });
       var buf = new Uint8Array(await resp.arrayBuffer());
       await invoke('wsieve_raw_post', frame(1, requestId, resp.status, buf));

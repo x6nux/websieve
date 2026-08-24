@@ -28,6 +28,10 @@ pub struct ProxyCfg {
     pub client_priv: [u8; 32],
     pub mux_prefs: Vec<MuxId>,
     pub socks_listen: String,
+    /// 每个会话的请求基址；`None` = 相对路径（同源）。长度即会话数。
+    /// 由 `shard_setup::plan` 产出：条带启用时会话 0 同源、其余各自一个
+    /// 本地端口 origin；降级时只有一个 `None`。
+    pub session_bases: Vec<Option<String>>,
 }
 
 /// IPC 命令可见的「当前代」状态：emitter 的所有 invoke 都打到这里。
@@ -138,7 +142,9 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
 
         // 3. 握手 + mux
         emit_status(&app, "handshaking");
-        let extra_sessions = StripeCfg::with_env().extra_sessions;
+        // 会话数由 shard 编排决定（条带降级时就是 1），不再直接读
+        // StripeCfg——否则会出现「想要 4 个会话但只有 1 个端口」的错配。
+        let extra_sessions = cfg.session_bases.len().saturating_sub(1);
         // 会话组 id：本代会话（主 + 全部额外）共用一个值，服务端据此把它们
         // 归为一组并跨会话铺下行 lane。每代重新生成——上一代会话已拆除，
         // 复用旧 id 只会让服务端组表里混进死会话。
@@ -162,9 +168,15 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
             let dialer = StripeDialer::new(mux, StripeCfg::with_env());
             // 多 TCP 条带（aria2 效应）：急切建额外会话，lane 跨会话轮转。
             // 任一会话死 → 其上 lane 断；只要还有会话活着 conn 继续。
-            for _ in 0..extra_sessions {
+            for i in 0..extra_sessions {
+                // 每个额外会话一个独立 origin（同域名不同端口）——共用一个
+                // transport 就等于共用一个 origin，h2 会把它们复用回同一条
+                // TCP，多会话就白做了。各 transport 共享同一个 core。
+                let base = cfg.session_bases[i + 1].clone().unwrap_or_default();
+                let t2 = WebViewTransport::with_base(eval_fn(app.clone()), base);
+                t2.set_core(core.clone());
                 let (conn2, neg2) = XhttpConn::connect(
-                    transport.clone(),
+                    t2,
                     &UpstreamCfg {
                         server_pub: cfg.server_pub,
                         client_priv: cfg.client_priv,

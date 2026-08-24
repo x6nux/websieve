@@ -14,7 +14,10 @@
 
 mod bridge;
 mod emitter_src;
+mod hosts;
 mod proxy;
+mod shard;
+mod shard_setup;
 
 use std::sync::Arc;
 
@@ -35,7 +38,21 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let server_url = cfg.server_url.clone();
+    // 本地条带编排：hosts 劫持 + 多端口转发（见 shard_setup）。必须在建
+    // WebView 之前完成——主 WebView 要加载的正是转发器的端口。任何一步失败
+    // 都降级为单会话，不影响可用性。
+    let extra_sessions = wsieve_mux::stripe_runtime::StripeCfg::with_env().extra_sessions;
+    let plan = tauri::async_runtime::block_on(shard_setup::plan(
+        &cfg.server_url,
+        cfg.shard_base_port,
+        extra_sessions,
+        hosts::system_path(),
+    ));
+    let server_url = plan.page_url.clone();
+    let session_bases = plan.session_bases.clone();
+    // guard 持有 hosts 清理职责；进程正常退出时由 RunEvent::Exit 显式 drop，
+    // 崩溃路径由下次启动的 clear_managed 兜底。
+    let shard_guard = std::sync::Mutex::new(plan.guard);
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -67,6 +84,7 @@ fn main() {
                         client_priv: cfg.client_priv,
                         mux_prefs: cfg.mux_prefs,
                         socks_listen: cfg.socks_listen,
+                        session_bases,
                     },
                 )
                 .await
@@ -81,8 +99,15 @@ fn main() {
             wsieve_raw_post,
             wsieve_raw_stream,
         ])
-        .run(tauri::generate_context!())
-        .expect("tauri run");
+        .build(tauri::generate_context!())
+        .expect("tauri build")
+        .run(move |_app, event| {
+            // 退出时摘除 hosts 托管条目：不摘的话域名会一直指向已经不在跑的
+            // 转发器，本机之后访问该域名全部失败。
+            if let tauri::RunEvent::Exit = event {
+                shard_guard.lock().unwrap().take();
+            }
+        });
 }
 
 #[tauri::command]

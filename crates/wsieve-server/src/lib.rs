@@ -214,6 +214,8 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let uri = req.uri().clone();
+    // 只在协议路径的成功响应上使用（见 apply_cors 注释）。
+    let cors = cors_origin(&req);
 
     if method == "POST" && path == "/api/sync" {
         let n = query_param(&uri, "n").and_then(|v| v.parse::<u64>().ok());
@@ -223,14 +225,24 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
             Err(_) => return disguise_resp(&state, req).await,
         };
         match (n, sid) {
-            (Some(0), Some(sid)) => handshake(&state, sid, &body, &method, &path).await,
+            (Some(0), Some(sid)) => {
+                let mut r = handshake(&state, sid, &body, &method, &path).await;
+                // 握手失败时 handshake 内部已转伪装；那种响应是 200 nginx 页，
+                // 补 CORS 头会让它与协议响应可区分，故只在 200+TU 时补。
+                if r.status() == StatusCode::OK && r.headers().get(header::CONTENT_TYPE).is_none() {
+                    apply_cors(&mut r, &cors);
+                }
+                r
+            }
             (Some(n @ 1..), Some(sid)) => {
                 // 有效会话 → 恒 204 空 body；无效/死会话 → 伪装（无差别）。
                 if state.store.push_post(&sid, n, body).await.is_ok() {
-                    Response::builder()
+                    let mut r = Response::builder()
                         .status(StatusCode::NO_CONTENT)
                         .body(Body::empty())
-                        .unwrap()
+                        .unwrap();
+                    apply_cors(&mut r, &cors);
+                    r
                 } else {
                     disguise_resp(&state, bad_req()).await
                 }
@@ -241,10 +253,50 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
         let Some(sid) = query_param(&uri, "sid").and_then(|s| parse_sid(&s)) else {
             return disguise_resp(&state, req).await;
         };
-        attach(&state, sid, &method, &path).await
+        let mut r = attach(&state, sid, &method, &path).await;
+        // attach 失败走伪装（无 text/event-stream 头），只给真流补。
+        if r.headers()
+            .get(header::CONTENT_TYPE)
+            .is_some_and(|v| v == "text/event-stream")
+        {
+            apply_cors(&mut r, &cors);
+        }
+        r
     } else {
         disguise_resp(&state, req).await
     }
+}
+
+/// 跨源许可：仅当 `Origin` 与 `Host` 同域名（端口可不同）时返回该 Origin。
+///
+/// 多端口条带（客户端 hosts 劫持 + 本地转发，见 src-tauri/src/shard.rs）产生的
+/// 正是这种「同域名不同端口」的跨源 fetch。其他任何 Origin 一律不回 CORS 头：
+/// CORS 头出现在 nginx 默认页上本身就是可探测特征，而这里的判据要求探测者
+/// 精确构造与 Host 同域的 Origin 才能触发，且只有认证成功的响应才带头
+/// （§8：未认证请求一律走伪装处理器，那条路径不经过这里）。
+fn cors_origin(req: &axum::http::Request<Body>) -> Option<String> {
+    let origin = req.headers().get(header::ORIGIN)?.to_str().ok()?;
+    let host = req.headers().get(header::HOST)?.to_str().ok()?;
+    // ponytail: 按 ':' 切端口，对 IPv6 字面量不成立；客户端侧 hijackable()
+    // 已排除 IP 主机，条带只对域名启用。真要支持 IPv6 host 再换正式解析。
+    let o_host = origin.split("://").nth(1)?.split(':').next()?;
+    let h_host = host.split(':').next()?;
+    (o_host == h_host && !o_host.is_empty()).then(|| origin.to_string())
+}
+
+/// 给协议响应补 CORS 头。仅用于认证成功的响应，伪装路径绝不调用。
+fn apply_cors(resp: &mut Response, origin: &Option<String>) {
+    let Some(o) = origin else { return };
+    let Ok(v) = axum::http::HeaderValue::from_str(o) else { return };
+    // emitter 用 credentials:'include'，故必须回显具体 Origin（不能用 `*`）
+    // 并显式允许凭据。Vary: Origin 防止中间缓存把某个 Origin 的响应串给另一个。
+    resp.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        axum::http::HeaderValue::from_static("true"),
+    );
+    resp.headers_mut()
+        .insert(header::VARY, axum::http::HeaderValue::from_static("Origin"));
 }
 
 /// 失败路径的最小请求（body 已消费的场合）。
