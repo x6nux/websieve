@@ -4,6 +4,10 @@
 //! 关于 `Serialize`：这些派生**不用于写回 YAML**（写回走 `edit.rs` 的行级
 //! 定点改写，见 §5.6）。它们服务于把配置送给 UI 层的 JSON 序列化 ——
 //! 那条路上没有注释可丢。
+//!
+//! 「不用于写回 YAML」现在是编译期事实而非约定：workspace 的 `serde-saphyr`
+//! 关掉了 `serialize` feature，本 crate 派生的 `Serialize` 找不到 YAML
+//! 序列化器可用，只能喂给 serde_json 之类。
 
 use serde::{Deserialize, Serialize};
 use serde_saphyr::Spanned;

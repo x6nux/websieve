@@ -29,4 +29,11 @@ axum = "0.8"
 tokio-stream = "0.1"
 tower = "0.5"
 serde = { version = "1", features = ["derive"] }
-serde-saphyr = "1"
+# 刻意关掉 serialize：配置写回**不走** YAML 序列化，走 wsieve-config/src/edit.rs
+# 的行级定点改写（设计文档 §5.6）。序列化一次就会把用户手写的注释、引号、
+# 空行、对齐全部归一化掉 —— 这正是 edit.rs 整个模块存在的理由。
+# 那条纪律原先只写在文档注释里，而 `serde_saphyr::to_string` 对任何下游 crate
+# 都是可达的；关掉这个 feature 后它在编译期就不存在，纪律由此不再依赖自觉。
+# 注意 `Spanned<T>` 的 Deserialize（配置行号的来源）在 deserialize 里，不受影响；
+# 把配置送给 UI 层的 JSON 序列化走的是 serde 自身的 Serialize，也不受影响。
+serde-saphyr = { version = "1", default-features = false, features = ["deserialize"] }
