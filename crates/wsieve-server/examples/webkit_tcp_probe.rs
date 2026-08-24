@@ -132,10 +132,14 @@ fn sid_of(req: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let port: u16 = std::env::var("WSIEVE_WK_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(29099);
+    // 支持逗号分隔的多端口：同一域名 + 不同端口 = 不同 origin，用来验证
+    // 「hosts 劫持 + 本地多端口转发」能否让浏览器开出多条独立 TLS 连接。
+    let ports: Vec<u16> = std::env::var("WSIEVE_WK_PORT")
+        .unwrap_or_else(|_| "29099".into())
+        .split(',')
+        .filter_map(|v| v.trim().parse().ok())
+        .collect();
+    let port = *ports.first().expect("至少一个端口");
     let sessions: usize = std::env::var("WSIEVE_WK_SESSIONS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -157,7 +161,6 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let ledger = Arc::new(Mutex::new(Ledger::default()));
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     let scheme = if tls.is_some() { "https" } else { "http" };
     println!("webkit probe on {scheme}://127.0.0.1:{port}/  sessions={sessions} 采集={secs}s");
     println!("现在执行: open -a Safari {scheme}://127.0.0.1:{port}/");
@@ -179,21 +182,40 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let next = AtomicU64::new(0);
-    loop {
-        let (sock, _) = listener.accept().await?;
-        let alt = alt_origin.clone();
-        let _ = sock.set_nodelay(true);
-        let id = next.fetch_add(1, Ordering::Relaxed) + 1;
-        match &acceptor {
-            None => {
-                tokio::spawn(serve(sock, id, ledger.clone(), sessions, alt.clone()));
+    // 全部端口共享一个 ledger 与一个 TCP id 计数器，归属才可比。
+    let next = Arc::new(AtomicU64::new(0));
+    let mut tasks = Vec::new();
+    for p in ports {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", p)).await?;
+        println!("listening on {scheme}://127.0.0.1:{p}/");
+        let (acceptor, ledger, alt, next) = (
+            acceptor.clone(),
+            ledger.clone(),
+            alt_origin.clone(),
+            next.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else { return };
+                let _ = sock.set_nodelay(true);
+                let id = next.fetch_add(1, Ordering::Relaxed) + 1;
+                match &acceptor {
+                    None => {
+                        tokio::spawn(serve(sock, id, ledger.clone(), sessions, alt.clone()));
+                    }
+                    Some(acc) => {
+                        tokio::spawn(serve_tls(
+                            acc.clone(), sock, id, ledger.clone(), sessions, alt.clone(),
+                        ));
+                    }
+                }
             }
-            Some(acc) => {
-                tokio::spawn(serve_tls(acc.clone(), sock, id, ledger.clone(), sessions, alt.clone()));
-            }
-        }
+        }));
     }
+    for t in tasks {
+        let _ = t.await;
+    }
+    Ok(())
 }
 
 /// ALPN 同时 advertise h2 与 http/1.1，由浏览器自己选——这才反映真实
