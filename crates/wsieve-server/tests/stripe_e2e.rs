@@ -58,6 +58,7 @@ async fn connect_dialer(rig: &Rig, cfg: StripeCfg) -> Arc<StripeDialer> {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
             mux_prefs: vec![MuxId::Yamux],
+            group_id: wsieve_xhttp::client::random_group_id(),
         },
     )
     .await
@@ -75,6 +76,7 @@ fn no_upgrade_cfg() -> StripeCfg {
         upgrade_bytes: u64::MAX,
         upgrade_rate_bps: 0,
         upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
     }
 }
 
@@ -85,6 +87,7 @@ fn tiny_cfg() -> StripeCfg {
         upgrade_bytes: 64 * 1024,
         upgrade_rate_bps: 1,
         upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
     }
 }
 

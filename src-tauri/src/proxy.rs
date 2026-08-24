@@ -18,7 +18,7 @@ use tokio::sync::Notify;
 use wsieve_mux::stripe_runtime::{StripeCfg, StripeDialer};
 use wsieve_mux::{mux_factory, Mux};
 use wsieve_proto::hello::MuxId;
-use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
+use wsieve_xhttp::client::{random_group_id, UpstreamCfg, XhttpConn};
 
 use crate::bridge::{TransportCore, WebViewTransport};
 
@@ -138,6 +138,11 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
 
         // 3. 握手 + mux
         emit_status(&app, "handshaking");
+        let extra_sessions = StripeCfg::with_env().extra_sessions;
+        // 会话组 id：本代会话（主 + 全部额外）共用一个值，服务端据此把它们
+        // 归为一组并跨会话铺下行 lane。每代重新生成——上一代会话已拆除，
+        // 复用旧 id 只会让服务端组表里混进死会话。
+        let group_id = random_group_id();
         let attempt: anyhow::Result<Arc<StripeDialer>> = async {
             let (conn, neg) = XhttpConn::connect(
                 transport.clone(),
@@ -145,6 +150,7 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
                     server_pub: cfg.server_pub,
                     client_priv: cfg.client_priv,
                     mux_prefs: cfg.mux_prefs.clone(),
+                    group_id,
                 },
             )
             .await?;
@@ -153,7 +159,31 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
             }
             let io: wsieve_mux::MuxStream = Box::new(conn);
             let mux: Arc<dyn Mux> = Arc::from(mux_factory(neg.mux_id, io).await?);
-            Ok(StripeDialer::new(mux, StripeCfg::with_env()))
+            let dialer = StripeDialer::new(mux, StripeCfg::with_env());
+            // 多 TCP 条带（aria2 效应）：急切建额外会话，lane 跨会话轮转。
+            // 任一会话死 → 其上 lane 断；只要还有会话活着 conn 继续。
+            for _ in 0..extra_sessions {
+                let (conn2, neg2) = XhttpConn::connect(
+                    transport.clone(),
+                    &UpstreamCfg {
+                        server_pub: cfg.server_pub,
+                        client_priv: cfg.client_priv,
+                        mux_prefs: vec![neg.mux_id],
+                        group_id,
+                    },
+                )
+                .await?;
+                let io2: wsieve_mux::MuxStream = Box::new(conn2);
+                let mux2: Arc<dyn Mux> = Arc::from(mux_factory(neg2.mux_id, io2).await?);
+                dialer.attach_session(mux2);
+            }
+            if extra_sessions > 0 {
+                tracing::info!(
+                    "multi-session striping: {} sessions",
+                    dialer.session_count()
+                );
+            }
+            Ok(dialer)
         }
         .await;
 

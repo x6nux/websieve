@@ -100,6 +100,7 @@ async fn connect_mux(
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
             mux_prefs: prefs,
+            group_id: wsieve_xhttp::client::random_group_id(),
         },
     )
     .await
@@ -123,6 +124,7 @@ async fn echo_roundtrip(
             upgrade_bytes: u64::MAX,
             upgrade_rate_bps: 0,
             upgrade_window: Duration::from_millis(1),
+            extra_sessions: 0,
         },
     );
     let mut s = dialer
@@ -208,6 +210,7 @@ async fn dead_session_detection() {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
             mux_prefs: vec![MuxId::Yamux],
+            group_id: wsieve_xhttp::client::random_group_id(),
         },
     )
     .await
@@ -292,6 +295,7 @@ async fn out_of_order_reorder() {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
             mux_prefs: vec![MuxId::Yamux],
+            group_id: wsieve_xhttp::client::random_group_id(),
         },
     )
     .await
@@ -329,6 +333,7 @@ async fn probing_equivalence() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
+        wsieve_xhttp::client::random_group_id(),
         &[MuxId::Yamux],
     );
     let mut buf = vec![0u8; 65535];

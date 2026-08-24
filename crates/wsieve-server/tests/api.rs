@@ -72,7 +72,7 @@ fn make_msg1(
     ts_ms: u64,
 ) -> (Vec<u8>, snow::HandshakeState, Sid, String) {
     let mut client = build_client(&ts.server_pub, &ts.client_priv).unwrap();
-    let hello = encode_msg1(ts_ms, &[MuxId::Smux, MuxId::Yamux]);
+    let hello = encode_msg1(ts_ms, wsieve_xhttp::client::random_group_id(), &[MuxId::Smux, MuxId::Yamux]);
     let mut buf = vec![0u8; 65535];
     let n = client.write_message(&hello, &mut buf).unwrap();
     let mut tu = Vec::with_capacity(2 + n);
