@@ -77,8 +77,13 @@ impl Ledger {
     }
 }
 
-fn page(sessions: usize) -> String {
+fn page(sessions: usize, alt_origin: &str) -> String {
     // 复刻 XHTTP 的请求形状：每会话一条长挂 GET（下行）＋周期 POST（上行）。
+    //
+    // alt_origin 非空时，奇数会话打到另一个 origin（同 IP 同端口同证书，
+    // 仅主机名不同）——用来测 HTTP/2 connection coalescing（RFC 7540
+    // §9.1.1）：浏览器若认定两个 origin 可复用同一条 h2 连接，则「多子域名
+    // 绕开 h2 复用」这条路走不通。
     format!(
         r#"<!doctype html><meta charset=utf-8><title>webkit tcp probe</title>
 <body style="font:14px/1.6 -apple-system,sans-serif;padding:2rem">
@@ -87,12 +92,15 @@ fn page(sessions: usize) -> String {
 <pre id=log></pre>
 <script>
 const N = {sessions};
+const ALT = "{alt_origin}";
 const log = m => document.getElementById('log').textContent += m + '\n';
 function sid(i) {{ return 'wkprobe' + i + 'x'.repeat(8); }}
+function base(i) {{ return (ALT && i % 2 === 1) ? ALT : ''; }}
 for (let i = 0; i < N; i++) {{
   const s = sid(i);
+  const b = base(i);
   // 下行：长挂 chunked GET，读到流结束为止（占住一条连接，正是它决定 TCP 数）
-  fetch('/api/events?sid=' + s).then(async r => {{
+  fetch(b + '/api/events?sid=' + s).then(async r => {{
     const rd = r.body.getReader();
     for (;;) {{ const {{done}} = await rd.read(); if (done) break; }}
     log('session ' + i + ' downlink closed');
@@ -100,7 +108,7 @@ for (let i = 0; i < N; i++) {{
   // 上行：周期 POST
   let n = 0;
   setInterval(() => {{
-    fetch('/api/sync?n=' + (n++) + '&sid=' + s, {{method:'POST', body:'x'.repeat(256)}})
+    fetch(b + '/api/sync?n=' + (n++) + '&sid=' + s, {{method:'POST', body:'x'.repeat(256)}})
       .catch(() => {{}});
   }}, 500);
 }}
@@ -140,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
     // TLS 模式：`WSIEVE_WK_TLS=cert.pem,key.pem`。必须走 TLS 才测得到 h2——
     // 浏览器只在 TLS ALPN 里协商 HTTP/2，明文 h2c 一律不支持。生产走 CDN
     // 正是 https+h2，所以这个模式才对应真实部署。
+    // 备用 origin（同 IP 同端口同证书，仅主机名不同）——测 h2 连接合并。
+    let alt_origin = std::env::var("WSIEVE_WK_ALT_ORIGIN").unwrap_or_default();
+
     let tls = std::env::var("WSIEVE_WK_TLS").ok().map(|v| {
         let (c, k) = v.split_once(',').expect("WSIEVE_WK_TLS=cert.pem,key.pem");
         (c.to_string(), k.to_string())
@@ -171,14 +182,15 @@ async fn main() -> anyhow::Result<()> {
     let next = AtomicU64::new(0);
     loop {
         let (sock, _) = listener.accept().await?;
+        let alt = alt_origin.clone();
         let _ = sock.set_nodelay(true);
         let id = next.fetch_add(1, Ordering::Relaxed) + 1;
         match &acceptor {
             None => {
-                tokio::spawn(serve(sock, id, ledger.clone(), sessions));
+                tokio::spawn(serve(sock, id, ledger.clone(), sessions, alt.clone()));
             }
             Some(acc) => {
-                tokio::spawn(serve_tls(acc.clone(), sock, id, ledger.clone(), sessions));
+                tokio::spawn(serve_tls(acc.clone(), sock, id, ledger.clone(), sessions, alt.clone()));
             }
         }
     }
@@ -209,6 +221,7 @@ async fn serve_tls(
     tcp_id: u64,
     ledger: Arc<Mutex<Ledger>>,
     sessions: usize,
+    alt_origin: String,
 ) {
     let Ok(stream) = acceptor.accept(sock).await else { return };
     let alpn = stream
@@ -223,6 +236,7 @@ async fn serve_tls(
     let l = ledger.clone();
     let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let l = l.clone();
+        let alt = alt_origin.clone();
         async move {
             let path_q = req
                 .uri()
@@ -234,7 +248,7 @@ async fn serve_tls(
                     println!("TCP#{tcp_id} <- {s}");
                 }
             }
-            Ok::<_, std::convert::Infallible>(respond(&path_q, sessions))
+            Ok::<_, std::convert::Infallible>(respond(&path_q, sessions, &alt))
         }
     });
     // auto builder：按 ALPN 结果自动走 h1 或 h2 —— 与真实 CDN 边缘一致。
@@ -243,7 +257,7 @@ async fn serve_tls(
         .await;
 }
 
-fn respond(path_q: &str, sessions: usize) -> hyper::Response<axum::body::Body> {
+fn respond(path_q: &str, sessions: usize, alt_origin: &str) -> hyper::Response<axum::body::Body> {
     if path_q.starts_with("/api/events") {
         // 长挂流：永不结束，占住这条流/连接 —— 复刻 XHTTP 下行。
         let s = futures::stream::unfold((), |_| async {
@@ -256,19 +270,29 @@ fn respond(path_q: &str, sessions: usize) -> hyper::Response<axum::body::Body> {
         hyper::Response::builder()
             .header("content-type", "application/octet-stream")
             .header("cache-control", "no-store")
+            .header("access-control-allow-origin", "*")
             .body(axum::body::Body::from_stream(s))
             .unwrap()
     } else if path_q == "/" {
         hyper::Response::builder()
             .header("content-type", "text/html; charset=utf-8")
-            .body(axum::body::Body::from(page(sessions)))
+            .body(axum::body::Body::from(page(sessions, alt_origin)))
             .unwrap()
     } else {
-        hyper::Response::new(axum::body::Body::from("ok"))
+        hyper::Response::builder()
+            .header("access-control-allow-origin", "*")
+            .body(axum::body::Body::from("ok"))
+            .unwrap()
     }
 }
 
-async fn serve(mut sock: tokio::net::TcpStream, tcp_id: u64, ledger: Arc<Mutex<Ledger>>, sessions: usize) {
+async fn serve(
+    mut sock: tokio::net::TcpStream,
+    tcp_id: u64,
+    ledger: Arc<Mutex<Ledger>>,
+    sessions: usize,
+    alt_origin: String,
+) {
     let mut buf = vec![0u8; 8192];
     loop {
         // keep-alive：一条 TCP 上可能来多个请求，逐个处理（这正是要观测的复用）。
@@ -285,7 +309,7 @@ async fn serve(mut sock: tokio::net::TcpStream, tcp_id: u64, ledger: Arc<Mutex<L
         }
 
         if line.starts_with("GET / ") {
-            let body = page(sessions);
+            let body = page(sessions, &alt_origin);
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                 body.len()
@@ -308,7 +332,7 @@ async fn serve(mut sock: tokio::net::TcpStream, tcp_id: u64, ledger: Arc<Mutex<L
                 }
             }
         } else {
-            let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\nok";
             if sock.write_all(head.as_bytes()).await.is_err() {
                 return;
             }
