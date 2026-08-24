@@ -36,6 +36,35 @@ pub enum ConfigError {
     UnsupportedProxyType { name: String, kind: String },
     #[error("出站名重复：{0}。规则用名字引用出站，重名会产生歧义")]
     DuplicateProxyName(String),
+    #[error("{field} 的值 {value:?} 不合法，应为 {legal} 之一")]
+    BadEnumField {
+        field: &'static str,
+        value: String,
+        legal: &'static str,
+    },
+}
+
+/// 枚举字段的合法取值。
+///
+/// 判定沿用下游 `Mode::from_str` 的宽松度（`trim` + ASCII 转小写），
+/// 这样 `validate()` 不会比真正的消费方更严 —— 拒掉一个下游明明收得下的值，
+/// 与放过一个下游收不下的值同样是错的，只是方向相反。
+fn check_enum(
+    field: &'static str,
+    value: &str,
+    legal: &'static [&'static str],
+    legal_text: &'static str,
+) -> Result<(), ConfigError> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if legal.contains(&normalized.as_str()) {
+        Ok(())
+    } else {
+        Err(ConfigError::BadEnumField {
+            field,
+            value: value.to_string(),
+            legal: legal_text,
+        })
+    }
 }
 
 /// 从字符串读取配置。
@@ -83,7 +112,24 @@ impl Config {
 
     /// 配置自身的校验。规则的校验在 wsieve-route 里做 ——
     /// 本 crate 刻意不认识规则语义。
+    ///
+    /// 枚举字段（mode / carrier / log-level）在这里就要拦下来。
+    /// 它们最终确实会被下游的 `Mode::from_str` 之类挡住，所以不拦也漏不出去；
+    /// 但一个叫 `validate` 的函数对配置里最基本的枚举字段放行，
+    /// 会让调用方以为「过了 validate 就没问题」。要么名副其实，要么别叫这名字。
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // 合法值取自设计文档 §5.2 的 schema 注释；
+        // log-level 的五档与 `tracing::Level::from_str` 一致（它同样忽略大小写），
+        // 故这里放行的值到了 §5.2 那条 EnvFilter 上都收得下。
+        check_enum("mode", &self.mode, &["rule", "global", "direct"], "rule / global / direct")?;
+        check_enum("carrier", &self.carrier, &["shared", "isolated"], "shared / isolated")?;
+        check_enum(
+            "log-level",
+            &self.log_level,
+            &["trace", "debug", "info", "warn", "error"],
+            "trace / debug / info / warn / error",
+        )?;
+
         let mut seen: HashSet<&str> = HashSet::new();
         for p in &self.proxies {
             if p.kind != "websieve" {
@@ -310,6 +356,67 @@ rules:
                 }
                 other => panic!("应是语法错，实为 {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_bogus_mode() {
+        // `mode: bogus` 最终确实会被下游的 Mode::from_str 挡住，所以它漏不出去。
+        // 但一个叫 validate 的函数对配置里最基本的枚举字段放行，会让调用方
+        // 以为「过了 validate 就没问题」—— 那是它给出的一份虚假保证。
+        let cfg = "mode: bogus\nrules:\n  - MATCH,DIRECT\n";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(matches!(e, ConfigError::BadEnumField { field: "mode", .. }), "{e:?}");
+        let text = e.to_string();
+        assert!(text.contains("mode"), "要点名是哪个字段：{text}");
+        assert!(text.contains("bogus"), "要点名冒犯的值：{text}");
+        assert!(text.contains("global"), "要列出合法取值：{text}");
+    }
+
+    #[test]
+    fn validate_rejects_bogus_carrier_and_log_level() {
+        for (cfg, field, bad, legal_hint) in [
+            ("carrier: nope\n", "carrier", "nope", "isolated"),
+            ("log-level: shout\n", "log-level", "shout", "debug"),
+        ] {
+            let e = load_str(cfg).unwrap().validate().unwrap_err();
+            match &e {
+                ConfigError::BadEnumField { field: f, value, .. } => {
+                    assert_eq!(*f, field);
+                    assert_eq!(value, bad);
+                }
+                other => panic!("应是枚举字段错，实为 {other:?}"),
+            }
+            assert!(e.to_string().contains(legal_hint), "要列出合法取值：{e}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_every_legal_enum_value() {
+        // 校验不能比真正的消费方更严 —— 拒掉一个下游明明收得下的值，
+        // 与放过一个下游收不下的值同样是错的，只是方向相反。
+        for m in ["rule", "global", "direct"] {
+            load_str(&format!("mode: {m}\n")).unwrap().validate().unwrap();
+        }
+        for c in ["shared", "isolated"] {
+            load_str(&format!("carrier: {c}\n")).unwrap().validate().unwrap();
+        }
+        for l in ["trace", "debug", "info", "warn", "error"] {
+            load_str(&format!("log-level: {l}\n")).unwrap().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn enum_validation_matches_the_downstream_leniency() {
+        // 下游 `Mode::from_str` 做的是 `trim()` + ASCII 转小写，故 `RULE`、
+        // ` rule ` 在那边都收得下。这里必须同样收下，否则同一份配置
+        // 「校验不过但实际能跑」，两层又给出矛盾答案 —— 与 edit.rs 那处
+        // 出站名之争同构，只是方向相反。
+        for m in ["RULE", "Rule", " rule ", "\tGLOBAL\n"] {
+            load_str(&format!("mode: \"{}\"\n", m.escape_debug()))
+                .unwrap()
+                .validate()
+                .unwrap_or_else(|e| panic!("{m:?} 在下游合法，这里不该拒：{e}"));
         }
     }
 
