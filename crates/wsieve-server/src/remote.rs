@@ -67,10 +67,14 @@ fn serve_conn(conn: Arc<StripeConn>, addr: AddrPort) {
                 }
             }
         };
-        tokio::join!(up, down);
-        let _ = stream.shutdown().await;
+        // 下行结束（目标 EOF/错误）即触发 CLOSE；上行泵继续排空客户端残余
+        // 数据直至其 EOF，不阻塞 CLOSE 发送。
+        let up_handle = tokio::spawn(up);
+        down.await;
+        stream.shutdown().await.ok();
         conn.close_send(wsieve_proto::stripe::CloseReason::TargetEof)
             .await;
+        up_handle.abort();
     });
 }
 
