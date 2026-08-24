@@ -8,6 +8,7 @@ pub mod h2mux_impl;
 pub mod muxado_impl;
 pub mod picomux_impl;
 pub mod smux_impl;
+pub mod stripe_runtime;
 pub mod yamux_impl;
 
 pub use wsieve_proto::hello::MuxId;
