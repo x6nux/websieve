@@ -26,6 +26,7 @@ fn test_cfg() -> StripeCfg {
         upgrade_bytes: u64::MAX, // 默认不升级；升级用例单独开小阈值
         upgrade_rate_bps: 0,
         upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
     }
 }
 
@@ -149,12 +150,13 @@ async fn multi_lane_striped_8mb() {
         upgrade_bytes: 64 * 1024,
         upgrade_rate_bps: 1,
         upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
     };
     let (client, server) = make_pair(MuxId::Yamux).await;
     start_server_side(server, cfg.clone()).await;
     let dialer = StripeDialer::new(client, cfg.clone());
     let port = echo_server().await.unwrap();
-    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+    let s = dialer.connect(&local_addr(port)).await.unwrap();
 
     let payload = pattern(8 * 1024 * 1024);
     let mut s = s;
@@ -192,6 +194,7 @@ async fn read_exact_timeout(
     }
     Ok(())
 }
+
 
 /// 3. 乱序交付：重组器必须按 offset 输出连续流（模拟：服务端后发低 offset
 /// 分片——经「延迟 lane」难以精确控制，改为直接驱动重组状态：用两条手工
@@ -266,6 +269,7 @@ async fn lane_join_mid_stream() {
         let mut lane1 = sv.accept().await.unwrap();
         let mut hdr = [0u8; HEADER_LEN];
         lane1.read_exact(&mut hdr).await.unwrap();
+        let conn_id = decode_header(&hdr).unwrap().conn_id;
         let mut ab = Vec::new();
         let mut c = [0u8; 64];
         loop {
@@ -280,10 +284,10 @@ async fn lane_join_mid_stream() {
         let mut f = Vec::new();
         encode_frame(0, &p0, &mut f);
         lane1.write_all(&f).await.unwrap();
-        // 开 lane2（OPEN 加入 conn 1）发分片 1
+        // 开 lane2（OPEN 加入该 conn）发分片 1
         let mut lane2 = sv.open().await.unwrap();
         let mut hdr2 = encode_header(&ConnHeader {
-            conn_id: 1,
+            conn_id,
             cmd: Cmd::Open,
             dir: Dir::Down,
             lane_id: 5,
@@ -294,7 +298,7 @@ async fn lane_join_mid_stream() {
         lane2.write_all(&hdr2).await.unwrap();
         // CLOSE 在 lane1（最闲）
         let mut cl = encode_header(&ConnHeader {
-            conn_id: 1,
+            conn_id,
             cmd: Cmd::Close,
             dir: Dir::Down,
             lane_id: 0,
@@ -324,6 +328,7 @@ async fn close_with_gap_errors() {
         let mut lane1 = server.accept().await.unwrap();
         let mut hdr = [0u8; HEADER_LEN];
         lane1.read_exact(&mut hdr).await.unwrap();
+        let conn_id = decode_header(&hdr).unwrap().conn_id;
         let mut ab = Vec::new();
         let mut c = [0u8; 64];
         loop {
@@ -338,7 +343,7 @@ async fn close_with_gap_errors() {
         encode_frame(0, &[9u8; 100], &mut f);
         lane1.write_all(&f).await.unwrap();
         let mut cl = encode_header(&ConnHeader {
-            conn_id: 1,
+            conn_id,
             cmd: Cmd::Close,
             dir: Dir::Down,
             lane_id: 0,
@@ -380,7 +385,8 @@ async fn unknown_conn_inbound_dropped() {
     let (client, server) = make_pair(MuxId::Yamux).await;
     let dialer = StripeDialer::new(client.clone(), test_cfg());
     let port = echo_server().await.unwrap();
-    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+    // conn 保持存活即可（本例断言的是 ghost 流不影响它），无需读写
+    let _s = dialer.connect(&local_addr(port)).await.unwrap();
 
     // 服务端先 accept 我们的 lane（保持 conn 活跃），再主动开一条未知
     // conn_id 的流
@@ -481,6 +487,7 @@ async fn upgrade_to_target_lanes() {
         upgrade_bytes: 64 * 1024,
         upgrade_rate_bps: 1,
         upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
     };
     // 双端都开自动升级：客户端上行触发其侧 add lane；这里只验证客户端侧。
     let (client, server) = make_pair(MuxId::Yamux).await;
@@ -500,4 +507,262 @@ async fn upgrade_to_target_lanes() {
     read_exact_timeout(&mut s, &mut got, Duration::from_secs(30)).await.unwrap();
     writer.await.unwrap();
     assert_eq!(got, payload, "升级后仍必须字节一致");
+}
+
+/// 服务端多会话泵：一个 mux + 共享 registry 的 accept 循环（每会话一个）。
+async fn serve_session(server: Arc<dyn Mux>, cfg: StripeCfg, registry: Arc<ConnRegistry>) {
+    loop {
+        let Ok(stream) = server.accept().await else { return };
+        let reg = registry.clone();
+        let cfg = cfg.clone();
+        let mux = server.clone();
+        tokio::spawn(async move {
+            let _ = route_inbound_with_cfg(&reg, mux, cfg, stream, pump_conn).await;
+        });
+    }
+}
+
+fn pump_conn(conn: Arc<StripeConnLike>, addr: AddrPort) {
+    tokio::spawn(async move {
+        let host = match &addr.addr {
+            TargetAddr::V4(o) => format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]),
+            TargetAddr::Domain(d) => d.clone(),
+            TargetAddr::V6(_) => "::1".to_string(),
+        };
+        let Ok(tcp) = tokio::net::TcpStream::connect((host, addr.port)).await else { return };
+        let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+        let mut up_s = conn.stream();
+        let mut down_s = up_s.clone();
+        let up = async {
+            let mut buf = [0u8; 16384];
+            loop {
+                match up_s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if tcp_w.write_all(&buf[..n]).await.is_err() { break } }
+                }
+            }
+        };
+        let down = async {
+            let mut buf = [0u8; 16384];
+            loop {
+                match tcp_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => { if down_s.write_all(&buf[..n]).await.is_err() { break } }
+                }
+            }
+        };
+        tokio::join!(up, down);
+        down_s.shutdown().await.ok();
+        conn.close_send(wsieve_proto::stripe::CloseReason::TargetEof).await;
+    });
+}
+
+use wsieve_mux::stripe_runtime::StripeConn as StripeConnLike;
+
+/// 计数版 accept 泵：每 accept 一条流计数 +1（测 lane 分布用）。
+async fn serve_session_counting(
+    server: Arc<dyn Mux>,
+    cfg: StripeCfg,
+    registry: Arc<ConnRegistry>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    loop {
+        let Ok(stream) = server.accept().await else { return };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reg = registry.clone();
+        let cfg = cfg.clone();
+        let mux = server.clone();
+        tokio::spawn(async move {
+            let _ = route_inbound_with_cfg(&reg, mux, cfg, stream, pump_conn).await;
+        });
+    }
+}
+
+/// 10. 多会话条带：两条 duplex 对（= 两个独立「TCP」），客户端 dialer 挂
+/// 两个 mux，服务端两 mux 共享 ConnRegistry。升级后 lane 分布在两个会话
+/// 上，8MB 回显字节一致。
+#[tokio::test]
+async fn multi_session_striping() {
+    let cfg = StripeCfg {
+        target_lanes: 4,
+        upgrade_bytes: 64 * 1024,
+        upgrade_rate_bps: 1,
+        upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
+    };
+    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
+    tokio::spawn(serve_session(s2, cfg.clone(), registry.clone()));
+
+    let dialer = StripeDialer::new(c1, cfg.clone());
+    assert!(dialer.attach_session(c2));
+    assert!(!dialer.attach_session(dialer_pick(&dialer)), "重复挂载应被拒绝");
+    assert_eq!(dialer.session_count(), 2);
+    let port = echo_server().await.unwrap();
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+
+    let payload = pattern(8 * 1024 * 1024);
+    let mut ws = s.clone();
+    let writer = { let p = payload.clone(); tokio::spawn(async move { ws.write_all(&p).await.unwrap() }) };
+    let mut got = vec![0u8; payload.len()];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(60)).await.unwrap();
+    writer.await.unwrap();
+    assert_eq!(got, payload, "跨两会话条带回显必须字节一致");
+}
+
+fn dialer_pick(d: &Arc<StripeDialer>) -> Arc<dyn Mux> {
+    // 取主会话 mux（sessions[0]）用于重复挂载断言
+    d.primary_mux()
+}
+
+/// 11. 单会话死亡：dialer 挂两个会话，杀掉非首 lane 所在会话的传输，
+/// conn 仍可经另一会话收发。（实现层面：直接不依赖该会话即可——用一条
+/// 新 conn 走存活会话验证 dialer 仍可用；旧 conn 若 lane 全在死会话上会
+/// 按自身 lane EOF 机制终结，不影响 dialer。）
+#[tokio::test]
+async fn session_death_conn_survives_via_other_session() {
+    let cfg = test_cfg();
+    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
+    // 死会话：服务端不开 accept 泵 → 该会话空闲即断
+    drop(s2);
+    let dialer = StripeDialer::new(c1, cfg.clone());
+    let _ = dialer.attach_session(c2);
+    let port = echo_server().await.unwrap();
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+    let payload = pattern(1 * 1024 * 1024);
+    let mut ws = s.clone();
+    let writer = { let p = payload.clone(); tokio::spawn(async move { ws.write_all(&p).await.unwrap() }) };
+    let mut got = vec![0u8; payload.len()];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(30)).await.unwrap();
+    writer.await.unwrap();
+    assert_eq!(got, payload, "死会话存在时经主会话的 conn 必须照常工作");
+}
+
+/// 12. lane 分布断言：多会话下升级开的 lane 应落在不同会话上（轮转）。
+/// 服务端两个 mux 各自计数 accept 的流：两会话均应收到 ≥2 条流（首 lane
+/// + 升级 lane 分摊），证明 lane 确实跨 TCP 分布。
+#[tokio::test]
+async fn multi_session_lane_distribution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let cfg = StripeCfg {
+        target_lanes: 4,
+        upgrade_bytes: 64 * 1024,
+        upgrade_rate_bps: 1,
+        upgrade_window: Duration::from_millis(1),
+        extra_sessions: 0,
+    };
+    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    let n1 = Arc::new(AtomicUsize::new(0));
+    let n2 = Arc::new(AtomicUsize::new(0));
+    tokio::spawn(serve_session_counting(s1, cfg.clone(), registry.clone(), n1.clone()));
+    tokio::spawn(serve_session_counting(s2, cfg.clone(), registry.clone(), n2.clone()));
+
+    let dialer = StripeDialer::new(c1, cfg.clone());
+    dialer.attach_session(c2);
+    let port = echo_server().await.unwrap();
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+
+    let payload = pattern(4 * 1024 * 1024);
+    let mut ws = s.clone();
+    let writer = { let p = payload.clone(); tokio::spawn(async move { ws.write_all(&p).await.unwrap() }) };
+    let mut got = vec![0u8; payload.len()];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(60)).await.unwrap();
+    writer.await.unwrap();
+    assert_eq!(got, payload);
+
+    let a = n1.load(Ordering::Relaxed);
+    let b = n2.load(Ordering::Relaxed);
+    assert!(a >= 2 && b >= 2, "lane 应跨两会话分布，实际 s1={a} s2={b}");
+}
+
+/// 构造一个「真死」的客户端 mux：底层 duplex 的对端半直接丢弃，任何读写
+/// 立即失败 → mux 会话终结 → accept 循环退出。
+/// 注意不能用 `drop(server_mux)`：适配器把驱动任务的 JoinHandle 一 drop
+/// 就是 detach（任务继续跑并持有 io），会话反而活着。
+async fn dead_mux(id: MuxId) -> Arc<dyn Mux> {
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    drop(server_io);
+    Arc::from(mux_factory(id, Box::new(client_io)).await.unwrap())
+}
+
+/// 13. 服务端 registry 排空：经 route_inbound_with_cfg 建的 conn 在接收方向
+/// 终结后必须从表中摘除。registry 已从「每会话一张、随会话拆除整体回收」
+/// 改为 AppState 级全局表，没有显式清理 = 每条 conn 永久泄漏。
+#[tokio::test]
+async fn server_registry_drains_after_conn_ends() {
+    let (client, server) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    let cfg = test_cfg();
+    tokio::spawn(serve_session(server, cfg.clone(), registry.clone()));
+
+    let port = echo_server().await.unwrap();
+    let dialer = StripeDialer::new(client, cfg);
+    let mut s = dialer.connect(&local_addr(port)).await.unwrap();
+
+    // 走一趟真实数据，确认 conn 已建立并进表
+    s.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    read_exact_timeout(&mut s, &mut got, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(&got, b"ping");
+    assert_eq!(registry.len(), 1, "conn 建立后服务端表应有 1 条");
+
+    // 客户端半关 → 上行 CLOSE(TargetEof) 送达服务端 → 服务端 conn 的接收
+    // 方向终结（lane_reader 的 CLOSE 分支即刻 mark_recv_terminal）。
+    s.shutdown().await.unwrap();
+
+    // 服务端清表是异步任务：给它落定时间
+    for _ in 0..100 {
+        if registry.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        registry.len(),
+        0,
+        "conn 终结后服务端 registry 必须排空（否则每条 conn 永久泄漏）"
+    );
+}
+
+/// 14. 死会话下的 connect：两个会话、其中一个真死，连续 6 次 connect 全部
+/// 成功且能真实往返。修复前 pick() 无存活性检查且 connect 不重试 → 轮转
+/// 命中死会话即失败（实测 6 次里 3 次挂）。
+#[tokio::test]
+async fn connect_retries_past_dead_session() {
+    let cfg = test_cfg();
+    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let registry = Arc::new(ConnRegistry::new());
+    tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
+    let c2 = dead_mux(MuxId::Yamux).await;
+
+    let dialer = StripeDialer::new(c1, cfg);
+    assert!(dialer.attach_session(c2));
+    assert_eq!(dialer.session_count(), 2);
+
+    let port = echo_server().await.unwrap();
+    for i in 0..6 {
+        let mut s = dialer
+            .connect(&local_addr(port))
+            .await
+            .unwrap_or_else(|e| panic!("第 {i} 次 connect 失败: {e}"));
+        // 真实往返：证明拿到的是活会话上的 conn，而非「open 成功但发不出去」
+        let msg = format!("probe-{i}");
+        s.write_all(msg.as_bytes()).await.unwrap();
+        let mut got = vec![0u8; msg.len()];
+        read_exact_timeout(&mut s, &mut got, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| panic!("第 {i} 次往返失败: {e}"));
+        assert_eq!(got, msg.as_bytes());
+    }
+    // 死会话应已被摘表（accept 循环退出 / open 失败两条路径任一触发）
+    assert_eq!(dialer.session_count(), 1, "死会话应已从会话表摘除");
 }

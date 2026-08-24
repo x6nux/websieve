@@ -14,12 +14,13 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
@@ -30,6 +31,38 @@ use wsieve_proto::stripe::{
     decode_close_payload, decode_frame, decode_header, encode_close_payload, encode_frame,
     encode_header, is_inline_header, CloseReason, Cmd, ConnHeader, Dir, HEADER_LEN, CHUNK,
 };
+
+/// 开 lane 抽象：给一条 conn 打开一条新 lane（写好 OPEN 头后返回流）。
+/// 多会话时由 StripeDialer 提供（跨会话轮转）；单会话时退化为固定 mux。
+pub type LaneOpener = Arc<
+    dyn Fn(Dir) -> BoxFuture<'static, anyhow::Result<MuxStream>> + Send + Sync,
+>;
+
+/// 在指定 mux 上开一条 lane 并写好 OPEN 头。
+async fn open_lane_on(
+    mux: &Arc<dyn Mux>,
+    conn_id: u64,
+    dir: Dir,
+) -> anyhow::Result<MuxStream> {
+    let mut stream = mux.open().await?;
+    let hdr = encode_header(&ConnHeader {
+        conn_id,
+        cmd: Cmd::Open,
+        dir,
+        lane_id: 0,
+    })
+    .to_vec();
+    stream.write_all(&hdr).await?;
+    Ok(stream)
+}
+
+/// 单 mux 版 opener（服务端 / 单会话客户端）。
+fn single_mux_opener(conn_id: u64, mux: Arc<dyn Mux>) -> LaneOpener {
+    Arc::new(move |dir| {
+        let mux = mux.clone();
+        Box::pin(async move { open_lane_on(&mux, conn_id, dir).await })
+    })
+}
 
 /// 上行待发队列上限（字节）。超过 → poll_write Pending（写侧背压）。
 const MAX_PENDING: usize = 4 * 1024 * 1024;
@@ -43,6 +76,9 @@ pub struct StripeCfg {
     pub upgrade_bytes: u64,
     pub upgrade_rate_bps: u64,
     pub upgrade_window: Duration,
+    /// 额外 XHTTP 会话数（多 TCP 条带）。0 = 单会话（既有行为）。
+    /// 由上层 wiring 负责实际建会话并 `StripeDialer::attach_session`。
+    pub extra_sessions: usize,
 }
 
 impl Default for StripeCfg {
@@ -52,6 +88,7 @@ impl Default for StripeCfg {
             upgrade_bytes: 1024 * 1024,
             upgrade_rate_bps: 1024 * 1024,
             upgrade_window: Duration::from_secs(1),
+            extra_sessions: 0,
         }
     }
 }
@@ -78,6 +115,11 @@ impl StripeCfg {
         if let Ok(v) = std::env::var("WSIEVE_STRIPE_UPGRADE_WINDOW_MS") {
             if let Ok(n) = v.parse() {
                 cfg.upgrade_window = Duration::from_millis(n);
+            }
+        }
+        if let Ok(v) = std::env::var("WSIEVE_EXTRA_SESSIONS") {
+            if let Ok(n) = v.parse() {
+                cfg.extra_sessions = n;
             }
         }
         cfg
@@ -130,15 +172,27 @@ struct ConnInner {
     conn_id: u64,
     /// 接收方向终结（EOF/错误）时 notify_waiters（清表任务等它）。
     recv_terminal: Arc<tokio::sync::Notify>,
+    /// 接收方向已终结的持久标记。`Notify::notify_waiters` 只唤醒「已注册」
+    /// 的等待者，清表任务在 conn 建立之后才 spawn，中间存在丢失唤醒的窗口
+    /// （短连接：CLOSE 先于清表任务注册到达 → 表项永久泄漏）。等待方必须
+    /// 「先注册 Notified，再复查本标记」。
+    recv_terminated: std::sync::atomic::AtomicBool,
     cfg: StripeCfg,
-    mux: Arc<dyn Mux>,
+    lane_opener: LaneOpener,
     recv: Mutex<RecvState>,
     out: Mutex<OutState>,
     /// 控制 lane 集合变化 / 关闭（发送任务消费）。
     ctl: Sender<CtlMsg>,
     lane_count: Arc<AtomicUsize>,
-    /// 接收侧 accept lane 用的 lane_id 分配器。
-    next_in_lane_id: AtomicU16,
+}
+
+impl ConnInner {
+    /// 标记接收方向终结并唤醒等待者。顺序关键：先置标记再 notify，
+    /// 配合等待端的「注册后复查」即可无窗口。
+    fn mark_recv_terminal(&self) {
+        self.recv_terminated.store(true, Ordering::Release);
+        self.recv_terminal.notify_waiters();
+    }
 }
 
 enum CtlMsg {
@@ -169,11 +223,12 @@ impl StripeConn {
     /// 建立一条 conn。`initial_lane` 为首 mux 流（客户端 = mux.open() 的
     /// BIDI 流；服务端 = accept 到的流），`initial_bytes` 为首帧前缀
     /// （客户端 = OPEN 头 + TargetAddr；服务端 = 空）。`send_dir` 是本端
-    /// 发送方向（客户端 UP，服务端 DOWN）。
+    /// 发送方向（客户端 UP，服务端 DOWN）。`lane_opener` 负责后续加 lane
+    /// （多会话时跨会话轮转）。
     fn new(
         conn_id: u64,
         cfg: StripeCfg,
-        mux: Arc<dyn Mux>,
+        lane_opener: LaneOpener,
         send_dir: Dir,
         initial_lane: MuxStream,
         initial_bytes: Vec<u8>,
@@ -184,8 +239,9 @@ impl StripeConn {
         let inner = Arc::new(ConnInner {
             conn_id,
             recv_terminal: Arc::new(tokio::sync::Notify::new()),
+            recv_terminated: std::sync::atomic::AtomicBool::new(false),
             cfg,
-            mux: mux.clone(),
+            lane_opener,
             recv: Mutex::new(RecvState {
                 pending_early: None,
                 buf: BytesMut::new(),
@@ -207,7 +263,6 @@ impl StripeConn {
             }),
             ctl: ctl_tx,
             lane_count,
-            next_in_lane_id: AtomicU16::new(1),
         });
         // 服务端在解析 OPEN 时可能同批读到地址后的早期数据：直接喂入重组器
         if !early_inbound.is_empty() {
@@ -240,26 +295,21 @@ impl StripeConn {
     /// 主动加发送 lane（发送任务自身也会按阈值自动加）。
     pub async fn add_lanes(&self, n: usize) {
         for _ in 0..n {
-            if let Ok(stream) = self.inner.mux.open().await {
-                let lane_id = self.inner.next_in_lane_id.fetch_add(1, Ordering::Relaxed);
-                let hdr = encode_header(&ConnHeader {
-                    conn_id: self.inner.conn_id,
-                    cmd: Cmd::Open,
-                    dir: Dir::Up, // 本端主动加的 lane 载本端发送方向数据
-                    lane_id,
-                })
-                .to_vec();
-                let (r, mut w) = tokio::io::split(stream);
-                if w.write_all(&hdr).await.is_ok() {
-                    tokio::spawn(drain_read_half(r));
-                    let _ = self.inner.ctl.send(CtlMsg::AddLane(w)).await;
-                }
+            if let Ok(stream) = (self.inner.lane_opener)(Dir::Up).await {
+                let (r, w) = tokio::io::split(stream);
+                tokio::spawn(drain_read_half(r));
+                let _ = self.inner.ctl.send(CtlMsg::AddLane(w)).await;
             }
         }
     }
 
     pub(crate) fn inner_recv_terminal(&self) -> Arc<tokio::sync::Notify> {
         self.inner.recv_terminal.clone()
+    }
+
+    /// 接收方向是否已终结（EOF/错误/CLOSE 全交付）。
+    pub(crate) fn recv_terminated(&self) -> bool {
+        self.inner.recv_terminated.load(Ordering::Acquire)
     }
 
     /// 诊断：接收方向状态快照。
@@ -435,7 +485,7 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
                             let mut st = inner.recv.lock().unwrap();
                             apply_close(&mut st, final_off, reason);
                             drop(st);
-                            inner.recv_terminal.notify_waiters();
+                            inner.mark_recv_terminal();
                             continue; // 其它 lane 可能还有数据；本 lane 读到 EOF 为止
                         }
                         break;
@@ -462,7 +512,7 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
                         wake_reader(&mut st);
                     }
                     drop(st);
-                    inner.recv_terminal.notify_waiters();
+                    inner.mark_recv_terminal();
                     lane_eof(&inner);
                     return;
                 }
@@ -484,7 +534,7 @@ fn lane_eof(inner: &Arc<ConnInner>) {
     let mut st = inner.recv.lock().unwrap();
     st.live_lanes = st.live_lanes.saturating_sub(1);
     if st.live_lanes == 0 {
-        inner.recv_terminal.notify_waiters();
+        inner.mark_recv_terminal();
         if let Some((final_off, _)) = st.closed {
             if st.contig < final_off && st.failed.is_none() {
                 st.failed = Some(io::Error::new(
@@ -554,7 +604,6 @@ async fn send_task(
 ) {
     let mut lanes = vec![LaneW { w: Some(initial_w), last_write: Instant::now() }];
     let mut up_off: u64 = 0;
-    let mut next_lane_id: u16 = 1;
     let start = Instant::now();
     let mut sent: u64 = 0;
     if !initial_bytes.is_empty() {
@@ -641,7 +690,6 @@ async fn send_task(
                 send_dir,
                 sent,
                 start,
-                &mut next_lane_id,
             )
             .await;
         }
@@ -730,7 +778,6 @@ async fn maybe_upgrade(
     send_dir: Dir,
     sent: u64,
     start: Instant,
-    next_lane_id: &mut u16,
 ) {
     let cfg = &inner.cfg;
     if lanes.len() >= cfg.target_lanes || sent < cfg.upgrade_bytes {
@@ -746,19 +793,8 @@ async fn maybe_upgrade(
     }
     let want = cfg.target_lanes - lanes.len();
     for _ in 0..want {
-        let Ok(stream) = inner.mux.open().await else { break };
-        let lane_id = *next_lane_id;
-        *next_lane_id += 1;
-        let hdr = encode_header(&ConnHeader {
-            conn_id: inner.conn_id,
-            cmd: Cmd::Open,
-            dir: send_dir,
-            lane_id,
-        });
-        let (r, mut w) = tokio::io::split(stream);
-        if w.write_all(&hdr).await.is_err() {
-            continue;
-        }
+        let Ok(stream) = (inner.lane_opener)(send_dir).await else { break };
+        let (r, w) = tokio::io::split(stream);
         // 自己开的 lane 上对端不会有数据，但读半须有人消费（EOF 检测）
         tokio::spawn(drain_read_half(r));
         lanes.push(LaneW { w: Some(w), last_write: Instant::now() });
@@ -797,14 +833,50 @@ impl ConnRegistry {
     pub fn get(&self, id: u64) -> Option<Arc<StripeConn>> {
         self.map.lock().unwrap().get(&id).cloned()
     }
+    /// 当前表项数（诊断/测试）。
+    pub fn len(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// 注册表清理任务：conn 接收方向终结后从表中摘除。双端共用（客户端
+/// `connect`、服务端 `route_inbound_with_cfg` 的新 conn 路径）——没有它
+/// 表项永久泄漏。
+///
+/// 竞态处理：`Notify::notify_waiters` 只唤醒「已注册」的等待者，而本任务
+/// 是在 conn 建立之后才 spawn 的，终结完全可能先于注册发生（短连接常见）。
+/// 因此顺序必须是「先建 Notified（注册），再复查持久标记」：
+///   - 终结先发生 → 复查命中 → 立即清理；
+///   - 终结后发生 → Notified 已注册 → 被唤醒 → 清理。
+/// 两种顺序都无窗口。
+fn spawn_registry_cleanup(registry: Arc<ConnRegistry>, conn: &Arc<StripeConn>) {
+    let conn_id = conn.conn_id();
+    let term = conn.inner_recv_terminal();
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let notified = term.notified();
+        tokio::pin!(notified);
+        // 注册（Notified 首次 poll 才入队），随后复查已终结标记。
+        notified.as_mut().enable();
+        if !conn.recv_terminated() {
+            notified.await;
+        }
+        registry.remove(conn_id);
+    });
 }
 
 // ---------------- 客户端：StripeDialer ----------------
 
 /// 客户端拨号器：分配 conn_id，建首 lane（OPEN + TargetAddr），后台归并
-/// 服务端新开的 DOWN lane。
+/// 服务端新开的 DOWN lane。多会话：`attach_session` 挂额外会话 mux，
+/// lane 打开跨会话轮转（每 lane 独立 TCP 拥塞窗口，aria2 效应）。
 pub struct StripeDialer {
     mux: Arc<dyn Mux>,
+    sessions: RwLock<Vec<Arc<dyn Mux>>>,
+    rr: AtomicU64,
     cfg: StripeCfg,
     next_conn_id: Arc<AtomicU64>,
     registry: Arc<ConnRegistry>,
@@ -815,11 +887,111 @@ impl StripeDialer {
         self.registry.get(id)
     }
 
+    /// 当前挂载的会话 mux 数（含主会话）。
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().unwrap().len()
+    }
+
+    /// 主会话 mux（诊断/测试用）。
+    pub fn primary_mux(&self) -> Arc<dyn Mux> {
+        self.mux.clone()
+    }
+
+    fn pick(&self) -> Arc<dyn Mux> {
+        let sessions = self.sessions.read().unwrap();
+        let n = self.rr.fetch_add(1, Ordering::Relaxed);
+        sessions[(n as usize) % sessions.len()].clone()
+    }
+
+    /// 从会话表摘除一个已死会话（其 accept 循环退出即为死亡证据）。
+    /// 不变量：`sessions` 永不为空——最后一个条目即使已死也保留，让
+    /// `connect` 干净地返回错误（而非对空 vec 取模 panic），由外层
+    /// 代理重连循环负责重建会话。
+    fn prune_session(&self, mux: &Arc<dyn Mux>) {
+        let mut s = self.sessions.write().unwrap();
+        if s.len() <= 1 {
+            return;
+        }
+        if let Some(i) = s.iter().position(|m| Arc::ptr_eq(m, mux)) {
+            s.remove(i);
+        }
+    }
+
+    /// lane opener：跨会话轮转开 lane（写好 OPEN 头）。单次 pick 落到死会话
+    /// 时在剩余会话上重试（open 失败即死亡证据）。拨号器已销毁时退化到主
+    /// 会话 mux。
+    fn rr_lane_opener(self: &Arc<Self>, conn_id: u64) -> LaneOpener {
+        let dialer = Arc::downgrade(self);
+        let primary = self.mux.clone();
+        Arc::new(move |dir| {
+            let dialer = dialer.clone();
+            let primary = primary.clone();
+            Box::pin(async move {
+                let Some(d) = dialer.upgrade() else {
+                    // 拨号器已销毁：主会话是唯一还能取到的句柄
+                    return open_lane_on(&primary, conn_id, dir).await;
+                };
+                let attempts = d.session_count();
+                let mut last: Option<anyhow::Error> = None;
+                for _ in 0..attempts {
+                    let mux = d.pick();
+                    match open_lane_on(&mux, conn_id, dir).await {
+                        Ok(s) => return Ok(s),
+                        Err(e) => {
+                            d.prune_session(&mux);
+                            last = Some(e);
+                        }
+                    }
+                }
+                Err(last.unwrap_or_else(|| anyhow::anyhow!("no live session to open lane on")))
+            })
+        })
+    }
+
+    /// 挂载一个额外会话（其 mux 的后台 accept 循环由本方法启动）。
+    /// 返回 false 表示该会话已挂载过（幂等拒绝）。
+    pub fn attach_session(self: &Arc<Self>, mux: Arc<dyn Mux>) -> bool {
+        {
+            let mut s = self.sessions.write().unwrap();
+            if s.iter().any(|m| Arc::ptr_eq(m, &mux)) {
+                return false;
+            }
+            s.push(mux.clone());
+        }
+        let d = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = match mux.accept().await {
+                    Ok(s) => s,
+                    // accept 循环退出 = 会话已死：先摘表，避免后续 pick
+                    // 继续把 lane 往死会话上开。
+                    Err(_) => {
+                        d.prune_session(&mux);
+                        return;
+                    }
+                };
+                let dd = d.clone();
+                tokio::spawn(async move {
+                    let _ = join_inbound(&dd.registry, stream).await;
+                });
+            }
+        });
+        true
+    }
+
     pub fn new(mux: Arc<dyn Mux>, cfg: StripeCfg) -> Arc<Self> {
         let dialer = Arc::new(Self {
-            mux,
+            mux: mux.clone(),
+            sessions: RwLock::new(vec![mux.clone()]),
+            rr: AtomicU64::new(0),
             cfg,
-            next_conn_id: Arc::new(AtomicU64::new(1)),
+            // conn_id 随机 epoch + 单调递增：服务端 registry 跨会话/跨客户端
+            // 共享（多 TCP 条带），不同 dialer 必须几乎不可能撞 conn_id。
+            // 高 32 位随机、低 32 位计数；撞上的后果是该流被对端按未知 conn
+            // 丢弃，概率 2^-32 级（可忽略）。
+            next_conn_id: Arc::new(AtomicU64::new(
+                (rand::random::<u32>() as u64) << 32 | 1,
+            )),
             registry: Arc::new(ConnRegistry::new()),
         });
         // 后台 accept：服务端发起的 DOWN lane 归并；未知 conn / 非 OPEN → 丢流
@@ -828,7 +1000,13 @@ impl StripeDialer {
             loop {
                 let stream = match d.mux.accept().await {
                     Ok(s) => s,
-                    Err(_) => return,
+                    // 主会话也在 sessions 表里：死了同样要摘（prune 保证表
+                    // 不会变空，最后一个死条目让 connect 干净失败）。
+                    Err(_) => {
+                        let primary = d.mux.clone();
+                        d.prune_session(&primary);
+                        return;
+                    }
                 };
                 let dd = d.clone();
                 tokio::spawn(async move {
@@ -842,16 +1020,37 @@ impl StripeDialer {
     }
 
     /// 开一条新逻辑连接（首 lane = BIDI OPEN + TargetAddr）。
+    /// 轮转落到死会话时在剩余会话上重试（最多 `session_count()` 次）。
     pub async fn connect(
-        &self,
+        self: &Arc<Self>,
         target: &AddrPort,
     ) -> io::Result<StripeStreamHandle> {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let stream = self
-            .mux
-            .open()
-            .await
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let attempts = self.session_count().max(1);
+        let mut last: Option<io::Error> = None;
+        let mut opened = None;
+        for _ in 0..attempts {
+            let mux = self.pick();
+            match mux.open().await {
+                Ok(s) => {
+                    opened = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    // open 失败 = 该会话已死：摘表后换一条再试。
+                    self.prune_session(&mux);
+                    last = Some(io::Error::other(e.to_string()));
+                }
+            }
+        }
+        let stream = match opened {
+            Some(s) => s,
+            None => {
+                return Err(last.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "no live session")
+                }))
+            }
+        };
         let mut prefix = encode_header(&ConnHeader {
             conn_id,
             cmd: Cmd::Open,
@@ -863,7 +1062,7 @@ impl StripeDialer {
         let conn = StripeConn::new(
             conn_id,
             self.cfg.clone(),
-            self.mux.clone(),
+            self.rr_lane_opener(conn_id),
             Dir::Up,
             stream,
             prefix,
@@ -871,20 +1070,17 @@ impl StripeDialer {
         );
         self.registry.insert(conn_id, conn.clone());
         // conn 接收方向终结（EOF/错误）后清表
-        let reg = self.registry.clone();
-        let h = conn.stream();
-        let term = conn.inner_recv_terminal();
-        tokio::spawn(async move {
-            term.notified().await;
-            reg.remove(conn_id);
-        });
-        Ok(h)
+        spawn_registry_cleanup(self.registry.clone(), &conn);
+        Ok(conn.stream())
     }
 }
 
 // ---------------- 服务端：StripeListener ----------------
 
 /// 服务端监听器：accept mux 流 → 按 conn_id 路由 / 建新 conn（OPEN 带 addr）。
+/// `registry` 由外部注入——多会话条带要求跨会话共享同一张表（conn 的 lane
+/// 可能来自任意会话）。StripeConn 的加 lane 始终走本监听器所属会话的 mux
+/// （服务端单会话开 lane，见结构设计说明）。
 pub struct StripeListener {
     mux: Arc<dyn Mux>,
     cfg: StripeCfg,
@@ -985,6 +1181,11 @@ impl StripeListener {
         })
     }
 
+    /// 共享 registry 版（多会话条带）：多个会话的监听器归并到同一张表。
+    pub fn with_registry(mux: Arc<dyn Mux>, cfg: StripeCfg, registry: Arc<ConnRegistry>) -> Arc<Self> {
+        Arc::new(Self { mux, cfg, registry })
+    }
+
     /// accept 循环（每会话一个）。`on_new(conn, addr)`：新 conn 建立时拨目标。
     pub async fn run<F>(self: Arc<Self>, on_new: F)
     where
@@ -1035,8 +1236,12 @@ where
         return Ok(InboundLane::Dropped);
     }
     let (addr, early_data) = read_open_addr(&mut stream).await?;
-    let conn = StripeConn::new(header.conn_id, cfg, mux, Dir::Down, stream, Vec::new(), early_data);
+    let opener = single_mux_opener(header.conn_id, mux);
+    let conn = StripeConn::new(header.conn_id, cfg, opener, Dir::Down, stream, Vec::new(), early_data);
     registry.insert(header.conn_id, conn.clone());
+    // conn 接收方向终结后清表。registry 现在是 AppState 级全局表（跨会话
+    // 共享），不再随会话拆除而整体回收——没有这一步每条 conn 都永久泄漏。
+    spawn_registry_cleanup(registry.clone(), &conn);
     on_new(conn.clone(), addr.clone());
     Ok(InboundLane::New(conn, addr))
 }
