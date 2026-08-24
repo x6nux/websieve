@@ -1,82 +1,87 @@
-//! 服务端核心循环（Task 15）：accept() mux 流 → 读首帧 TargetAddr →
-//! TcpStream::connect → copy_bidirectional(stream, tcp)。每流一个 tokio task。
-//! 拨号失败 → 直接关流（客户端 SOCKS5 层会收到 EOF → 回 RST）。
+//! v2 服务端远程泵：mux accept → ConnHeader 路由（StripeListener）→
+//! 每 conn 拨目标 TCP + 双向泵。旧「首帧 TargetAddr 单流」协议已整体删除。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use wsieve_mux::stripe_runtime::{StripeCfg, StripeConn, StripeListener};
 use wsieve_mux::{Mux, MuxStream};
-use wsieve_proto::addr::{decode_addr, AddrPort, TargetAddr};
+use wsieve_proto::addr::{AddrPort, TargetAddr};
 
 /// 拨号超时（TCP connect，含域名解析）。
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// 首帧 TargetAddr 的最大长度（域名 ≤255 + 头尾，留足余量）。
-const ADDR_FRAME_MAX: usize = 512;
 
-/// 会话级 accept 循环：每条 mux 子流一个 task。
+/// 会话级 accept 循环：StripeListener 按 conn_id 路由 lane / 建新 conn。
 pub async fn session_loop(mux: Box<dyn Mux>) {
-    loop {
-        let stream = match mux.accept().await {
-            Ok(s) => s,
-            Err(_) => return, // 会话终结
-        };
-        tokio::spawn(async move {
-            if let Err(e) = serve_stream(stream).await {
-                let _ = e;
+    let listener = StripeListener::new(Arc::from(mux), StripeCfg::with_env());
+    listener.run(serve_conn).await;
+}
+
+/// 新 conn：拨目标 + 双向泵；目标 EOF → CLOSE(TargetEof)。
+fn serve_conn(conn: Arc<StripeConn>, addr: AddrPort) {
+    tokio::spawn(async move {
+        let mut stream = conn.stream();
+        let tcp = match dial(&addr).await {
+            Ok(t) => t,
+            Err(e) => {
+                // 拨号失败：错误原因下发给客户端后终结 conn
+                eprintln!("[remote] dial {} failed: {e}", addr.display());
+                let _ = stream.shutdown().await;
+                conn.close_send(wsieve_proto::stripe::CloseReason::TargetError)
+                    .await;
+                return;
             }
-        });
-    }
+        };
+        let (mut tcp_r, mut tcp_w) = tokio::io::split(tcp);
+
+        // 上行：conn → 目标。客户端 EOF（read 返回 0）→ 半关目标写侧。
+        let up = {
+            let mut up_s = stream.clone();
+            async move {
+                let mut buf = [0u8; 16 * 1024];
+                loop {
+                    match up_s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if tcp_w.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        // 下行：目标 → conn。目标 EOF → shutdown 触发 CLOSE(TargetEof)。
+        let down = async {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match tcp_r.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        };
+        tokio::join!(up, down);
+        let _ = stream.shutdown().await;
+        conn.close_send(wsieve_proto::stripe::CloseReason::TargetEof)
+            .await;
+    });
 }
 
-/// 单流：首帧 TargetAddr → 拨号 → 双向拷贝。任何失败 → 关流（drop）。
-async fn serve_stream(mut stream: MuxStream) -> std::io::Result<()> {
-    // 读首帧（完整读出一个 Frame::Data 载荷——TargetAddr 可能分多次 read 到齐）
-    let mut buf = Vec::with_capacity(ADDR_FRAME_MAX);
-    let mut chunk = [0u8; 512];
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            // 对端没给地址就关了：静默结束
-            return Ok(());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > ADDR_FRAME_MAX {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "address frame too large",
-            ));
-        }
-        if let Ok((_, consumed)) = decode_addr(&buf) {
-            let _ = consumed;
-            break;
-        }
-        // 不完整：继续读
-    }
-
-    let (target, _) = decode_addr(&buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-    // 首帧地址之后同帧携带的早期数据（若有）先发给目标
-    let mut tcp = dial(&target).await?;
-    if let Some(rest) = first_frame_rest(&buf) {
-        if !rest.is_empty() {
-            tcp.write_all(rest).await?;
-        }
-    }
-    copy_both(&mut stream, &mut tcp).await
-}
-
-/// 解析 TargetAddr → SocketAddr 串，拨第一个能通的。
-async fn dial(target: &AddrPort) -> std::io::Result<tokio::net::TcpStream> {
+/// 解析 TargetAddr → 拨第一个能通的 TCP。
+async fn dial(target: &AddrPort) -> std::io::Result<TcpStream> {
     let host = match &target.addr {
         TargetAddr::V4(o) => format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3]),
-        TargetAddr::V6(_) => {
-            // 本地回环场景罕见 IPv6 直填；交给 getaddrvia format
-            target.display().trim_matches(|c| c == '[' || c == ']').split(']').next().unwrap_or("::1").to_string()
-        }
+        TargetAddr::V6(_) => "::1".to_string(),
         TargetAddr::Domain(d) => d.clone(),
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
-    let fut = tokio::net::TcpStream::connect((host.as_str(), target.port));
+    let fut = TcpStream::connect((host.as_str(), target.port));
     match tokio::time::timeout(DIAL_TIMEOUT, fut).await {
         Ok(r) => r,
         Err(_) => Err(std::io::Error::new(
@@ -86,20 +91,56 @@ async fn dial(target: &AddrPort) -> std::io::Result<tokio::net::TcpStream> {
     }
 }
 
-/// 双向拷贝直至任一侧结束。
-async fn copy_both(
-    stream: &mut MuxStream,
-    tcp: &mut tokio::net::TcpStream,
-) -> std::io::Result<()> {
-    tokio::io::copy_bidirectional(stream, tcp).await.map(|_| ())
+/// 测试辅助：构造客户端 OPEN 前缀（ConnHeader + TargetAddr）。
+pub fn open_prefix(conn_id: u64, target: &AddrPort) -> Vec<u8> {
+    use wsieve_proto::stripe::{encode_header, Cmd, ConnHeader, Dir};
+    let mut prefix = encode_header(&ConnHeader {
+        conn_id,
+        cmd: Cmd::Open,
+        dir: Dir::Bidi,
+        lane_id: 0,
+    })
+    .to_vec();
+    prefix.extend_from_slice(&wsieve_proto::addr::encode_addr(target));
+    prefix
 }
 
-/// 首帧编码辅助（客户端侧约定，服务端测试也用它构造拨号帧）。
-pub fn target_frame(t: &AddrPort) -> Vec<u8> {
-    wsieve_proto::addr::encode_addr(t)
-}
-
-/// 读完首帧后剩余的载荷（Address 之后同帧携带的早期数据）。
-pub fn first_frame_rest(buf: &[u8]) -> Option<&[u8]> {
-    decode_addr(buf).ok().map(|(_, consumed)| &buf[consumed..])
+/// 测试辅助：读首帧头 + addr。返回 (conn_id, addr, 同批剩余字节)。
+pub async fn read_open(stream: &mut MuxStream) -> std::io::Result<(u64, AddrPort, Vec<u8>)> {
+    let mut b = [0u8; 16];
+    let mut got = 0;
+    while got < 16 {
+        let n = stream.read(&mut b[got..]).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof before header",
+            ));
+        }
+        got += n;
+    }
+    let h = wsieve_proto::stripe::decode_header(&b)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    let mut chunk = [0u8; 256];
+    loop {
+        if let Ok((addr, consumed)) = wsieve_proto::addr::decode_addr(&buf) {
+            let rest = buf.split_off(consumed);
+            return Ok((h.conn_id, addr, rest));
+        }
+        if buf.len() > 512 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "address frame too large",
+            ));
+        }
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof before address",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
 }

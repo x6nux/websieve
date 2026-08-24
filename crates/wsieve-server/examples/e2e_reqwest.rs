@@ -43,7 +43,13 @@ async fn main() -> anyhow::Result<()> {
         &UpstreamCfg {
             server_pub,
             client_priv,
-            mux_prefs: vec![wsieve_proto::hello::MuxId::Yamux],
+            mux_prefs: std::env::var("WSIEVE_E2E_MUX")
+                .ok()
+                .and_then(|m| wsieve_proto::hello::MuxId::from_u8(match m.as_str() {
+                    "smux" => 0x02, "muxado" => 0x03, "picomux" => 0x04, "h2mux" => 0x05, _ => 0x01,
+                }))
+                .map(|m| vec![m])
+                .unwrap_or_else(|| vec![wsieve_proto::hello::MuxId::Yamux]),
         },
     )
     .await?;
@@ -52,24 +58,26 @@ async fn main() -> anyhow::Result<()> {
     let io: wsieve_mux::MuxStream = Box::new(conn);
     let mux: Arc<dyn wsieve_mux::Mux> = Arc::from(wsieve_mux::mux_factory(neg.mux_id, io).await?);
 
+    // v2 条带化：StripeDialer 负责 conn_id 分配、OPEN+TargetAddr 首 lane、
+    // 以及后台 accept 归并服务端新开的 DOWN lane。
+    let cfg = wsieve_mux::stripe_runtime::StripeCfg::with_env();
+    let dialer = std::sync::Arc::new(wsieve_mux::stripe_runtime::StripeDialer::new(
+        mux, cfg,
+    ));
+
     let listener = tokio::net::TcpListener::bind(&socks).await?;
     println!("SOCKS5 listening on {socks}");
-    // 与 src-tauri/src/proxy.rs 相同的 handler/桥接路径。
+    // 与 src-tauri/src/proxy.rs 相同的 handler 路径（v2：StripeConn 出口）。
     let _ = wsieve_socks5::serve(listener, move |target| {
-        let mux = mux.clone();
+        let dialer = dialer.clone();
         Box::pin(async move {
-            use tokio::io::AsyncWriteExt;
-            let mut stream: wsieve_mux::MuxStream = mux
-                .open()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let frame = wsieve_proto::addr::encode_addr(&target);
-            stream
-                .write_all(&frame)
+            let stream = dialer
+                .connect(&target)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             let (local, mut remote_end) = tokio::io::duplex(64 * 1024);
             tokio::spawn(async move {
+                let mut stream = stream;
                 let _ = tokio::io::copy_bidirectional(&mut remote_end, &mut stream).await;
             });
             Ok(local)

@@ -13,11 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::Manager;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
-use wsieve_mux::{mux_factory, Mux, MuxStream};
-use wsieve_proto::addr::encode_addr;
+use wsieve_mux::stripe_runtime::{StripeCfg, StripeDialer};
+use wsieve_mux::{mux_factory, Mux};
 use wsieve_proto::hello::MuxId;
 use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
 
@@ -49,29 +48,25 @@ fn eval_fn(app: tauri::AppHandle) -> Box<dyn Fn(String) + Send + Sync> {
     })
 }
 
-/// SOCKS5 handler：从当前会话代的 mux 开流，首帧 TargetAddr。
+/// SOCKS5 handler（v2 条带化）：StripeDialer 开 conn（OPEN + TargetAddr
+/// 首 lane），后台 accept 任务自动归并服务端新开的 DOWN lane。
 fn socks_handler(
-    mux: Arc<tokio::sync::RwLock<Option<Arc<dyn Mux>>>>,
+    dialer: Arc<tokio::sync::RwLock<Option<Arc<StripeDialer>>>>,
 ) -> impl Fn(wsieve_proto::addr::AddrPort) -> futures::future::BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>>
        + Clone + Send + 'static {
     move |target| {
-        let mux = mux.clone();
+        let dialer = dialer.clone();
         Box::pin(async move {
-            let guard = mux.read().await;
-            let Some(mux) = guard.clone() else {
+            let guard = dialer.read().await;
+            let Some(dialer) = guard.clone() else {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "no session",
                 ));
             };
             drop(guard);
-            let mut stream: MuxStream = mux
-                .open()
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            let frame = encode_addr(&target);
-            stream
-                .write_all(&frame)
+            let stream = dialer
+                .connect(&target)
                 .await
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
             Ok(bridge_duplex(stream).await)
@@ -79,13 +74,15 @@ fn socks_handler(
     }
 }
 
-/// 把 MuxStream 包成 socks5::serve 要的 DuplexStream：开一条本地 duplex，
-/// 两个桥接任务做双向 copy。首帧已由调用方写入，这里只搬字节。
-async fn bridge_duplex(stream: MuxStream) -> tokio::io::DuplexStream {
+/// 把 StripeStreamHandle 包成 socks5::serve 要的 DuplexStream：开一条本地
+/// duplex，桥接任务做双向 copy。
+async fn bridge_duplex(
+    stream: wsieve_mux::stripe_runtime::StripeStreamHandle,
+) -> tokio::io::DuplexStream {
     let (local, mut remote_end) = tokio::io::duplex(64 * 1024);
     let mut stream = stream;
     tokio::spawn(async move {
-        // remote_end <-> stream；local 返回给 socks5 层
+        // remote_end <-> stripe conn；local 返回给 socks5 层
         let _ = tokio::io::copy_bidirectional(&mut remote_end, &mut stream).await;
     });
     local
@@ -96,15 +93,15 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&cfg.socks_listen).await?;
     tracing::info!("SOCKS5 listening on {}", cfg.socks_listen);
 
-    let mux_slot: Arc<tokio::sync::RwLock<Option<Arc<dyn Mux>>>> =
+    let dialer_slot: Arc<tokio::sync::RwLock<Option<Arc<StripeDialer>>>> =
         Arc::new(tokio::sync::RwLock::new(None));
     let session_dead = Arc::new(Notify::new());
 
     // SOCKS5 服务任务
     tokio::spawn({
-        let mux_slot = mux_slot.clone();
+        let mux_slot = dialer_slot.clone();
         async move {
-            let _ = wsieve_socks5::serve(listener, socks_handler(mux_slot)).await;
+            let _ = wsieve_socks5::serve(listener, socks_handler(dialer_slot.clone())).await;
         }
     });
 
@@ -143,7 +140,7 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
 
         // 3. 握手 + mux
         emit_status(&app, "handshaking");
-        let attempt: anyhow::Result<Box<dyn Mux>> = async {
+        let attempt: anyhow::Result<Arc<StripeDialer>> = async {
             let (conn, neg) = XhttpConn::connect(
                 transport.clone(),
                 &UpstreamCfg {
@@ -156,22 +153,22 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
             if neg.fallback {
                 emit_status(&app, "WARN: mux fallback (server did not honor prefs)");
             }
-            let io: MuxStream = Box::new(conn);
-            let mux = mux_factory(neg.mux_id, io).await?;
-            Ok(mux)
+            let io: wsieve_mux::MuxStream = Box::new(conn);
+            let mux: Arc<dyn Mux> = Arc::from(mux_factory(neg.mux_id, io).await?);
+            Ok(StripeDialer::new(mux, StripeCfg::with_env()))
         }
         .await;
 
         match attempt {
-            Ok(mux) => {
+            Ok(dialer) => {
                 backoff = Duration::from_millis(100);
                 emit_status(&app, "connected");
-                *mux_slot.write().await = Some(Arc::from(mux));
+                *dialer_slot.write().await = Some(dialer);
                 // 会话死亡信号：XhttpConn 内部断开时其流全部失败，但主循环
                 // 通过心跳/transport 死亡感知。等通知。
                 session_dead.notified().await;
                 emit_status(&app, "session dead, reloading");
-                *mux_slot.write().await = None;
+                *dialer_slot.write().await = None;
             }
             Err(e) => {
                 tracing::warn!("session attempt failed: {e:#}");

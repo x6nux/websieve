@@ -10,8 +10,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex as AsyncMutex;
+use wsieve_mux::stripe_runtime::{StripeCfg, StripeDialer};
 use wsieve_mux::{mux_factory, Mux, MuxStream};
-use wsieve_proto::addr::{encode_addr, AddrPort, TargetAddr};
+use wsieve_proto::addr::{AddrPort, TargetAddr};
 use wsieve_proto::crypto::gen_keypair;
 use wsieve_proto::hello::MuxId;
 use wsieve_server::{AppState, KeepaliveRange, ServerKeys, SEEN_CACHE_CAPACITY};
@@ -91,7 +92,7 @@ async fn start_server() -> TestRig {
 async fn connect_mux(
     rig: &TestRig,
     prefs: Vec<MuxId>,
-) -> (Box<dyn Mux>, MuxId) {
+) -> (std::sync::Arc<dyn Mux>, MuxId) {
     let transport = Arc::new(ReqwestTransport::new(format!("http://{}", rig.addr)).unwrap());
     let (conn, neg) = XhttpConn::connect(
         transport,
@@ -105,37 +106,43 @@ async fn connect_mux(
     .unwrap();
     let io: MuxStream = Box::new(conn);
     let mux = mux_factory(neg.mux_id, io).await.unwrap();
-    (mux, neg.mux_id)
+    (std::sync::Arc::from(mux), neg.mux_id)
 }
 
-/// 经 mux 流把 payload 发给 echo 并读回全部（首帧带 TargetAddr）。
+/// v2：经 StripeDialer 开 conn（BIDI OPEN + TargetAddr），发 payload 读回全部。
+/// 高阈值（不升级）以贴近小流量路径；乱序/大流量由 stripe 专项测试覆盖。
 async fn echo_roundtrip(
-    mux: &dyn Mux,
+    mux: std::sync::Arc<dyn Mux>,
     echo: SocketAddr,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut stream = mux.open().await.unwrap();
-    let mut frame = encode_addr(&AddrPort {
-        addr: TargetAddr::V4([127, 0, 0, 1]),
-        port: echo.port(),
-    });
-    frame.extend_from_slice(payload);
-    stream.write_all(&frame).await.unwrap();
-    stream.flush().await.unwrap();
-
-    let mut got = Vec::new();
-    let mut buf = [0u8; 8192];
-    // 读到 EOF（对端关流）或超时；echo 回显长度 = payload，多余字节是 mux 控制帧
-    // 之外不可能出现——这里以「已收齐 payload 即停，再读一次确认无损坏」为准
-    while got.len() < payload.len() {
-        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
+    let dialer = StripeDialer::new(
+        mux,
+        StripeCfg {
+            target_lanes: 4,
+            upgrade_bytes: u64::MAX,
+            upgrade_rate_bps: 0,
+            upgrade_window: Duration::from_millis(1),
+        },
+    );
+    let mut s = dialer
+        .connect(&AddrPort {
+            addr: TargetAddr::V4([127, 0, 0, 1]),
+            port: echo.port(),
+        })
+        .await
+        .unwrap();
+    s.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    let mut done = 0;
+    while done < payload.len() {
+        let n = tokio::time::timeout(Duration::from_secs(15), s.read(&mut got[done..]))
             .await
             .expect("15s 内应有回显")
             .unwrap();
-        assert!(n > 0, "premature EOF at {}", got.len());
-        got.extend_from_slice(&buf[..n]);
+        assert!(n > 0, "premature EOF at {done}");
+        done += n;
     }
-    got.truncate(payload.len());
     got
 }
 
@@ -148,7 +155,7 @@ async fn full_chain_echo() {
     let echo = echo_server().await;
     let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
     assert_eq!(chosen, MuxId::Yamux);
-    let got = echo_roundtrip(mux.as_ref(), echo, b"ping-over-full-chain").await;
+    let got = echo_roundtrip(mux, echo, b"ping-over-full-chain").await;
     assert_eq!(got, b"ping-over-full-chain");
 }
 
@@ -173,7 +180,7 @@ async fn run_one_mux(rig: &TestRig, id: MuxId) {
     let (mux, chosen) = connect_mux(rig, vec![id]).await;
     assert_eq!(chosen, id, "偏好唯一时应选中 {id:?}");
     let tag = format!("matrix-{id:?}-payload");
-    let got = echo_roundtrip(mux.as_ref(), echo, tag.as_bytes()).await;
+    let got = echo_roundtrip(mux, echo, tag.as_bytes()).await;
     assert_eq!(got, tag.as_bytes(), "{id:?} 全链路失败");
 }
 
@@ -184,7 +191,7 @@ async fn upstream_64k_integrity() {
     let echo = echo_server().await;
     let (mux, _chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
     let payload: Vec<u8> = (0..80_000u32).map(|i| (i % 253) as u8).collect();
-    let got = echo_roundtrip(mux.as_ref(), echo, &payload).await;
+    let got = echo_roundtrip(mux, echo, &payload).await;
     assert_eq!(got.len(), payload.len());
     assert_eq!(got, payload);
 }
@@ -291,11 +298,11 @@ async fn out_of_order_reorder() {
     .unwrap();
     assert_eq!(neg.mux_id, MuxId::Yamux);
     let io: MuxStream = Box::new(conn);
-    let mux = mux_factory(MuxId::Yamux, io).await.unwrap();
+    let mux: std::sync::Arc<dyn Mux> = std::sync::Arc::from(mux_factory(MuxId::Yamux, io).await.unwrap());
 
     // 连续多段写：聚合层会切成多个 POST（seq 递增），奇数延迟后到达序打乱
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 249) as u8).collect();
-    let got = echo_roundtrip(mux.as_ref(), echo, &payload).await;
+    let got = echo_roundtrip(mux, echo, &payload).await;
     assert_eq!(got, payload, "乱序到达时服务端重组应透明");
 }
 
@@ -402,7 +409,7 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
         handles.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis((N - 1 - i) as u64 * 150)).await;
             let tag = format!("concurrent-session-{i}-payload");
-            let got = echo_roundtrip(mux.as_ref(), echo, tag.as_bytes()).await;
+            let got = echo_roundtrip(mux, echo, tag.as_bytes()).await;
             assert_eq!(got, tag.as_bytes(), "session {i} 回显不一致");
         }));
     }
