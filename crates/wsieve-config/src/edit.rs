@@ -51,20 +51,20 @@ pub fn replace_rule_line(src: &str, line: u64, new_value: &str) -> Result<String
     let (body, eol) = split_eol(lines[idx]);
     let item = split_item(body, line)?;
 
-    // 值与注释之间的空白照原样留着，视觉对齐不被破坏
-    let gap: String = item
-        .value
-        .chars()
-        .rev()
-        .take_while(|c| c.is_whitespace())
-        .collect();
+    // 值与注释之间的对齐空白照原样留着，视觉对齐不被破坏。
+    // 这里同样只认 YAML 的 s-white（空格 / 制表符），理由与 find_comment_start 一致：
+    // U+3000 之类在 YAML 眼里是**值的一部分**，当成 gap 采走的话，写回时
+    // 新值后面会凭空多出一个全角空格（实测 `- MATCH,DIRECT　 # 注释` 每存一次多一个）。
+    // 另外按**原顺序**切片而非 `rev().collect()`：后者会把 " \t" 写成 "\t "，
+    // 同值替换就不再恒等 —— 全是空格时看不出来，空格与 TAB 混用才现形。
+    let gap = &item.value[item.value.trim_end_matches([' ', '\t']).len()..];
 
     let mut out = String::with_capacity(src.len() + new_value.len());
     for (i, l) in lines.iter().enumerate() {
         if i == idx {
             out.push_str(item.prefix);
             out.push_str(new_value);
-            out.push_str(&gap);
+            out.push_str(gap);
             out.push_str(item.comment);
             out.push_str(eol);
         } else {
@@ -146,6 +146,13 @@ fn split_item(body: &str, line: u64) -> Result<Item<'_>, EditError> {
 /// 实测 `- MATCH,DIRECT#兜底` 读回来的值就是 `MATCH,DIRECT#兜底` 整串。
 /// 若按「第一个 `#` 即注释起点」去切，同值替换会写出 `MATCH,DIRECT#兜底#兜底`
 /// —— 一次静默的文件损坏，正是本模块要防的事。
+///
+/// 「空白」按 YAML 规范的 `s-white` 判定：**只有** 空格与制表符两种。
+/// 这里刻意不用 `char::is_whitespace` —— 它覆盖整个 Unicode White_Space
+/// 属性，会把 U+3000（中文输入法的全角空格，本项目用户的日常产物）、
+/// U+00A0、U+2003 也算成空白，于是 `- MATCH,DIRECT　#兜底` 里的 `#`
+/// 被误判成开启注释，而 YAML 认为它是值的一部分。后果与上面那条 ASCII
+/// 陷阱同构，但更凶：每存一次注释就翻一倍，五次之后是 32 份，且每轮都「成功」。
 fn find_comment_start(s: &str) -> Option<usize> {
     // 区段开头等同于「前面是空白」：`- #foo` 里的 `#` 确实开启注释
     let mut prev_is_space = true;
@@ -153,7 +160,7 @@ fn find_comment_start(s: &str) -> Option<usize> {
         if c == '#' && prev_is_space {
             return Some(i);
         }
-        prev_is_space = c.is_whitespace();
+        prev_is_space = matches!(c, ' ' | '\t');
     }
     None
 }
@@ -332,6 +339,69 @@ rules:
 
         let out = replace_rule_line(src, 2, "MATCH,日本节点").unwrap();
         assert_eq!(out, "rules:\n  - MATCH,日本节点\n", "旧值应整串被换掉");
+    }
+
+    #[test]
+    fn a_full_width_space_before_the_hash_does_not_open_a_comment() {
+        // YAML 的 s-white **只有**空格与制表符。U+3000（中文输入法的全角空格）
+        // 在 YAML 眼里是值的普通字符，故 `- MATCH,DIRECT　#兜底` 的值是整串。
+        // 若用 `char::is_whitespace` 判定（覆盖整个 Unicode White_Space），
+        // 这个 `#` 会被误当成注释起点，同值替换每存一次就把 `　#兜底` 翻一倍：
+        // 实测五次之后是 32 份，且每一轮都「成功」，永远不报错。
+        let src = "rules:\n  - MATCH,DIRECT\u{3000}#兜底\n";
+        let value = rules_of(src)[0].1.clone();
+        assert_eq!(value, "MATCH,DIRECT\u{3000}#兜底", "先钉住 YAML 的实际取值");
+
+        let same = replace_rule_line(src, 2, &value).unwrap();
+        assert_eq!(same, src, "含全角空格 + `#` 的值同值替换必须逐字节恒等");
+    }
+
+    #[test]
+    fn full_width_space_does_not_compound_across_repeated_saves() {
+        // 这个 bug 的杀伤力在于**指数累积**：单看一轮像是「多了个尾巴」，
+        // 五轮之后原值被 32 份注释淹没。用连存五次钉死它不再增长。
+        let src = "rules:\n  - MATCH,DIRECT\u{3000}#兜底\n";
+        let mut text = src.to_string();
+        for i in 1..=5 {
+            let value = rules_of(&text)[0].1.clone();
+            text = replace_rule_line(&text, 2, &value).unwrap();
+            assert_eq!(text, src, "第 {i} 次保存后就该逐字节等于原文");
+        }
+    }
+
+    #[test]
+    fn other_unicode_spaces_before_a_hash_are_part_of_the_value_too() {
+        // 同一族的另外两个来源：U+00A0（不换行空格，网页复制粘贴的常客）
+        // 与 U+2003（em space）。判定必须是「只认空格与 TAB」，
+        // 而不是逐个把已知的 Unicode 空白拉黑 —— 后者永远列不全。
+        for sp in ['\u{00a0}', '\u{2003}'] {
+            let src = format!("rules:\n  - MATCH,DIRECT{sp}#兜底\n");
+            let value = rules_of(&src)[0].1.clone();
+            assert_eq!(value, format!("MATCH,DIRECT{sp}#兜底"), "U+{:04X}", sp as u32);
+            let same = replace_rule_line(&src, 2, &value).unwrap();
+            assert_eq!(same, src, "U+{:04X} 之后的 `#` 不该开启注释", sp as u32);
+        }
+    }
+
+    #[test]
+    fn a_tab_in_the_alignment_gap_keeps_its_position() {
+        // 对齐空白按**原顺序**保留。用 `chars().rev().collect()` 采集的实现
+        // 会把 " \t" 写回成 "\t "，全是空格时看不出来，空格与 TAB 混用才现形。
+        let src = "rules:\n  - MATCH,DIRECT \t# 注释\n";
+        let value = rules_of(src)[0].1.clone();
+        let same = replace_rule_line(src, 2, &value).unwrap();
+        assert_eq!(same, src, "gap 里的空格与 TAB 顺序不能被颠倒");
+    }
+
+    #[test]
+    fn a_trailing_full_width_space_in_the_value_is_not_taken_as_gap() {
+        // gap 只能从**值的尾部**采走 YAML 认得的空白。U+3000 属于值本身，
+        // 采走它会让写回的新值后面凭空多一个全角空格 —— 每存一次多一个。
+        let src = "rules:\n  - MATCH,DIRECT\u{3000} # 注释\n";
+        let value = rules_of(src)[0].1.clone();
+        assert_eq!(value, "MATCH,DIRECT\u{3000}", "全角空格是值的一部分");
+        let same = replace_rule_line(src, 2, &value).unwrap();
+        assert_eq!(same, src, "值尾的全角空格不该被当成对齐空白重复写出");
     }
 
     #[test]
