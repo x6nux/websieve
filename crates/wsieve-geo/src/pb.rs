@@ -36,7 +36,7 @@ impl<'a> Reader<'a> {
         loop {
             let b = *self.buf.get(self.pos).ok_or(PbError::Truncated)?;
             self.pos += 1;
-            // 第 10 个字节只允许贡献 1 位（64 = 9*7 + 1）
+            // 走到第 11 字节即超出 u64 varint 的最大长度
             if shift >= 64 {
                 return Err(PbError::VarintOverflow);
             }
