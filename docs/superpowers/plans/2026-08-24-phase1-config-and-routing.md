@@ -3287,11 +3287,16 @@ Expected: 全绿。既有的 proto / transport / xhttp / mux / socks5 测试不�
 Run: `cargo clippy -p wsieve-geo -p wsieve-route -p wsieve-config --all-targets -- -D warnings`
 Expected: 无警告。
 
-> **为什么不跑 `--workspace`**：仓库现有代码已经有 3 处 clippy 报错，与本阶段无关
-> （`crates/wsieve-proto/src/stripe.rs:178` 的 `type_complexity`，
-> `crates/wsieve-proto/src/hello.rs:10-11` 的文档列表缩进）。
-> 把它们纳入本阶段的完成门禁，等于让阶段 1 卡在别人的债上。
-> 想顺手清掉是好事，但**单独提交**，别混进本阶段的提交里。
+> **执行期更新（2026-08-25）**：原先此处写着「仓库现有 3 处 clippy 报错属范围外，跑
+> `--workspace` 会卡在别人的债上」。实际执行 Task 8 时发现**躲不掉**——
+> `cargo clippy -p wsieve-route` 会连带检查依赖，`wsieve-proto` 的报错让
+> `wsieve-route` 也过不了 `-D warnings`。
+>
+> 那三处已在提交 `style(proto): 清掉三处 clippy 报错以解除下游门禁阻塞` 中单独清理
+> （`hello.rs` 的 `doc_lazy_continuation`、`stripe.rs` 的 `type_complexity`），
+> 上面的命令现在可以直接通过。
+>
+> 教训：「范围外的技术债」在依赖图上游时，并不真的在范围外。
 
 - [ ] **Step 5: 提交**
 
