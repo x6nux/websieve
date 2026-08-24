@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
 
 use crate::{Mux, MuxStream};
@@ -344,16 +343,6 @@ impl StripeConn {
     /// 本端发送方向关闭（原因写入 CLOSE 帧）。
     pub async fn close_send(&self, reason: CloseReason) {
         self.inner.request_close(reason);
-    }
-}
-
-impl ConnInner {
-    fn try_add_lane(&self, w: WriteHalf<MuxStream>) -> io::Result<()> {
-        match self.ctl.try_send(CtlMsg::AddLane(w)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(io::Error::new(io::ErrorKind::WouldBlock, "ctl full")),
-            Err(TrySendError::Closed(_)) => Err(io_closed()),
-        }
     }
 }
 
