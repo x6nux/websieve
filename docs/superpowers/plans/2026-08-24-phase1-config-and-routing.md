@@ -188,6 +188,27 @@ mod tests {
         let mut r = Reader::new(&[0xFF; 11]);
         assert!(r.varint().is_err());
     }
+
+    #[test]
+    fn overlong_tenth_byte_errors_instead_of_truncating() {
+        // 10 字节 varint 的第 10 字节只能是 0 或 1。给 0x02 意味着这个数
+        // 超出 u64，必须报错而不是把高位静默移出去 —— 上一个测试用 11 个
+        // 字节，覆盖的是第 11 字节那条路径，覆盖不到这里。
+        let mut buf = vec![0xFF; 9];
+        buf.push(0x02);
+        let mut r = Reader::new(&buf);
+        assert!(matches!(r.varint(), Err(PbError::VarintOverflow)));
+    }
+
+    #[test]
+    fn maximal_valid_varint_still_decodes() {
+        // 反向守住：合法的 u64::MAX（第 10 字节恰为 0x01）不能被误判为溢出。
+        // 只加守卫不加这条，很容易把边界上的合法值一起挡掉。
+        let mut buf = vec![0xFF; 9];
+        buf.push(0x01);
+        let mut r = Reader::new(&buf);
+        assert_eq!(r.varint().unwrap(), u64::MAX);
+    }
 }
 ```
 
@@ -239,8 +260,13 @@ impl<'a> Reader<'a> {
         loop {
             let b = *self.buf.get(self.pos).ok_or(PbError::Truncated)?;
             self.pos += 1;
-            // 第 10 个字节只允许贡献 1 位（64 = 9*7 + 1）
             if shift >= 64 {
+                return Err(PbError::VarintOverflow);
+            }
+            // protobuf 的 u64 varint 最多 10 字节：前 9 个各贡献 7 位（63 位），
+            // 第 10 个只剩 1 位可用。此时高位非零说明这个数超出 u64 ——
+            // 必须报错，不能让 << 63 把它们静默移出去（房规：错误绝不静默）。
+            if shift == 63 && b & 0x7f > 1 {
                 return Err(PbError::VarintOverflow);
             }
             v |= ((b & 0x7f) as u64) << shift;
@@ -303,7 +329,9 @@ impl<'a> Reader<'a> {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test -p wsieve-geo --lib pb::`
-Expected: 6 个测试全部 PASS
+Expected: 8 个测试全部 PASS
+
+> 注意：`lib.rs` 里已声明 `pub mod ip;` 与 `pub mod site;`，但那两个文件要到 Task 3/4 才写。本步骤前先建两个**空文件**占位，否则整个 crate 编译不过。
 
 - [ ] **Step 5: 提交**
 
