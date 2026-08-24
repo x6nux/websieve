@@ -40,7 +40,7 @@ fn serve_conn(conn: Arc<StripeConn>, addr: AddrPort) {
         let up = {
             let mut up_s = stream.clone();
             async move {
-                let mut buf = [0u8; 16 * 1024];
+                let mut buf = vec![0u8; 64 * 1024];
                 loop {
                     match up_s.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
@@ -55,7 +55,7 @@ fn serve_conn(conn: Arc<StripeConn>, addr: AddrPort) {
         };
         // 下行：目标 → conn。目标 EOF → shutdown 触发 CLOSE(TargetEof)。
         let down = async {
-            let mut buf = [0u8; 16 * 1024];
+            let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match tcp_r.read(&mut buf).await {
                     Ok(0) | Err(_) => break,

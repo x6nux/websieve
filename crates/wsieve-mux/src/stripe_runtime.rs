@@ -540,7 +540,7 @@ fn feed(inner: &Arc<ConnInner>, off: u64, payload: Bytes) {
 // ---------------- 发送任务 ----------------
 
 struct LaneW {
-    w: WriteHalf<MuxStream>,
+    w: Option<WriteHalf<MuxStream>>,
     last_write: Instant,
 }
 
@@ -552,13 +552,17 @@ async fn send_task(
     initial_w: WriteHalf<MuxStream>,
     mut ctl: tokio::sync::mpsc::Receiver<CtlMsg>,
 ) {
-    let mut lanes = vec![LaneW { w: initial_w, last_write: Instant::now() }];
+    let mut lanes = vec![LaneW { w: Some(initial_w), last_write: Instant::now() }];
     let mut up_off: u64 = 0;
     let mut next_lane_id: u16 = 1;
     let start = Instant::now();
     let mut sent: u64 = 0;
     if !initial_bytes.is_empty() {
-        if lanes[0].w.write_all(&initial_bytes).await.is_err() {
+        let ok = match lanes[0].w.as_mut() {
+            Some(w) => w.write_all(&initial_bytes).await.is_ok(),
+            None => false,
+        };
+        if !ok {
             mark_dead(&inner);
             return;
         }
@@ -588,19 +592,42 @@ async fn send_task(
             }
             let mut off = up_off;
             let mut idx = 0usize;
-            let mut failed = false;
+            // 并行分发：每条 lane 攒好自己的帧批次，然后各 lane 的写入并发执行
+            // （join_all + 每批次 move 进独立 future）。串行 await 会让窗口满的
+            // lane 阻塞其他 lane（队头阻塞），多车道退化成单车道——这正是
+            // 分片要解决的问题。每 lane 内部帧顺序天然保持（批次内顺序 write_all）。
+            let mut batches: Vec<Vec<u8>> = vec![Vec::new(); lanes.len()];
             for chunk in bytes.chunks(CHUNK) {
                 let li = idx % lanes.len();
                 idx += 1;
-                let lane = &mut lanes[li];
-                let mut frame = Vec::with_capacity(12 + chunk.len());
-                encode_frame(off, chunk, &mut frame);
-                if lane.w.write_all(&frame).await.is_err() {
-                    failed = true;
-                    break;
-                }
-                lane.last_write = Instant::now();
+                encode_frame(off, chunk, &mut batches[li]);
                 off += chunk.len() as u64;
+            }
+            // 把每条 lane 的写半 move 到独立 future 再 join——所有权出借问题
+            // 用「写完放回」解决：lane 写半包成 Option，future 归还。
+            let mut lane_ws: Vec<Option<WriteHalf<MuxStream>>> =
+                lanes.iter_mut().map(|l| l.w.take()).collect();
+            let mut futs = Vec::new();
+            for (li, buf) in batches.into_iter().enumerate() {
+                if buf.is_empty() {
+                    continue;
+                }
+                let Some(mut w) = lane_ws[li].take() else { continue };
+                futs.push(async move {
+                    let r = w.write_all(&buf).await.is_ok();
+                    (li, w, r)
+                });
+            }
+            let results = futures::future::join_all(futs).await;
+            let mut failed = false;
+            for (li, w, ok) in results {
+                if let Some(l) = lanes.get_mut(li) {
+                    l.w = Some(w);
+                    l.last_write = Instant::now();
+                }
+                if !ok {
+                    failed = true;
+                }
             }
             if failed {
                 mark_dead(&inner);
@@ -642,7 +669,7 @@ async fn send_task(
             _ = notified => {},
             msg = ctl.recv() => match msg {
                 Some(CtlMsg::AddLane(w)) => {
-                    lanes.push(LaneW { w, last_write: Instant::now() });
+                    lanes.push(LaneW { w: Some(w), last_write: Instant::now() });
                     inner.lane_count.store(lanes.len(), Ordering::Relaxed);
                 }
                 None => {
@@ -669,11 +696,15 @@ async fn send_task(
         })
         .to_vec();
         frame.extend_from_slice(&encode_close_payload(up_off, inner.out.lock().unwrap().close_reason));
-        let _ = lanes[best].w.write_all(&frame).await;
+        if let Some(w) = lanes[best].w.as_mut() {
+            let _ = w.write_all(&frame).await;
+        }
     }
     for l in &mut lanes {
-        let _ = l.w.flush().await;
-        let _ = l.w.shutdown().await;
+        if let Some(w) = l.w.as_mut() {
+            let _ = w.flush().await;
+            let _ = w.shutdown().await;
+        }
     }
     mark_dead(&inner);
 }
@@ -730,7 +761,7 @@ async fn maybe_upgrade(
         }
         // 自己开的 lane 上对端不会有数据，但读半须有人消费（EOF 检测）
         tokio::spawn(drain_read_half(r));
-        lanes.push(LaneW { w, last_write: Instant::now() });
+        lanes.push(LaneW { w: Some(w), last_write: Instant::now() });
         inner.lane_count.store(lanes.len(), Ordering::Relaxed);
     }
 }
