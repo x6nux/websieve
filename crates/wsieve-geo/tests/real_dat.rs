@@ -48,7 +48,7 @@ fn real_geosite_cn_and_ads_behave() {
     assert!(db.has("cn"));
     assert!(db.matches("cn", "www.baidu.com"), "baidu 应属 cn");
     assert!(!db.matches("cn", "www.google.com"), "google 不应属 cn");
-    eprintln!("跳过的条目数（Regex/空值/超深）：{}", db.skipped_regex());
+    eprintln!("跳过的条目数（Regex/空值/超深）：{}", db.skipped_entries());
 }
 
 /// B2 的现实回归：真实 geosite 里不该存在能匹配一切的类别。

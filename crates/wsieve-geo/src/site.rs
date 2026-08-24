@@ -17,13 +17,13 @@ struct SiteClass {
 
 pub struct SiteDb {
     classes: HashMap<String, SiteClass>,
-    skipped_regex: usize,
+    skipped_entries: usize,
 }
 
 impl SiteDb {
     pub fn parse(buf: &[u8]) -> Result<Self, PbError> {
         let mut classes: HashMap<String, SiteClass> = HashMap::new();
-        let mut skipped_regex = 0usize;
+        let mut skipped_entries = 0usize;
 
         let mut r = Reader::new(buf);
         while !r.is_empty() {
@@ -35,14 +35,14 @@ impl SiteDb {
             // GeoSiteList.entry
             let entry = r.bytes()?;
             let (code, class, skipped) = parse_geosite(entry)?;
-            skipped_regex += skipped;
+            skipped_entries += skipped;
             // 同一 code 出现多次时合并而非覆盖
             let slot = classes.entry(code).or_default();
             slot.full.extend(class.full);
             slot.substr.extend(class.substr);
             slot.suffix.merge(class.suffix);
         }
-        Ok(Self { classes, skipped_regex })
+        Ok(Self { classes, skipped_entries })
     }
 
     pub fn has(&self, code: &str) -> bool {
@@ -70,11 +70,15 @@ impl SiteDb {
     /// 2. 空值条目 —— 空 Substr 会让匹配恒真，必须拦；
     /// 3. 标签数超过 MAX_LABELS 的超深域名 —— 见 DomainTrie::insert。
     ///
+    /// 名字不叫 skipped_regex：三个来源里只有第一个与正则有关，
+    /// 旧名会让读者把「空值」「超深」两类丢弃误读成正则条目，
+    /// 对着一个不存在的正则问题排查。
+    ///
     /// ponytail: 不支持 Domain.Type = Regex，解析时跳过并计数。
     /// 上限：带正则的 geosite 条目不会命中，表现为漏匹配（绝不会错匹配）。
     /// 升级路径：若实测漏匹配显著，引入 regex crate 并在此加一个 Vec<Regex>。
-    pub fn skipped_regex(&self) -> usize {
-        self.skipped_regex
+    pub fn skipped_entries(&self) -> usize {
+        self.skipped_entries
     }
 }
 
@@ -359,7 +363,7 @@ mod tests {
     fn regex_entries_are_skipped_and_counted() {
         let buf = encode_geosite_list(&[("t", &[(1, ".*\\.example\\.com"), (3, "keep.com")])]);
         let db = SiteDb::parse(&buf).unwrap();
-        assert_eq!(db.skipped_regex(), 1, "Regex 条目应被计数");
+        assert_eq!(db.skipped_entries(), 1, "Regex 条目应被计数");
         assert!(db.matches("t", "keep.com"), "同类别的其他条目不受影响");
     }
 
@@ -392,7 +396,7 @@ mod tests {
         let deep = deep_domain(20_000);
         let buf = encode_geosite_list(&[("t", &[(2, deep.as_str()), (3, "keep.com")])]);
         let db = SiteDb::parse(&buf).unwrap();
-        assert_eq!(db.skipped_regex(), 1, "超深条目应被计入 skipped");
+        assert_eq!(db.skipped_entries(), 1, "超深条目应被计入 skipped");
         assert!(!db.matches("t", &deep), "被丢弃的条目不应能匹配");
         assert!(db.matches("t", "keep.com"), "同类别的正常条目不受影响");
         // 函数正常返回本身就是断言：db 在此处析构，迭代式 Drop 不能爆栈
@@ -409,7 +413,7 @@ mod tests {
         )]);
         let db = SiteDb::parse(&buf).unwrap();
         assert!(db.matches("t", &at_cap), "128 层应被接受");
-        assert_eq!(db.skipped_regex(), 1, "129 层应被丢弃且计数");
+        assert_eq!(db.skipped_entries(), 1, "129 层应被丢弃且计数");
     }
 
     /// B1：merge 路径同样不能递归 —— 同一 code 出现两次会走 merge。
@@ -437,7 +441,7 @@ mod tests {
         assert!(!db.matches("cn", "mybank.com"), "空 Substr 绝不能匹配任意域名");
         assert!(!db.matches("cn", "login.microsoft.com"));
         assert!(db.matches("cn", "baidu.com"), "同类别的正常条目不受影响");
-        assert_eq!(db.skipped_regex(), 1, "空条目应被计数");
+        assert_eq!(db.skipped_entries(), 1, "空条目应被计数");
     }
 
     /// B2 的隐蔽入口：值 "." 会被 parse_domain 规范化成空串，
@@ -448,7 +452,7 @@ mod tests {
         let db = SiteDb::parse(&buf).unwrap();
         assert!(!db.matches("cn", "mybank.com"), "\".\" 规范化后为空，同样必须拦");
         assert!(db.matches("cn", "baidu.com"));
-        assert_eq!(db.skipped_regex(), 1);
+        assert_eq!(db.skipped_entries(), 1);
     }
 
     /// B2：full / suffix 的空值实测无害，但一并拦掉并计数。
@@ -458,6 +462,6 @@ mod tests {
         let db = SiteDb::parse(&buf).unwrap();
         assert!(!db.matches("cn", "mybank.com"));
         assert!(db.matches("cn", "baidu.com"));
-        assert_eq!(db.skipped_regex(), 2, "空 full 与空 suffix 各计一次");
+        assert_eq!(db.skipped_entries(), 2, "空 full 与空 suffix 各计一次");
     }
 }
