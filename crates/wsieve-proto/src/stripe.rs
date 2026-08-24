@@ -323,10 +323,8 @@ mod tests {
 
     #[test]
     fn frame_len_over_limit_rejected() {
-        let mut b = FRAME_HEADER_LEN.to_le_bytes().to_vec();
-        let mut hdr = Vec::new();
-        encode_frame(0, b"", &mut hdr);
-        b = hdr;
+        let mut b = Vec::new();
+        encode_frame(0, b"", &mut b);
         b[8..12].copy_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
         assert_eq!(
             decode_frame(&b),

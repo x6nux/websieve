@@ -13,7 +13,7 @@ fn delay_pipe(rtt_ms: u64) -> (tokio::io::DuplexStream, tokio::io::DuplexStream)
     let half = Duration::from_millis(rtt_ms / 2);
     tokio::spawn(async move {
         let (mut r, w) = tokio::io::split(b1);
-        let (mut r2, mut w2) = tokio::io::split(b2);
+        let (mut r2, w2) = tokio::io::split(b2);
         let mut w = Some(w);
         let mut w2o = Some(w2);
         let mut buf1 = vec![0u8; 65536];
