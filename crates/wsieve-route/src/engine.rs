@@ -61,13 +61,55 @@ pub enum BuildError {
     UnknownGlobalOutbound(String),
 }
 
+/// 加载期 GEO 校验的告警。**不是错误**：按设计文档 §12，涉 GEO 的规则
+/// 跳过并告警，绝不阻断启动 —— GEO 是外部下载的数据，允许缺失或过时。
+///
+/// 以数据形式返回而不是就地打日志：本 crate 全程无 IO、无日志依赖
+/// （见 lib.rs 的纪律），且 UI 需要拿到行号去标红对应的规则行，
+/// 日志文本给不了它这个。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GeoWarning {
+    /// 文件正常，但里面没有这个类别 —— 绝大多数情况是笔误
+    /// （写了 `GEOSITE,cnn` 而非 `GEOSITE,cn`）。这条规则永远不会命中，
+    /// 且因为「不命中」与「没写这条规则」表现完全一致，不告警就永远无人察觉。
+    #[error("第 {line} 行：{kind} 引用了 GEO 数据里不存在的类别「{code}」，该规则永远不会命中")]
+    UnknownClass {
+        line: usize,
+        kind: RuleKind,
+        code: String,
+    },
+    /// 文件本身读不了或解析不了。与「类别不存在」是两回事，不能混报：
+    /// 这里是环境问题（还没下载 / 权限不足 / 下载损坏），补上文件就全好；
+    /// 而 UnknownClass 是配置里的笔误，换多少个文件都没用。
+    /// 混为一谈会把用户引向错误的修复方向。
+    ///
+    /// 按**库**汇总而不是按规则逐条报：缺一个文件却刷出十条一模一样的
+    /// 告警，是在用噪音淹没信号。`affected` 给出受牵连的规则条数。
+    #[error("{kind} 数据不可用（{reason}），{affected} 条相关规则将不会命中")]
+    DbUnavailable {
+        kind: RuleKind,
+        affected: usize,
+        reason: String,
+    },
+}
+
+/// 一条规则连同它在规则列表里的位置。
+///
+/// 行号必须随规则一起存下来：`rules` 里没有注释与空行，下标早已与
+/// 用户看到的行号对不上，而 GEO 告警要能把 UI 的光标定到出错那一行。
+#[derive(Debug)]
+struct Entry {
+    rule: Rule,
+    line: usize,
+}
+
 /// 已加载的规则集，供 evaluate() 使用。
 ///
 /// `Debug` 是必需的，不是装饰：测试里对 `Result<RuleSet, _>` 调
 /// `.unwrap_err()` 要求 `T: Debug`，少了它 Task 9 的 5 个测试全部编译失败。
 #[derive(Debug)]
 pub struct RuleSet {
-    rules: Vec<Rule>,
+    rules: Vec<Entry>,
     mode: Mode,
     global: Decision,
     /// MATCH 的目标。加载期已保证存在。
@@ -110,7 +152,7 @@ impl RuleSet {
             if rule.kind == RuleKind::Match {
                 fallback = Some(Decision::from(&rule.target));
             }
-            rules.push(rule);
+            rules.push(Entry { rule, line });
         }
 
         let fallback = fallback.ok_or(BuildError::MissingMatch)?;
@@ -145,6 +187,89 @@ impl RuleSet {
         &self.global
     }
 
+    /// 加载期的 GEO 引用校验（设计文档 §12）。
+    ///
+    /// **刻意不做成 `build` 的参数**，理由有三：
+    ///
+    /// 1. `build` 不需要 GEO 文件也该能用。规则语法校验与 GEO 数据是否
+    ///    到位是两件独立的事，把 GeoDb 塞进 build 会让「只想校验语法」的
+    ///    调用方（现有全部单测、UI 的规则试算）被迫先准备两个 .dat 文件。
+    /// 2. GeoDb 是惰性加载的。build 里一旦碰 GEO，就等于把 11MB 的
+    ///    geosite.dat 解析提前到了每次加载配置时 —— 而一份不含 GEOSITE
+    ///    规则的配置本该一个字节都不读。分开之后，调用方可以在自己选定的
+    ///    时机（例如 GEO 文件下载完成之后）再校验。
+    /// 3. 返回值语义干净。build 的失败是「配置不可用」，而 GEO 告警是
+    ///    「配置可用，但有几条规则不会生效」—— 两者混在一个 Result 里，
+    ///    要么逼出 `(RuleSet, Vec<Warning>)` 这种谁都可以忽略后半截的元组，
+    ///    要么把告警伪装成错误。分成两个方法，各自的返回值都只说一件事。
+    ///
+    /// GEO 文件缺失/损坏与类别不存在被分成两类告警，绝不合并：前者是环境
+    /// 问题，后者是配置笔误，修复方向完全不同（详见 GeoWarning 的注释）。
+    ///
+    /// 没有 GEO 规则时不碰 GeoDb，也就不会触发任何文件读取。
+    pub fn check_geo(&self, geo: &GeoDb) -> Vec<GeoWarning> {
+        let mut warnings = Vec::new();
+        // 两个库各自独立：geosite 坏了不影响 geoip 的校验，反之亦然。
+        // 一个库只在首次遇到相关规则时才被触碰，从而保住惰性加载。
+        let mut site_unavailable: Option<String> = None;
+        let mut ip_unavailable: Option<String> = None;
+        let mut site_affected = 0usize;
+        let mut ip_affected = 0usize;
+
+        for entry in &self.rules {
+            let (kind, unavailable, affected) = match entry.rule.kind {
+                RuleKind::GeoSite => {
+                    (RuleKind::GeoSite, &mut site_unavailable, &mut site_affected)
+                }
+                RuleKind::GeoIp => (RuleKind::GeoIp, &mut ip_unavailable, &mut ip_affected),
+                // 其余规则与 GEO 无关
+                _ => continue,
+            };
+            let RuleValue::Text(code) = &entry.rule.value else {
+                continue;
+            };
+
+            // 该库已知不可用：只累加受影响条数，不再重复查询
+            if unavailable.is_some() {
+                *affected += 1;
+                continue;
+            }
+
+            let found = match kind {
+                RuleKind::GeoSite => geo.has_site_class(code),
+                _ => geo.has_ip_class(code),
+            };
+            match found {
+                Ok(true) => {}
+                Ok(false) => warnings.push(GeoWarning::UnknownClass {
+                    line: entry.line,
+                    kind,
+                    code: code.clone(),
+                }),
+                Err(e) => {
+                    // 错误绝不吞掉：转成一条按库汇总的告警，
+                    // 原始原因（含路径）原样带出去
+                    *unavailable = Some(e.to_string());
+                    *affected += 1;
+                }
+            }
+        }
+
+        for (kind, unavailable, affected) in [
+            (RuleKind::GeoSite, site_unavailable, site_affected),
+            (RuleKind::GeoIp, ip_unavailable, ip_affected),
+        ] {
+            if let Some(reason) = unavailable {
+                warnings.push(GeoWarning::DbUnavailable {
+                    kind,
+                    affected,
+                    reason,
+                });
+            }
+        }
+        warnings
+    }
+
     /// 两阶段求值。协议见设计文档 §4.2 纪律①。
     ///
     /// - 第一轮传 `resolved: None`。多数流量在域名类规则处命中，**不触发解析**
@@ -176,7 +301,8 @@ impl RuleSet {
             TargetAddr::V6(a) => (None, Some(IpAddr::from(*a))),
         };
 
-        for rule in &self.rules {
+        for entry in &self.rules {
+            let rule = &entry.rule;
             if rule.kind == RuleKind::Match {
                 return Verdict::Decided(Decision::from(&rule.target));
             }

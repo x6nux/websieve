@@ -69,6 +69,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("目标：{}", target.display());
     println!("规则：{} 条", set.len());
 
+    // GEO 引用校验：类别写错的规则永远不会命中，而「不命中」与
+    // 「没写这条规则」表现完全一致 —— 不在这里说出来就永远无人察觉。
+    // 告警不阻断判决（设计文档 §12），照常往下走。
+    let warnings = set.check_geo(&geo);
+    if !warnings.is_empty() {
+        println!("GEO 告警：{} 条", warnings.len());
+        for w in &warnings {
+            println!("  警告：{w}");
+        }
+    }
+
     match set.evaluate(&target, None, &geo) {
         Verdict::Decided(d) => println!("判决：{d:?}（第一轮，未解析 DNS）"),
         Verdict::NeedResolve { domain } => {

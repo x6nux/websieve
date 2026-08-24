@@ -55,6 +55,26 @@ impl RuleKind {
     }
 }
 
+/// 用户在配置里写的那个词，原样还回去。
+///
+/// 告警文案要用它，而 `{kind:?}` 给的是 Rust 的驼峰变体名（`GeoSite`）——
+/// 用户配置里写的是 `GEOSITE`，让他拿着一个文件里搜不到的词去找那一行，
+/// 是在给诊断信息故意打折。
+impl std::fmt::Display for RuleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RuleKind::Domain => "DOMAIN",
+            RuleKind::DomainSuffix => "DOMAIN-SUFFIX",
+            RuleKind::DomainKeyword => "DOMAIN-KEYWORD",
+            RuleKind::GeoSite => "GEOSITE",
+            RuleKind::IpCidr => "IP-CIDR",
+            RuleKind::GeoIp => "GEOIP",
+            RuleKind::DstPort => "DST-PORT",
+            RuleKind::Match => "MATCH",
+        })
+    }
+}
+
 /// 规则命中后的目标出站。
 ///
 /// 出站名保持用户原样（大小写与内部空格均不修改），因为出站名是

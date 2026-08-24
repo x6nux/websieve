@@ -86,6 +86,12 @@ impl GeoDb {
     }
 
     pub fn ip_matches(&self, code: &str, addr: IpAddr) -> Result<bool, GeoError> {
+        let db = self.ensure_ip_loaded()?;
+        Ok(db.matches(code, addr))
+    }
+
+    /// 触发 geoip 的惰性加载并借出解析结果。与 ensure_site_loaded 同构。
+    fn ensure_ip_loaded(&self) -> Result<&IpDb, GeoError> {
         let db = self.ip.get_or_init(|| {
             std::fs::read(&self.ip_path)
                 .map_err(|e| (FailKind::Read, e.to_string()))
@@ -93,10 +99,7 @@ impl GeoDb {
                     IpDb::parse(&buf).map_err(|e| (FailKind::Parse, e.to_string()))
                 })
         });
-        match db {
-            Ok(db) => Ok(db.matches(code, addr)),
-            Err(fail) => Err(Self::to_error(&self.ip_path, fail)),
-        }
+        db.as_ref().map_err(|fail| Self::to_error(&self.ip_path, fail))
     }
 
     pub fn site_matches(&self, code: &str, domain: &str) -> Result<bool, GeoError> {
@@ -126,14 +129,11 @@ impl GeoDb {
         Ok(self.ensure_site_loaded()?.has(code))
     }
 
+    /// geoip 侧的同款校验。同样不再靠 ip_matches(code, 0.0.0.0) 这种
+    /// 哨兵地址来强制加载 —— 那既白跑一次二分查找，又要在之后
+    /// 重新从 OnceLock 里把库捞出来，读起来像是在绕开自己的 API。
     pub fn has_ip_class(&self, code: &str) -> Result<bool, GeoError> {
-        self.ip_matches(code, IpAddr::from([0, 0, 0, 0]))?;
-        Ok(self
-            .ip
-            .get()
-            .and_then(|r| r.as_ref().ok())
-            .map(|db| db.has(code))
-            .unwrap_or(false))
+        Ok(self.ensure_ip_loaded()?.has(code))
     }
 
     /// 惰性加载的测试探针：geosite 是否已经被加载过。
