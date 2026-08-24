@@ -50,8 +50,22 @@ pub enum ServeMode {
     Tls(TlsAcceptor),
 }
 
+/// 选定进程级 crypto provider。
+///
+/// rustls 0.23 在编译进多个 provider 时拒绝自动选择，构建 ServerConfig 时
+/// 直接 panic。本 workspace 显式启用了 ring，但 tokio-rustls 会顺带带进
+/// aws-lc-rs，于是两个都在 ⇒ 必须显式装一个。少了这一步，`direct` 与
+/// `cdn-full-self-signed` 两种部署一启动就崩，而 CI/E2E 全用 `cdn-flexible`
+/// （明文）跑，永远碰不到这条路径。
+///
+/// 重复调用返回 Err（已装过），忽略即可——多个测试并发进来是正常的。
+fn ensure_crypto_provider() {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+}
+
 /// 读取 PEM 证书 + 私钥 → rustls ServerConfig（TLS 1.3 only + early data）。
 fn rustls_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerConfig> {
+    ensure_crypto_provider();
     let mut cfg = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -150,4 +164,52 @@ pub async fn serve(
         }
     }
     Ok(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 两种 TLS 部署模式必须能真正构建出 acceptor。
+    ///
+    /// 回归守卫：rustls 0.23 的 crypto provider 歧义会让这里 panic，而全部
+    /// E2E/集成测试都跑 `cdn-flexible`（明文），这条路径此前零覆盖——服务端
+    /// 带证书启动即崩，直到线上才发现。
+    #[tokio::test]
+    async fn tls_modes_build_acceptor() {
+        assert!(matches!(
+            build(&Deployment::CdnFullSelfSigned).await.unwrap(),
+            ServeMode::Tls(_)
+        ));
+
+        // direct 模式读的是 PEM 文件，所以这里必须落地真的 PEM（rcgen 直接给）。
+        let ka = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&ka)
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("wsieve-tls-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, ka.serialize_pem()).unwrap();
+
+        let mode = build(&Deployment::Direct {
+            cert_path: cert_path.to_string_lossy().into_owned(),
+            key_path: key_path.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap();
+        assert!(matches!(mode, ServeMode::Tls(_)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cdn_flexible_is_plain() {
+        assert!(matches!(
+            build(&Deployment::CdnFlexible).await.unwrap(),
+            ServeMode::Plain
+        ));
+    }
 }
