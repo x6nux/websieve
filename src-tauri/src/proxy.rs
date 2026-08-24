@@ -98,11 +98,9 @@ pub async fn run(app: tauri::AppHandle, cfg: ProxyCfg) -> anyhow::Result<()> {
     let session_dead = Arc::new(Notify::new());
 
     // SOCKS5 服务任务
-    tokio::spawn({
-        let mux_slot = dialer_slot.clone();
-        async move {
-            let _ = wsieve_socks5::serve(listener, socks_handler(dialer_slot.clone())).await;
-        }
+    let serve_slot = dialer_slot.clone();
+    tokio::spawn(async move {
+        let _ = wsieve_socks5::serve(listener, socks_handler(serve_slot)).await;
     });
 
     let mut backoff = Duration::from_millis(100);
