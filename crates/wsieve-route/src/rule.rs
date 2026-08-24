@@ -212,8 +212,6 @@ impl Rule {
     }
 
     /// IP 类规则是否匹配给定地址（供引擎调用）。
-    // Task 10 的 evaluate() 会调用此方法，届时移除此 allow。
-    #[allow(dead_code)]
     pub(crate) fn matches_ip(&self, ip: IpAddr) -> bool {
         match &self.value {
             RuleValue::Cidr(net) => net.contains(&ip),

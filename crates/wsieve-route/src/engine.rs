@@ -1,8 +1,12 @@
 //! 两阶段判决引擎（设计文档 §4.2 纪律① / §6.2）。
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 
-use crate::rule::{Mode, Rule, RuleError, RuleKind, Target};
+use wsieve_geo::GeoDb;
+use wsieve_proto::addr::{AddrPort, TargetAddr};
+
+use crate::rule::{Mode, Rule, RuleError, RuleKind, RuleValue, Target};
 
 /// 当前连接的判决结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +144,123 @@ impl RuleSet {
     pub fn global_target(&self) -> &Decision {
         &self.global
     }
+
+    /// 两阶段求值。协议见设计文档 §4.2 纪律①。
+    ///
+    /// - 第一轮传 `resolved: None`。多数流量在域名类规则处命中，**不触发解析**
+    /// - 返回 `NeedResolve` 时，调用方解析后传 `Some(&ips)` 再调一轮；
+    ///   解析失败或超时传 `Some(&[])`
+    /// - 第二轮**永不**再返回 `NeedResolve`
+    ///
+    /// 第二轮从头重扫而非断点续扫：规则只有几十条，开销可忽略，
+    /// 换来的是函数完全幂等、无需维护游标状态。若断点续扫，`resolved`
+    /// 只对触发点之后的规则可见，同一域名在更靠前的另一条 IP 规则上
+    /// 会得到不同判决，幂等性直接破。
+    pub fn evaluate(
+        &self,
+        target: &AddrPort,
+        resolved: Option<&[IpAddr]>,
+        geo: &GeoDb,
+    ) -> Verdict {
+        // mode 短路
+        match self.mode {
+            Mode::Direct => return Verdict::Decided(Decision::Direct),
+            Mode::Global => return Verdict::Decided(self.global.clone()),
+            Mode::Rule => {}
+        }
+
+        // 目标地址的两种形态，预先取出，避免每条规则重复 match
+        let (domain, target_ip) = match &target.addr {
+            TargetAddr::Domain(d) => (Some(d.trim_end_matches('.').to_ascii_lowercase()), None),
+            TargetAddr::V4(o) => (None, Some(IpAddr::from(*o))),
+            TargetAddr::V6(a) => (None, Some(IpAddr::from(*a))),
+        };
+
+        for rule in &self.rules {
+            if rule.kind == RuleKind::Match {
+                return Verdict::Decided(Decision::from(&rule.target));
+            }
+
+            let hit = match rule.kind {
+                RuleKind::DstPort => matches!(&rule.value, RuleValue::Port(p) if *p == target.port),
+
+                // ── 域名类：目标是 IP 就跳过 ──
+                RuleKind::Domain
+                | RuleKind::DomainSuffix
+                | RuleKind::DomainKeyword
+                | RuleKind::GeoSite => {
+                    let Some(d) = domain.as_deref() else { continue };
+                    let RuleValue::Text(v) = &rule.value else {
+                        continue;
+                    };
+                    match rule.kind {
+                        RuleKind::Domain => d == v,
+                        RuleKind::DomainSuffix => suffix_matches(d, v),
+                        RuleKind::DomainKeyword => d.contains(v.as_str()),
+                        // GEO 不可用时视为不匹配，绝不阻断连接（设计文档 §12）
+                        RuleKind::GeoSite => geo.site_matches(v, d).unwrap_or(false),
+                        _ => unreachable!(),
+                    }
+                }
+
+                // ── IP 类：目标是域名则需要解析 ──
+                RuleKind::IpCidr | RuleKind::GeoIp => {
+                    let ips: &[IpAddr] = if let Some(ip) = &target_ip {
+                        std::slice::from_ref(ip)
+                    } else {
+                        // 目标是域名
+                        if rule.no_resolve {
+                            continue;
+                        }
+                        match resolved {
+                            None => {
+                                // 第一轮：把解析需求抛给调用方
+                                return Verdict::NeedResolve {
+                                    domain: domain.clone().unwrap_or_default(),
+                                };
+                            }
+                            // 第二轮：空切片即不匹配，继续往下
+                            Some(ips) => ips,
+                        }
+                    };
+
+                    match rule.kind {
+                        RuleKind::IpCidr => ips.iter().any(|ip| rule.matches_ip(*ip)),
+                        RuleKind::GeoIp => {
+                            let RuleValue::Text(code) = &rule.value else {
+                                continue;
+                            };
+                            ips.iter()
+                                .any(|ip| geo.ip_matches(code, *ip).unwrap_or(false))
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                RuleKind::Match => unreachable!("已在循环开头处理"),
+            };
+
+            if hit {
+                return Verdict::Decided(Decision::from(&rule.target));
+            }
+        }
+
+        // build() 已保证 MATCH 存在，正常走不到这里；保底仍用 fallback
+        Verdict::Decided(self.fallback.clone())
+    }
+}
+
+/// 后缀匹配，边界必须落在标签分隔点上。
+/// `example.com` 匹配 `example.com` 与 `a.example.com`，但不匹配 `notexample.com`。
+fn suffix_matches(domain: &str, suffix: &str) -> bool {
+    if domain == suffix {
+        return true;
+    }
+    domain
+        .len()
+        .checked_sub(suffix.len())
+        .filter(|&i| i > 0)
+        .is_some_and(|i| domain.as_bytes()[i - 1] == b'.' && &domain[i..] == suffix)
 }
 
 #[cfg(test)]
