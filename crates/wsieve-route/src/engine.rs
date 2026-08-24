@@ -181,63 +181,77 @@ impl RuleSet {
                 return Verdict::Decided(Decision::from(&rule.target));
             }
 
+            // 每个 kind 独占一个 arm，穷举性由编译器静态保证，无需 unreachable!()
             let hit = match rule.kind {
                 RuleKind::DstPort => matches!(&rule.value, RuleValue::Port(p) if *p == target.port),
 
                 // ── 域名类：目标是 IP 就跳过 ──
-                RuleKind::Domain
-                | RuleKind::DomainSuffix
-                | RuleKind::DomainKeyword
-                | RuleKind::GeoSite => {
+                RuleKind::Domain => {
                     let Some(d) = domain.as_deref() else { continue };
-                    let RuleValue::Text(v) = &rule.value else {
-                        continue;
-                    };
-                    match rule.kind {
-                        RuleKind::Domain => d == v,
-                        RuleKind::DomainSuffix => suffix_matches(d, v),
-                        RuleKind::DomainKeyword => d.contains(v.as_str()),
-                        // GEO 不可用时视为不匹配，绝不阻断连接（设计文档 §12）
-                        RuleKind::GeoSite => geo.site_matches(v, d).unwrap_or(false),
-                        _ => unreachable!(),
-                    }
+                    let RuleValue::Text(v) = &rule.value else { continue };
+                    d == v
+                }
+                RuleKind::DomainSuffix => {
+                    let Some(d) = domain.as_deref() else { continue };
+                    let RuleValue::Text(v) = &rule.value else { continue };
+                    suffix_matches(d, v)
+                }
+                RuleKind::DomainKeyword => {
+                    let Some(d) = domain.as_deref() else { continue };
+                    let RuleValue::Text(v) = &rule.value else { continue };
+                    d.contains(v.as_str())
+                }
+                // GEO 不可用时视为不匹配，绝不阻断连接（设计文档 §12）
+                RuleKind::GeoSite => {
+                    let Some(d) = domain.as_deref() else { continue };
+                    let RuleValue::Text(v) = &rule.value else { continue };
+                    geo.site_matches(v, d).unwrap_or(false)
                 }
 
                 // ── IP 类：目标是域名则需要解析 ──
-                RuleKind::IpCidr | RuleKind::GeoIp => {
+                RuleKind::IpCidr => {
                     let ips: &[IpAddr] = if let Some(ip) = &target_ip {
                         std::slice::from_ref(ip)
                     } else {
-                        // 目标是域名
                         if rule.no_resolve {
                             continue;
                         }
                         match resolved {
                             None => {
-                                // 第一轮：把解析需求抛给调用方
                                 return Verdict::NeedResolve {
                                     domain: domain.clone().unwrap_or_default(),
                                 };
                             }
-                            // 第二轮：空切片即不匹配，继续往下
                             Some(ips) => ips,
                         }
                     };
-
-                    match rule.kind {
-                        RuleKind::IpCidr => ips.iter().any(|ip| rule.matches_ip(*ip)),
-                        RuleKind::GeoIp => {
-                            let RuleValue::Text(code) = &rule.value else {
-                                continue;
-                            };
-                            ips.iter()
-                                .any(|ip| geo.ip_matches(code, *ip).unwrap_or(false))
+                    ips.iter().any(|ip| rule.matches_ip(*ip))
+                }
+                RuleKind::GeoIp => {
+                    let ips: &[IpAddr] = if let Some(ip) = &target_ip {
+                        std::slice::from_ref(ip)
+                    } else {
+                        if rule.no_resolve {
+                            continue;
                         }
-                        _ => unreachable!(),
-                    }
+                        match resolved {
+                            None => {
+                                return Verdict::NeedResolve {
+                                    domain: domain.clone().unwrap_or_default(),
+                                };
+                            }
+                            Some(ips) => ips,
+                        }
+                    };
+                    let RuleValue::Text(code) = &rule.value else { continue };
+                    ips.iter().any(|ip| geo.ip_matches(code, *ip).unwrap_or(false))
                 }
 
-                RuleKind::Match => unreachable!("已在循环开头处理"),
+                RuleKind::Match => {
+                    // 循环开头已提前 return，此处永远不到；
+                    // 但写出来比 unreachable!() 更能让读者明白控制流。
+                    continue;
+                }
             };
 
             if hit {

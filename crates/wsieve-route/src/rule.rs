@@ -46,16 +46,12 @@ pub enum RuleKind {
 
 impl RuleKind {
     /// 是否属于域名类规则（无需 IP 就能判定）。
-    pub fn is_domain_kind(self) -> bool {
+    /// 供解析器用于校验 no-resolve 不被误加到非 IP 规则上。
+    fn is_domain_kind(self) -> bool {
         matches!(
             self,
             RuleKind::Domain | RuleKind::DomainSuffix | RuleKind::DomainKeyword | RuleKind::GeoSite
         )
-    }
-
-    /// 是否属于 IP 类规则（域名目标需要先 DNS 解析）。
-    pub fn is_ip_kind(self) -> bool {
-        matches!(self, RuleKind::IpCidr | RuleKind::GeoIp)
     }
 }
 
@@ -112,6 +108,15 @@ pub enum RuleError {
     BadPort(String),
     #[error("未知的第四段参数：{0}（只支持 no-resolve）")]
     UnknownFlag(String),
+    /// I1：域名类和 GEO 类规则的匹配值不能为空
+    #[error("{0} 规则的匹配值不能为空——空字符串会匹配所有请求，请填写具体的域名或分类名")]
+    EmptyValue(String),
+    /// I3：出站名不能为空
+    #[error("出站名不能为空——请填写出站节点的名称，例如：MATCH,DIRECT 或 MATCH,我的节点")]
+    EmptyTarget,
+    /// N2：no-resolve 只对 IP 类规则（IP-CIDR、GEOIP）有效
+    #[error("{0} 是域名类规则，no-resolve 对它无效——该标志只用于 IP-CIDR 和 GEOIP 规则，请删除 no-resolve")]
+    NoResolveOnDomainRule(String),
 }
 
 impl Rule {
@@ -173,16 +178,35 @@ impl Rule {
                 RuleValue::Cidr(net)
             }
             RuleKind::DstPort => {
-                // u16::parse 会拒绝 0 以外的非法值；70000 超出 u16 范围同样被拒
+                // I2：u16::parse 放过了 0，但端口 0 永远不会匹配真实连接，
+                //     而且本模块自己的错误提示就写着「合法范围 1-65535」，
+                //     必须手动拦截，否则代码与文档自相矛盾。
                 let port = value_str
                     .parse::<u16>()
                     .map_err(|_| RuleError::BadPort(value_str.to_string()))?;
+                if port == 0 {
+                    return Err(RuleError::BadPort(value_str.to_string()));
+                }
                 RuleValue::Port(port)
             }
             RuleKind::Match => RuleValue::None,
-            // 域名与 GEO 类别：统一规范化（小写 + 去尾点），匹配时不必再处理
-            _ => RuleValue::Text(value_str.trim_end_matches('.').to_ascii_lowercase()),
+            // I1：域名与 GEO 类别：规范化前先拒空值——
+            //     空字符串经 contains("") 会命中所有请求，等同于通配符，
+            //     用户通常并不知道自己写了一条「匹配所有」的规则。
+            _ => {
+                if value_str.is_empty() {
+                    return Err(RuleError::EmptyValue(format!("{kind:?}")));
+                }
+                RuleValue::Text(value_str.trim_end_matches('.').to_ascii_lowercase())
+            }
         };
+
+        // I3：出站名不能为空——空名会通过 known_outbounds 查找时给出
+        //     「引用了不存在的出站：」（名字那里什么都没有）的误导性错误，
+        //     在解析期就拦掉能给出更清晰的信息。
+        if target_str.is_empty() {
+            return Err(RuleError::EmptyTarget);
+        }
 
         // 目标出站解析：DIRECT / REJECT 大小写不敏感；其余保持原样
         let target = match target_str.to_ascii_uppercase().as_str() {
@@ -201,6 +225,12 @@ impl Rule {
                 "" => {}
                 other => return Err(RuleError::UnknownFlag(other.to_string())),
             }
+        }
+
+        // N2：no-resolve 只对 IP 类规则有意义，§96 的注释已说明这一点。
+        //     在域名类规则上静默接受会让用户以为打开了某个开关，实则什么都没发生。
+        if no_resolve && kind.is_domain_kind() {
+            return Err(RuleError::NoResolveOnDomainRule(format!("{kind:?}")));
         }
 
         Ok(Rule {
@@ -311,5 +341,65 @@ mod tests {
         assert!(Rule::parse_line("# 这是注释").unwrap().is_none());
         assert!(Rule::parse_line("   ").unwrap().is_none());
         assert!(Rule::parse_line("DOMAIN,a.com,PROXY").unwrap().is_some());
+    }
+
+    // ── I1：空值被拒绝 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_value_is_rejected_for_domain_rules() {
+        // 空 value 在 contains("") 时会命中所有请求，必须在解析期截断
+        let e = Rule::parse("DOMAIN-KEYWORD,,REJECT").unwrap_err().to_string();
+        assert!(e.contains("空"), "错误信息应说明值为空：{e}");
+        assert!(Rule::parse("DOMAIN,,DIRECT").is_err(), "DOMAIN 空值");
+        assert!(Rule::parse("DOMAIN-SUFFIX,,DIRECT").is_err(), "DOMAIN-SUFFIX 空值");
+        assert!(Rule::parse("GEOSITE,,DIRECT").is_err(), "GEOSITE 空值");
+        assert!(Rule::parse("GEOIP,,DIRECT").is_err(), "GEOIP 空值");
+    }
+
+    // ── I2：端口 0 被拒绝 ─────────────────────────────────────────────────
+
+    #[test]
+    fn port_zero_is_rejected() {
+        // 端口 0 永不匹配真实连接，错误文案已声明合法范围为 1-65535
+        let e = Rule::parse("DST-PORT,0,DIRECT").unwrap_err().to_string();
+        assert!(e.contains("非法端口") || e.contains("0"), "错误信息要点名端口 0：{e}");
+        // 65535 依然合法
+        assert!(Rule::parse("DST-PORT,65535,DIRECT").is_ok());
+        // 1 依然合法
+        assert!(Rule::parse("DST-PORT,1,DIRECT").is_ok());
+    }
+
+    // ── I3：空出站名被拒绝 ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_target_is_rejected() {
+        // MATCH, 和 MATCH,   （纯空白）都应在解析期就报错
+        let e = Rule::parse("MATCH,").unwrap_err().to_string();
+        assert!(e.contains("出站名") || e.contains("不能为空"), "错误信息应说明出站名为空：{e}");
+
+        let e2 = Rule::parse("MATCH,   ").unwrap_err().to_string();
+        assert!(e2.contains("出站名") || e2.contains("不能为空"), "纯空白出站名应被拒绝：{e2}");
+
+        // 非 MATCH 规则的空 target 同样应被拒绝
+        assert!(Rule::parse("DOMAIN,a.com,").is_err(), "空 target 在 DOMAIN 规则上");
+    }
+
+    // ── N2：域名类规则上的 no-resolve 被拒绝 ───────────────────────────────
+
+    #[test]
+    fn no_resolve_is_rejected_on_domain_rules() {
+        // no-resolve 只对 IP-CIDR / GEOIP 有意义，加在域名类规则上是无声 no-op
+        let e = Rule::parse("DOMAIN,a.com,DIRECT,no-resolve").unwrap_err().to_string();
+        assert!(
+            e.contains("no-resolve") || e.contains("域名类"),
+            "错误信息应指出 no-resolve 用错了位置：{e}"
+        );
+        assert!(Rule::parse("DOMAIN-SUFFIX,a.com,DIRECT,no-resolve").is_err());
+        assert!(Rule::parse("DOMAIN-KEYWORD,google,DIRECT,no-resolve").is_err());
+        assert!(Rule::parse("GEOSITE,cn,DIRECT,no-resolve").is_err());
+
+        // IP 类规则上的 no-resolve 仍合法
+        assert!(Rule::parse("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve").is_ok());
+        assert!(Rule::parse("GEOIP,CN,DIRECT,no-resolve").is_ok());
     }
 }
