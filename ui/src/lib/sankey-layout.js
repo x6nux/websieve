@@ -16,6 +16,7 @@
  * 决定，措辞统一走 `weight.js`。本模块刻意不出现「字节」二字。
  */
 import { sankey, sankeyLinkHorizontal } from 'd3-sankey';
+import { rowWeight } from './weight.js';
 
 export const NODE_W = 12;
 export const NODE_PAD = 10;
@@ -37,19 +38,10 @@ export function gradientId(name) {
 }
 
 /**
- * 一行画图用的量。
- *
- * 优先 `weight`（flows.js / aggregate.js 的契约），没有才退回 `bytes`。
- * 这不是防御性写法：当前后端不上报逐流字节，`bytes` 恒为 0，按它画图
- * 会得到一张永远空着的图 —— 而数据其实是有的，只是量是连接数。
- * 阶段 2 补上字节后 `weight` 自动变成字节数，这里一个字都不用改。
- */
-function weightOf(r) {
-  return typeof r.weight === 'number' ? r.weight : (r.bytes ?? 0);
-}
-
-/**
  * 流水行 → 三层图。返回 null 表示数据不足以画图（调用方走空状态）。
+ *
+ * 画图的量取自 `rowWeight`（见 weight.js）：当前后端不上报逐流字节，
+ * `bytes` 恒为 0，按它画图会得到一张永远空着的图。
  *
  * 流带必须按 (source,target) 聚合：同一条规则会被多个站点命中，
  * 因此 rule→outbound 这条边在原始行里重复出现。不聚合的话
@@ -77,7 +69,7 @@ export function toGraph(rows) {
 
   for (const r of rows) {
     // 零权重的流带会让 d3 的 ky 缩放系数变成 Infinity，全图 NaN
-    const w = weightOf(r);
+    const w = rowWeight(r);
     if (!(w > 0)) continue;
     const s = `s:${r.site}`;
     const u = `r:${r.rule}`;

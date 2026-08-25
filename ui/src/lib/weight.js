@@ -25,6 +25,26 @@ export { WEIGHT_BYTES, WEIGHT_CONNS };
 export const UNIT_CONFLICT_MSG =
   '流量数据的计量单位不一致：一部分按字节、一部分按连接数。两种量混在同一张图里没有意义，因此这里不作绘制。这属于数据来源冲突，请检查事件源。';
 
+/**
+ * 一行画图/排序用的量。
+ *
+ * 优先 `weight`（flows.js / aggregate.js 的契约），没有才退回 `bytes`。
+ * 这不是防御性写法：当前后端不上报逐流字节，`bytes` 恒为 0，按它画图
+ * 会得到一张永远空着的图 —— 而数据其实是有的，只是量是连接数。
+ * 阶段 2 补上字节后 `weight` 自动变成字节数，调用方一个字都不用改。
+ *
+ * 定义只此一处：粗细取哪个字段与「粗细代表什么」是同一个决定，
+ * 分成两处迟早会漂移成「按 A 排名、按 B 画图」。
+ */
+export function rowWeight(r) {
+  return typeof r?.weight === 'number' ? r.weight : (r?.bytes ?? 0);
+}
+
+/** 一批行的权重合计。 */
+export function totalWeight(rows) {
+  return (rows ?? []).reduce((s, r) => s + rowWeight(r), 0);
+}
+
 /** 量的名词。单位未知时返回 null —— 没有词可用，调用方只能走冲突分支。 */
 export function unitNoun(unit) {
   if (unit === WEIGHT_BYTES) return '字节';
