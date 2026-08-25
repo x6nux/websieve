@@ -49,7 +49,12 @@ const ID_QUIT: &str = "quit";
 /// 同一份事实：漏掉一个分支的话，用户点了菜单只会看到一条 warn 日志，
 /// 而那种 bug 在肉眼验收里极容易滑过去（三项长得一模一样）。
 /// 守它的是 `every_menu_item_has_a_handler`。
-const MODES: [(&str, &str); 3] = [
+///
+/// `pub(crate)`：`commands::control` 的
+/// `the_tray_and_the_command_agree_on_the_mode_names` 拿它当裁判，确保托盘
+/// 与命令面这两个入口对「有哪几个模式」不会分叉。让测试读真身而不是另抄
+/// 一份，才谈得上是交叉校验。
+pub(crate) const MODES: [(&str, &str); 3] = [
     (ID_MODE_RULE, "rule"),
     (ID_MODE_GLOBAL, "global"),
     (ID_MODE_DIRECT, "direct"),

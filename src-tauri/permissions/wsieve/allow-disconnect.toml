@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-disconnect"
+description = "允许控制窗口请求断开全部出站连接"
+commands.allow = ["disconnect"]

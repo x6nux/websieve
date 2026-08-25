@@ -18,6 +18,8 @@
 //! 冲突。留一个编译不过的提交，等于给二分查找埋一个假阳性。
 
 pub mod config;
+pub mod control;
+pub mod probe;
 
 /// 命令的统一错误类型。
 ///
@@ -57,10 +59,6 @@ pub enum CmdError {
     Other { message: String },
 }
 
-/// `allow(dead_code)`：`other` / `not_ready` 的构造方在 Task 12 的控制与
-/// 探针命令里。**Task 12 收尾时这个 allow 要删掉** —— 留着它等于给整个
-/// 构造面永久免检，将来某个构造函数真的没人用了就不再有人知道。
-#[allow(dead_code)]
 impl CmdError {
     pub fn io(e: impl std::fmt::Display) -> Self {
         Self::Io {

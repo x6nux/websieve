@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-outbound-latency-probe"
+description = "允许控制窗口对单个出站做一次延迟探测"
+commands.allow = ["outbound_latency_probe"]

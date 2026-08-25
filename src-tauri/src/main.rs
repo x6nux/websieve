@@ -334,6 +334,17 @@ fn main() {
             commands::config::config_get_raw,
             commands::config::config_save,
             commands::config::config_save_raw,
+            commands::control::connect,
+            commands::control::disconnect,
+            commands::control::set_mode,
+            commands::control::outbound_enable,
+            commands::control::control_hide,
+            commands::control::app_quit,
+            commands::probe::rule_test,
+            commands::probe::outbound_latency_probe,
+            commands::probe::geo_update,
+            commands::probe::geo_status,
+            commands::probe::traffic_snapshot,
         ])
         .build(tauri::generate_context!())
         .expect("tauri build")

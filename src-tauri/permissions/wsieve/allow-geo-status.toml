@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-geo-status"
+description = "允许控制窗口查询 GEO 数据文件是否就位（只读）"
+commands.allow = ["geo_status"]

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-control-hide"
+description = "允许控制窗口把自己隐藏到托盘（代理继续运行）"
+commands.allow = ["control_hide"]
