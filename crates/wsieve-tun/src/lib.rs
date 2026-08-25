@@ -17,5 +17,6 @@
 //! 后续 task 各自补一行声明即可。
 
 pub mod bypass;
+pub mod dns_server;
 pub mod fakedns;
 pub mod fakeip;
