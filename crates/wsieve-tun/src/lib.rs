@@ -16,4 +16,5 @@
 //! 是本仓库的既有底线（workspace 门禁是 `cargo test --workspace`）。
 //! 后续 task 各自补一行声明即可。
 
+pub mod bypass;
 pub mod fakeip;
