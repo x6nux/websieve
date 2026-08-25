@@ -60,6 +60,43 @@ impl std::fmt::Debug for DnsResolver {
     }
 }
 
+/// 判决路径的解析器选项。**独立成函数是为了可被测试直接检查**——
+/// 其中 `use_hosts_file = Never` 一条若被误删，行为退化是完全静默的
+/// （判决把出站域名看成 127.0.0.1，命中内网直连规则），因此必须有测试
+/// 盯着它，而不是只靠一行注释。见 `tests::routing_opts_never_reads_hosts`。
+pub(crate) fn routing_opts(
+    timeout: Duration,
+    cache_max: u64,
+    negative_ttl: Duration,
+) -> ResolverOpts {
+    let mut opts = ResolverOpts::default();
+    // 这个 timeout 只约束「池内单轮」，不等于端到端墙钟上限——真正的
+    // 硬超时在 lookup_for_routing 里用 tokio::time::timeout 施加。
+    // 这里仍然设小，是为了让池尽早放弃一台坏上游去试下一台。
+    opts.timeout = timeout;
+    // 判决路径上不做重试：重试的时间预算还不如直接让 IP 规则不匹配，
+    // 流程继续往下（纪律③）。attempts 默认为 2，必须显式压到 1。
+    opts.attempts = 1;
+    opts.cache_size = cache_max;
+    // 负缓存下限：服务端给的 NXDOMAIN TTL 可能是 0，那样等于没有负缓存，
+    // 不存在的域名会被反复查询（设计文档 §7.3）。
+    opts.negative_min_ttl = Some(negative_ttl);
+    // 判决只关心「这批 IP 落在哪个网段」，中间的 CNAME 记录一概不需要，
+    // 留着只会占缓存容量。
+    opts.preserve_intermediates = false;
+    // 关键：**绝不读系统 hosts 文件**。shard.rs 会把出站服务器域名写成
+    // `127.0.0.1 <域名> # wsieve-managed`；若解析器读了它，路由判决会
+    // 认为该域名是环回地址，从而命中内网直连规则。判决必须看到真实 IP。
+    //
+    // 默认值是 `Auto`，**会读** —— 这一点与直觉相反，实测（用 hosts 里
+    // 一条真实劫持行 `81.69.97.154 api.deepseek.com`，上游为可用 DoH）：
+    //   Always → [81.69.97.154]   hosts 里的劫持值
+    //   Auto   → [81.69.97.154]   默认值，同样被劫持
+    //   Never  → [3.173.21.63]    真实 IP
+    opts.use_hosts_file = ResolveHosts::Never;
+    opts
+}
+
 impl DnsResolver {
     /// 用配置里的 `dns.nameserver` 建立解析器。
     ///
@@ -80,32 +117,11 @@ impl DnsResolver {
             servers.push(parse_nameserver(spec)?);
         }
 
-        let mut opts = ResolverOpts::default();
-        // 这个 timeout 只约束「池内单轮」，不等于端到端墙钟上限——真正的
-        // 硬超时在 lookup_for_routing 里用 tokio::time::timeout 施加。
-        // 这里仍然设小，是为了让池尽早放弃一台坏上游去试下一台。
-        opts.timeout = timeout;
-        // 判决路径上不做重试：重试的时间预算还不如直接让 IP 规则不匹配，
-        // 流程继续往下（纪律③）。attempts 默认为 2，必须显式压到 1。
-        opts.attempts = 1;
-        opts.cache_size = cache_max;
-        // 负缓存下限：服务端给的 NXDOMAIN TTL 可能是 0，那样等于没有负缓存，
-        // 不存在的域名会被反复查询（设计文档 §7.3）。
-        opts.negative_min_ttl = Some(negative_ttl);
-        // 判决只关心「这批 IP 落在哪个网段」，中间的 CNAME 记录一概不需要，
-        // 留着只会占缓存容量。
-        opts.preserve_intermediates = false;
-        // 关键：**绝不读系统 hosts 文件**。shard.rs 会把出站服务器域名写成
-        // `127.0.0.1 <域名> # wsieve-managed`；若解析器读了它，路由判决会
-        // 认为该域名是环回地址，从而命中内网直连规则。判决必须看到真实 IP。
-        // 默认值是 Auto，**会读** —— 见 tests/resolver.rs 的 hosts 用例。
-        opts.use_hosts_file = ResolveHosts::Never;
-
         let inner = Resolver::builder_with_config(
             ResolverConfig::from_parts(None, vec![], servers),
             TokioRuntimeProvider::default(),
         )
-        .with_options(opts)
+        .with_options(routing_opts(timeout, cache_max, negative_ttl))
         .build()
         .map_err(|e| ResolverError::Build(e.to_string()))?;
 
@@ -174,6 +190,11 @@ pub fn bootstrap() -> Result<TokioResolver, ResolverError> {
         .map_err(|e| ResolverError::Build(e.to_string()))
 }
 
+/// `bootstrap_with` 的 hosts 开关。提成常量是为了让测试能直接盯住它 ——
+/// 与判决路径同理：出站域名正是被我们写进 hosts 的那一个，读它只会拿到
+/// `127.0.0.1`，转发器于是连向自己。
+const BOOTSTRAP_EXPLICIT_HOSTS: ResolveHosts = ResolveHosts::Never;
+
 /// 用显式上游建立 bootstrap 解析器，供 `proxy-server-nameserver` 写了具体
 /// 地址（而非 `system`）时使用。
 ///
@@ -191,7 +212,7 @@ pub fn bootstrap_with(nameservers: &[String]) -> Result<TokioResolver, ResolverE
     let mut opts = ResolverOpts::default();
     // 显式上游意味着用户绕开了系统配置，此时 hosts 也一并绕开 —— 出站域名
     // 正是被我们写进 hosts 的那一个，读它只会拿到 127.0.0.1。
-    opts.use_hosts_file = ResolveHosts::Never;
+    opts.use_hosts_file = BOOTSTRAP_EXPLICIT_HOSTS;
     Resolver::builder_with_config(
         ResolverConfig::from_parts(None, vec![], servers),
         TokioRuntimeProvider::default(),
@@ -199,4 +220,69 @@ pub fn bootstrap_with(nameservers: &[String]) -> Result<TokioResolver, ResolverE
     .with_options(opts)
     .build()
     .map_err(|e| ResolverError::Build(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 发现②的回归测试：`use_hosts_file` 的**默认值会读系统 hosts**，
+    /// 而 `shard.rs` 正往里写 `127.0.0.1 <出站域名> # wsieve-managed`。
+    /// 若这一条被误删，判决会认为出站域名解析到环回地址，从而命中
+    /// 「内网直连」类规则 —— 判决与事实相反，且完全静默，没有任何报错。
+    ///
+    /// 这个测试的价值在于它**脱网、确定性**：不依赖本机 hosts 里有什么，
+    /// 直接检查我们是否真的把开关拨到了 Never。
+    #[test]
+    fn routing_opts_never_reads_hosts() {
+        let opts = routing_opts(Duration::from_secs(2), 4096, Duration::from_secs(30));
+        assert_eq!(
+            opts.use_hosts_file,
+            ResolveHosts::Never,
+            "判决解析器绝不能读系统 hosts —— 我们自己往里写了劫持行"
+        );
+    }
+
+    /// 顺带锁住：hickory 的默认值确实是「会读」。这一条是上面那条测试
+    /// 之所以必要的前提；若哪天 hickory 把默认值改成 Never，这里会红，
+    /// 提示我们上面那条防御可以重新评估（但不必急着删）。
+    #[test]
+    fn hickory_default_would_read_hosts_which_is_why_we_override_it() {
+        assert_eq!(
+            ResolverOpts::default().use_hosts_file,
+            ResolveHosts::Auto,
+            "hickory 默认值变了，发现②的前提需重新评估"
+        );
+    }
+
+    /// 纪律③在时间预算上的落点：判决路径不重试。
+    /// attempts 默认为 2，一次超时就会翻倍等待。
+    #[test]
+    fn routing_opts_does_not_retry() {
+        let opts = routing_opts(Duration::from_secs(2), 4096, Duration::from_secs(30));
+        assert_eq!(opts.attempts, 1, "判决路径重试即是在给连接加延迟");
+    }
+
+    /// 配置项 `dns.cache.{max,negative-ttl-s}` 确实接到了 hickory 内置缓存上。
+    /// 「不自建缓存」这个决定成立的前提就是这两个旋钮真的被接上了。
+    #[test]
+    fn cache_knobs_are_wired_to_the_builtin_cache() {
+        let opts = routing_opts(Duration::from_secs(2), 777, Duration::from_secs(45));
+        assert_eq!(opts.cache_size, 777);
+        assert_eq!(
+            opts.negative_min_ttl,
+            Some(Duration::from_secs(45)),
+            "负缓存下限没接上：服务端给的 NXDOMAIN TTL 可能是 0，等于没有负缓存"
+        );
+    }
+
+    /// bootstrap_with 走的是另一套取舍（不压 attempts、不设负缓存下限），
+    /// 但 hosts 这一条两边都必须是 Never —— 出站域名正是被写进 hosts 的那个。
+    #[test]
+    fn bootstrap_with_also_never_reads_hosts() {
+        // 通过公开 API 建一个真实实例，确认它能建起来；hosts 开关本身
+        // 由下面的断言盯着（bootstrap_with 内部与此处用的是同一常量）。
+        assert!(bootstrap_with(&["1.1.1.1".to_string()]).is_ok());
+        assert_eq!(BOOTSTRAP_EXPLICIT_HOSTS, ResolveHosts::Never);
+    }
 }
