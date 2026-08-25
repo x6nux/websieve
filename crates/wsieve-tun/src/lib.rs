@@ -20,3 +20,4 @@ pub mod bypass;
 pub mod dns_server;
 pub mod fakedns;
 pub mod fakeip;
+pub mod routes;
