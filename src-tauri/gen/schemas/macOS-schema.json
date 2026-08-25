@@ -183,10 +183,28 @@
           "markdownDescription": "emitter IPC: heartbeat + raw frame channels (app commands)\n#### This default permission set includes:\n\n- `allow-wsieve-heartbeat`\n- `allow-wsieve-raw-post`\n- `allow-wsieve-raw-stream`"
         },
         {
-          "description": "允许控制窗口读取结构化配置（含 client-priv，仅本地 origin）",
+          "description": "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。",
           "type": "string",
           "const": "allow-config-get",
-          "markdownDescription": "允许控制窗口读取结构化配置（含 client-priv，仅本地 origin）"
+          "markdownDescription": "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。"
+        },
+        {
+          "description": "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。",
+          "type": "string",
+          "const": "allow-config-get-raw",
+          "markdownDescription": "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。"
+        },
+        {
+          "description": "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）",
+          "type": "string",
+          "const": "allow-config-save",
+          "markdownDescription": "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）"
+        },
+        {
+          "description": "允许控制窗口整份覆写配置原文（逃生舱）。写入前会解析并校验，语法或语义不合法一律拒绝。",
+          "type": "string",
+          "const": "allow-config-save-raw",
+          "markdownDescription": "允许控制窗口整份覆写配置原文（逃生舱）。写入前会解析并校验，语法或语义不合法一律拒绝。"
         },
         {
           "description": "Allows the emitter heartbeat command",

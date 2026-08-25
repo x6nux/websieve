@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-config-save-raw"
+description = "允许控制窗口整份覆写配置原文（逃生舱）。写入前会解析并校验，语法或语义不合法一律拒绝。"
+commands.allow = ["config_save_raw"]

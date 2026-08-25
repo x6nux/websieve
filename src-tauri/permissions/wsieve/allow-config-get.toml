@@ -1,4 +1,4 @@
 [[permission]]
 identifier = "allow-config-get"
-description = "允许控制窗口读取结构化配置（含 client-priv，仅本地 origin）"
+description = "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。"
 commands.allow = ["config_get"]

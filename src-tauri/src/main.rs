@@ -284,6 +284,13 @@ fn main() {
             wsieve_heartbeat,
             wsieve_raw_post,
             wsieve_raw_stream,
+            // ── 以下只授权给 control 窗口（capabilities/control.json）──
+            // 往 transport.json 里加它们中的任何一个，都等于把配置读写权
+            // 交给那台随时可能被攻破的服务器。守它的是 tests/capability_isolation.rs。
+            commands::config::config_get,
+            commands::config::config_get_raw,
+            commands::config::config_save,
+            commands::config::config_save_raw,
         ])
         .build(tauri::generate_context!())
         .expect("tauri build")

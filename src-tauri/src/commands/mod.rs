@@ -17,17 +17,14 @@
 //! 但那与本仓库既定的「每一步都可构建、可测试」纪律（计划 Task 3 Step 5）
 //! 冲突。留一个编译不过的提交，等于给二分查找埋一个假阳性。
 
+pub mod config;
+
 /// 命令的统一错误类型。
 ///
 /// 为什么不直接返回 String：Tauri 要求命令的错误类型实现 Serialize，
 /// String 能满足但会把「什么原因失败」压成一句话，UI 无法分类处理
 /// （譬如 §12 要求 YAML 语法错时把光标定到出错处 —— 那需要结构化的
 /// line / column 字段，而不是让前端去正则刮一句中文）。
-///
-/// `allow(dead_code)`：本 task 只落地骨架，构造这些变体的命令在随后的
-/// Task 11 / 12 补上。**这个 allow 到 Task 12 收尾时会被删掉** —— 留着它
-/// 等于给整个错误类型永久免检，将来某个变体真的没人构造时就不再有人知道。
-#[allow(dead_code)]
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CmdError {
@@ -60,6 +57,9 @@ pub enum CmdError {
     Other { message: String },
 }
 
+/// `allow(dead_code)`：`other` / `not_ready` 的构造方在 Task 12 的控制与
+/// 探针命令里。**Task 12 收尾时这个 allow 要删掉** —— 留着它等于给整个
+/// 构造面永久免检，将来某个构造函数真的没人用了就不再有人知道。
 #[allow(dead_code)]
 impl CmdError {
     pub fn io(e: impl std::fmt::Display) -> Self {
@@ -143,7 +143,6 @@ impl std::fmt::Display for CmdError {
 
 impl std::error::Error for CmdError {}
 
-#[allow(dead_code)]
 pub type CmdResult<T> = Result<T, CmdError>;
 
 #[cfg(test)]
