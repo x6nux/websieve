@@ -15,3 +15,5 @@
 //! `pub mod` 会让骨架提交无法通过 `cargo check`，而「每个提交都能构建」
 //! 是本仓库的既有底线（workspace 门禁是 `cargo test --workspace`）。
 //! 后续 task 各自补一行声明即可。
+
+pub mod fakeip;
