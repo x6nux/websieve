@@ -1,9 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "emitter（initialization_script 注入）需要 core IPC 原语；窗口由 setup 代码创建，因此挂在 main 窗口",
+  "description": "emitter（initialization_script 注入）需要 core IPC 原语；窗口由 setup 代码创建。shared 承载全部走 main 窗口；isolated 每出站一个 wsieve-transport-{出站名} 窗口，没有这条 glob 授权，那些窗口里的 emitter 一 invoke 就被 ACL 拒掉，表现为「出站永远握不上手」",
   "windows": [
-    "main"
+    "main",
+    "wsieve-transport-*"
   ],
   "permissions": [
     "core:default",

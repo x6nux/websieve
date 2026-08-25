@@ -22,4 +22,5 @@
 //! 死代码。模块内的实现与测试都是真的，只是还没有人调。
 #![allow(dead_code)]
 
+pub mod carrier;
 pub mod instance;
