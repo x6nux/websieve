@@ -58,6 +58,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# tauri 的 `test` feature 提供 MockRuntime —— 控制窗口的建/显/隐、事件推送
+# 能在无 GUI 的 CI 上真的跑起来，而不是只靠肉眼确认。写在 dev-dependencies
+# 里意味着这个 feature 只在编译 test target 时并入依赖图。
+tauri = { version = "2", features = ["test"] }
 # 只用于 carrier 的一个测试：验证 isolated 的窗口标签能被
 # capabilities/default.json 的 glob 授权匹配（含中文出站名）。
 # 该 crate 已经在 tauri-utils 的依赖树里，不引入新的编译成本。

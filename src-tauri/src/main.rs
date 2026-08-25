@@ -28,6 +28,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+mod control;
 mod custody;
 mod emitter_src;
 mod outbound;
@@ -229,6 +230,12 @@ fn main() {
                 )
                 .initialization_script(bootstrap::loader_js())
                 .build()?;
+            }
+
+            // 控制窗口（设计文档 §11.3）。建不起来不阻断代理 —— 用户至少
+            // 还能靠托盘和日志排障，而代理本身与界面无关。
+            if let Err(e) = control::open(&app.handle().clone()) {
+                tracing::error!("控制窗口创建失败：{e:#}");
             }
 
             let handle = app.handle().clone();
