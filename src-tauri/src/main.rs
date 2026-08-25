@@ -28,6 +28,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+mod commands;
 mod control;
 mod custody;
 mod emitter_src;

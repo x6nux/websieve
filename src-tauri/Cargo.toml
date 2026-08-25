@@ -35,6 +35,12 @@ wsieve-inbound = { path = "../crates/wsieve-inbound" }
 wsieve-route = { path = "../crates/wsieve-route" }
 wsieve-geo = { path = "../crates/wsieve-geo" }
 wsieve-dns = { path = "../crates/wsieve-dns" }
+# 配置的读、校验与「保留注释的定点改写」全在这个 crate 里（设计文档 §5.6）。
+# 命令面**不得**另起一套配置读写：写回若走 serde 序列化，用户手写的规则注释
+# 会在 UI 点一次开关之后全部消失 —— 而那正是 §5.1 选择 YAML 的唯一理由。
+# 该 crate 的 serde-saphyr 关掉了 serialize feature，`serde_saphyr::to_string`
+# 编译期就不存在，「写回不走序列化」因此是编译期事实而非注释里的约定。
+wsieve-config = { path = "../crates/wsieve-config" }
 
 # tray-icon：托盘 API 挂在 #[cfg(all(desktop, feature = "tray-icon"))] 下
 #   （tauri/src/lib.rs:112），不开则 tauri::tray 模块根本不存在。
