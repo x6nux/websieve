@@ -11,7 +11,7 @@ use std::net::IpAddr;
 
 use wsieve_geo::GeoDb;
 use wsieve_proto::addr::AddrPort;
-use wsieve_route::{Decision, RuleSet, Verdict};
+use wsieve_route::{Decision, RuleHit, RuleSet, Verdict};
 
 use crate::inject::RoutingResolver;
 
@@ -20,6 +20,15 @@ use crate::inject::RoutingResolver;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub decision: Decision,
+    /// 做出判决的那条规则。`None` = 没有规则参与（mode 短路，或规则表
+    /// 扫穿后落到兜底）—— 两者都不是「某条规则命中」，不能假装是。
+    ///
+    /// 这一项**只在判决当下拿得到**：事后想知道「是哪条规则把它送去了这个
+    /// 出站」，要么做不到，要么得把整轮判决重跑一遍。阶段 4/5 的流量视图
+    /// （桑基图中层显示规则原文）与 §11.2 的规则试算都要它，因此本函数走
+    /// `evaluate_explained` 而非 `evaluate`：两者是同一套逻辑，后者只是把
+    /// `hit` 丢掉。判决路径上顺手带出这一个字段接近零成本。
+    pub rule: Option<RuleHit>,
     /// 是否真的发生了 DNS 查询。多数流量在域名类规则处就命中，此值为 false ——
     /// 这正是两阶段协议「不需要时零 DNS 泄漏」的可观测证据。
     pub resolved: bool,
@@ -29,10 +38,10 @@ pub struct Outcome {
     pub ips: Vec<IpAddr>,
 }
 
-/// 走完两阶段协议，返回最终判决。
+/// 走完两阶段协议，返回最终判决**及其出处**。
 ///
-/// - 第一轮 `evaluate(target, None, ..)`；命中即返回，**不发任何 DNS**
-/// - 抛出 `NeedResolve` 才解析，然后 `evaluate(target, Some(&ips), ..)`
+/// - 第一轮 `evaluate_explained(target, None, ..)`；命中即返回，**不发任何 DNS**
+/// - 抛出 `NeedResolve` 才解析，然后 `evaluate_explained(target, Some(&ips), ..)`
 /// - 解析失败/超时得到空切片，该 IP 规则视为不匹配，流程继续（纪律③）
 ///
 /// **为什么第二轮不会再抛 `NeedResolve`（这不是信任，是可核查的结构事实）：**
@@ -57,17 +66,21 @@ pub async fn decide<R: RoutingResolver + ?Sized>(
     geo: &GeoDb,
     resolver: &R,
 ) -> Outcome {
-    match rules.evaluate(target, None, geo) {
+    let first = rules.evaluate_explained(target, None, geo);
+    match first.verdict {
         Verdict::Decided(decision) => Outcome {
             decision,
+            rule: first.hit,
             resolved: false,
             ips: Vec::new(),
         },
         Verdict::NeedResolve { domain } => {
             let ips = resolver.resolve(&domain).await;
-            match rules.evaluate(target, Some(&ips), geo) {
+            let second = rules.evaluate_explained(target, Some(&ips), geo);
+            match second.verdict {
                 Verdict::Decided(decision) => Outcome {
                     decision,
+                    rule: second.hit,
                     resolved: true,
                     ips,
                 },

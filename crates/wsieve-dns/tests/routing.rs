@@ -557,6 +557,62 @@ async fn decide_accepts_a_dyn_resolver_because_phase_two_holds_one() {
     assert_eq!(out.decision, Decision::Direct);
 }
 
+// ── 判决出处（阶段 4/5 的数据契约）────────────────────────
+
+#[tokio::test]
+async fn the_deciding_rule_is_carried_out_even_when_it_took_a_resolution() {
+    // 阶段 4/5 的流量视图要显示「是哪条规则把它送去了这条路」，而这只有
+    // 判决当下拿得到 —— 事后要么补不了，要么得把判决重跑一遍。
+    //
+    // 跨解析这条尤其容易丢：判决是第二轮做出的，若驱动方拿第一轮的 hit
+    // 或干脆丢掉 hit，用户在 UI 上看到的规则就与实际生效的那条对不上。
+    let set = rs(
+        &[
+            "DOMAIN-SUFFIX,never.example,REJECT",
+            "IP-CIDR,10.0.0.0/8,DIRECT",
+            "MATCH,PROXY",
+        ],
+        &["PROXY"],
+    );
+    let srv = TestDnsServer::start(&[("intranet.corp", &["10.7.7.7"])]).await;
+    let r = srv.resolver();
+    let out = decide(&set, &domain("intranet.corp", 443), &geo_missing(), &r).await;
+
+    assert_eq!(out.decision, Decision::Direct);
+    assert!(out.resolved, "这条判决是解析之后才做出的");
+    let hit = out.rule.expect("做出判决的规则必须带出来");
+    assert_eq!(
+        hit.text, "IP-CIDR,10.0.0.0/8,DIRECT",
+        "带出来的必须是**第二轮实际命中**的那条，不是第一轮的残留"
+    );
+    assert_eq!(hit.line, 2, "行号要对得上用户配置里的那一行");
+}
+
+#[tokio::test]
+async fn a_verdict_with_no_rule_behind_it_says_so_instead_of_inventing_one() {
+    // `rule: None` 是有含义的：mode 短路或扫穿兜底时，没有任何规则参与。
+    // 硬塞一条进去会让 UI 显示一条根本没被执行的规则。
+    use wsieve_route::Mode;
+
+    let set = RuleSet::build(
+        &["MATCH,PROXY".to_string()],
+        Mode::Global,
+        "PROXY",
+        &HashSet::from(["PROXY".to_string()]),
+    )
+    .expect("测试规则应能构建");
+    let srv = TestDnsServer::start(&[]).await;
+    let r = srv.resolver();
+    let out = decide(&set, &domain("a.com", 443), &geo_missing(), &r).await;
+
+    assert_eq!(out.decision, Decision::Outbound("PROXY".into()));
+    assert!(
+        out.rule.is_none(),
+        "global 模式下没有规则参与判决，不能编一条出来：{:?}",
+        out.rule
+    );
+}
+
 // ── 规则试算（§11.2）复用同一份判决 ────────────────────────
 
 #[tokio::test]
