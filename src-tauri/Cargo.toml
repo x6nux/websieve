@@ -8,6 +8,20 @@ description = "websieve Tauri shell: WebViewTransport bridge + SOCKS5 wiring"
 # standalone crate on purpose: the workspace stays pure-lib (protocol crates),
 # the app references them by path.
 
+[features]
+default = ["embed-ui"]
+# 把 ui/dist 嵌进二进制，而不是从 devUrl 拉。
+#
+# 为什么需要显式开：tauri-macros 里是
+#   dev: cfg!(not(feature = "custom-protocol"))
+# （tauri-macros/src/context.rs:155）。也就是说 **debug 构建默认走 devUrl**，
+# 控制窗口会去连 http://localhost:5174 —— 没跑 vite dev 时就是一片空白。
+# 实测：不开此 feature 时控制窗口 URL 是 http://localhost:5174；
+# 开了之后是 tauri://localhost，本地资产正常加载。
+#
+# 用 `cargo build --no-default-features` 可退回 devUrl 模式配合 `vite dev` 热重载。
+embed-ui = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -22,7 +36,13 @@ wsieve-route = { path = "../crates/wsieve-route" }
 wsieve-geo = { path = "../crates/wsieve-geo" }
 wsieve-dns = { path = "../crates/wsieve-dns" }
 
-tauri = { version = "2", features = [] }
+# tray-icon：托盘 API 挂在 #[cfg(all(desktop, feature = "tray-icon"))] 下
+#   （tauri/src/lib.rs:112），不开则 tauri::tray 模块根本不存在。
+# image-png：app.default_window_icon() 返回的图标要能被托盘复用，
+#   仓库只有 icons/icon.png。
+# custom-protocol 不写在这里 —— 它必须由上面的 embed-ui 间接开，
+#   否则就没有退回 devUrl 配合热重载的路了。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tokio-stream = "0.1"
