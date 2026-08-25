@@ -188,6 +188,12 @@ impl CarrierPlan {
     }
 
     /// 该出站的承载窗口应加载哪个页面。未知出站返回 `None`。
+    ///
+    /// 逐项 `allow(dead_code)`：`windows()` 已经覆盖了建窗这条主路径，
+    /// 本方法服务于「某个出站到底挂在哪张页面上」这类诊断与阶段 4 的
+    /// 出站详情视图。逐项标而非整模块开 —— 整模块 allow 会连真正的
+    /// 死代码一起盖住。
+    #[allow(dead_code)]
     pub fn page_url_for(&self, name: &str) -> Option<String> {
         self.slots.get(name).map(|s| s.page_url.clone())
     }
@@ -203,7 +209,8 @@ impl CarrierPlan {
         seen.into_iter().collect()
     }
 
-    /// 计划内的出站名（字典序）。
+    /// 计划内的出站名（字典序）。见 `page_url_for` 上关于 allow 的说明。
+    #[allow(dead_code)]
     pub fn outbounds(&self) -> Vec<String> {
         self.slots.keys().cloned().collect()
     }

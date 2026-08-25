@@ -259,6 +259,12 @@ impl HttpTransport for WebViewTransport {
 
 impl WebViewTransport {
     /// `eval` 闭包负责把 JS 命令送进 webview（tauri `Webview::eval`）。
+    ///
+    /// **只给测试用**（`#[cfg(test)]`）：生产路径一律走 `with_base` ——
+    /// 基址由承载计划决定，而空基址意味着「与承载页面同源」。留一个
+    /// 默认空基址的便捷构造在那里，等于给「忘了传基址」留了条静默的路，
+    /// 而那条路会把请求发到承载页面自己的 origin，也就是另一台服务器。
+    #[cfg(test)]
     pub fn new(eval: Box<dyn Fn(String) + Send + Sync>) -> Arc<Self> {
         Self::with_base(eval, String::new())
     }

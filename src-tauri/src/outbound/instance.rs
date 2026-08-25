@@ -155,6 +155,9 @@ pub struct OutboundInstance {
     /// 一个是「我连上了」，方向相反。混用会让等待方被重连请求误唤醒，
     /// 于是它以为出站已就绪，实际拿到的仍是 `None`。
     connected: Notify,
+    /// 「停下」的广播。与 `restart` 分开：`notify_one` 只叫醒一个等待者，
+    /// 而停机要叫醒全部（退避中的循环、握手中的循环、排队的分派请求）。
+    stop: Notify,
     /// 请求彻底停下（出站被禁用 / 应用退出）。
     stopping: AtomicBool,
 }
@@ -167,6 +170,7 @@ impl OutboundInstance {
             state: OutboundState::default(),
             restart: Notify::new(),
             connected: Notify::new(),
+            stop: Notify::new(),
             stopping: AtomicBool::new(false),
         })
     }
@@ -176,6 +180,12 @@ impl OutboundInstance {
     }
 
     /// 本出站的连接参数（管理器编排承载计划时要读）。
+    ///
+    /// 逐项 `allow(dead_code)`：当前的启动路径在建实例**之前**就已经算好了
+    /// 承载计划，因此还没有人回头读它；阶段 4 的配置热更新要拿它比对
+    /// 「参数变没变、要不要重连」。逐项标而非整模块开 —— 后者会连真正的
+    /// 死代码一起盖住。
+    #[allow(dead_code)]
     pub fn cfg(&self) -> &OutboundCfg {
         &self.cfg
     }
@@ -191,15 +201,32 @@ impl OutboundInstance {
     }
 
     /// 请求本出站立刻重来一轮（不影响其他出站，也不碰承载页面）。
-    /// UI 的「重连」按钮与配置热更新会调它。
+    /// UI 的「重连」按钮与配置热更新会调它——那两处都是阶段 4 的内容，
+    /// 因此暂时无人调用（见 `cfg` 上关于 allow 的说明）。
+    #[allow(dead_code)]
     pub fn request_restart(&self) {
         self.restart.notify_one();
     }
 
-    /// 请求本出站停下。循环会在下一个可中断点退出。
+    /// 请求彻底停下（出站被禁用 / 应用退出）。
+    ///
+    /// 三个唤醒点都要通知到：退避睡眠、已连接的等待、**以及正在进行的握手**。
+    /// 少了最后一个的话，被禁用的出站会一直卡在 `Connecting` 直到握手自己
+    /// 超时 —— UI 上显示「正在连接」，实际是个已经关掉的节点。
     pub fn request_stop(&self) {
         self.stopping.store(true, Ordering::Relaxed);
         self.restart.notify_one();
+        self.stop.notify_waiters();
+    }
+
+    /// 等到被叫停。已经在停的状态下立即返回。
+    async fn wait_stop(&self) {
+        loop {
+            if self.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            self.stop.notified().await;
+        }
     }
 
     /// 等到本出站连上（或至少走完一轮握手尝试）。
@@ -262,7 +289,17 @@ impl OutboundInstance {
 
             self.set_status(&env, Status::Connecting);
             let started = tokio::time::Instant::now();
-            match self.handshake(&core, &env).await {
+            // 握手可能挂很久（等心跳、等服务端应答）。停机请求必须能当场
+            // 打断它，否则一个被禁用的出站会一路显示「正在连接」直到超时
+            // —— 用户看着 UI 以为它还在努力，实际早就该停了。
+            let attempt = tokio::select! {
+                r = self.handshake(&core, &env) => r,
+                _ = self.wait_stop() => {
+                    self.set_status(&env, Status::Stopped);
+                    return;
+                }
+            };
+            match attempt {
                 Ok((dialer, liveness)) => {
                     let sessions = dialer.session_count();
                     *self.dialer.write().unwrap() = Some(dialer);
@@ -462,6 +499,11 @@ impl SessionLiveness {
     }
 
     /// 当前还活着的会话数。
+    ///
+    /// 只有测试在读：生产路径关心的是「**全部**会话是否都死了」
+    /// （`all_dead()`），而不是还剩几条。留着是因为测试要能区分
+    /// 「死了一条」与「全死了」—— 那正是本类型存在的理由。
+    #[cfg(test)]
     pub fn live_count(&self) -> usize {
         self.live.load(Ordering::Relaxed)
     }

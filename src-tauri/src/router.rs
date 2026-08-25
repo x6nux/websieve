@@ -17,12 +17,6 @@
 //! 需要 DNS 时返回 `Verdict::NeedResolve` 把需求抛回给调用方 —— 也就是这里。
 //! 本模块把两阶段协议整个委托给 `RoutingResolver`，见 `decide()` 的注释。
 
-//! **本模块尚未接线**：唯一的调用方是 Task 13 的出站管理器（它把 `dispatch`
-//! 包成 `wsieve_inbound::Dispatch` 交给混合端口入口），在那之前编译器看不到
-//! 任何使用点。因此这里整模块 `allow(dead_code)` —— **接线完成后必须删掉
-//! 这一行**，否则它会长期掩盖真正的死代码。模块内的实现与测试都是真的。
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
@@ -166,20 +160,24 @@ impl Router {
         Self::new(rules, geo, outbounds, Arc::new(NoResolver))
     }
 
-    /// 改「正在启动中」的排队上限（测试与将来的配置项用）。
-    pub fn with_start_wait(mut self, d: Duration) -> Self {
+    /// 改「正在启动中」的排队上限。
+    ///
+    /// `#[cfg(test)]`：当前生产路径一律用 `DEFAULT_START_WAIT`。等它变成
+    /// 配置项时（阶段 4）再放开 —— 在那之前留一个公开的可变旋钮，只会让
+    /// 「这个值到底从哪来的」多一个要排查的地方。
+    #[cfg(test)]
+    fn with_start_wait(mut self, d: Duration) -> Self {
         self.start_wait = d;
         self
     }
 
-    /// 已解析次数（诊断/测试）。
-    pub fn resolver_calls(&self) -> usize {
+    /// 已解析次数。
+    ///
+    /// `#[cfg(test)]`：它存在的唯一理由是让测试能断言「最多解析一次」
+    /// 与「域名类规则命中时零解析」—— 两条纪律都只有靠计数才证明得了。
+    #[cfg(test)]
+    fn resolver_calls(&self) -> usize {
         self.resolver_calls.load(Ordering::Relaxed)
-    }
-
-    /// 出站表（管理器要用同一份实例去跑会话循环）。
-    pub fn outbounds(&self) -> &BTreeMap<String, Arc<OutboundInstance>> {
-        &self.outbounds
     }
 
     /// 走完两阶段协议，返回判决与它的出处。
