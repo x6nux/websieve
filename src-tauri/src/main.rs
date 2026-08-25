@@ -36,6 +36,7 @@ mod outbound;
 mod router;
 mod shard;
 mod shard_setup;
+mod stats;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -242,6 +243,19 @@ fn main() {
             // 事件聚合节流（设计文档 §11.2）。必须在建完控制窗口之后起：
             // emit_control 会先查窗口在不在，不在就短路。
             let agg = events::Aggregator::new();
+
+            // 恢复上次的命中计数（§11.2），要在 spawn 之前 —— rule_hit_loop
+            // 的增量是「本轮快照 − 上轮快照」，先 spawn 再 restore 会让恢复
+            // 的历史值被当成一整轮的新增，UI 上凭空冒出一个巨大的尖峰。
+            // 取不到配置目录时跳过：观察数据丢了不影响功能，但要说出来。
+            match app.path().app_config_dir() {
+                Ok(dir) => {
+                    let saved = stats::load(&stats::path(&dir));
+                    agg.hits.restore(saved.rule_hits);
+                }
+                Err(e) => tracing::warn!("取配置目录失败（{e}），命中计数不恢复"),
+            }
+
             agg.spawn(app.handle().clone());
             app.manage(agg);
 
@@ -265,13 +279,31 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("tauri build")
-        .run(move |_app, event| {
+        .run(move |app, event| {
             // 退出时**按获取的相反顺序**摘除全部外部系统状态托管（spec §10）：
             // 系统代理不关的话用户整机断网；hosts 不摘的话域名会一直指向
             // 已经不在跑的转发器。两者的崩溃路径都由下次启动的 clear_stale 兜底。
             if let tauri::RunEvent::Exit = event {
                 sysproxy_guard.lock().unwrap().take();
                 shard_guard.lock().unwrap().take();
+
+                // 落盘命中计数（§11.2）。放在最后：它纯粹是观察数据，
+                // 而上面两条摘的是会影响用户整机网络的东西，先做要紧的。
+                // 失败要报出来 —— 静默丢数据是房规明令禁止的。
+                if let Some(agg) = app.try_state::<events::Aggregator>() {
+                    match app.path().app_config_dir() {
+                        Ok(dir) => {
+                            let f = stats::StatsFile {
+                                version: stats::VERSION,
+                                rule_hits: agg.hits.snapshot(),
+                            };
+                            if let Err(e) = stats::save(&stats::path(&dir), &f) {
+                                tracing::error!("写 stats.json 失败：{e}");
+                            }
+                        }
+                        Err(e) => tracing::warn!("取配置目录失败（{e}），命中计数未保存"),
+                    }
+                }
             }
         });
 }
