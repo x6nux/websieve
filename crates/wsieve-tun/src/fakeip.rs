@@ -159,7 +159,11 @@ impl FakeIpPool {
         self.len() == 0
     }
 
-    /// 该 IP 是否落在 fake-ip 段内（不论是否已分配）。
+    /// 该 IP 是否落在 fake-ip **可分配范围**内。
+    ///
+    /// ⚠️ **段内 ≠ 可分配范围内**：整段是 `198.18.0.0/15`，本函数只覆盖
+    /// 其中拿得出来发人的那部分（前 4 个地址与末尾广播地址不分配）。
+    /// 问「这个地址会不会被路由进 TUN」要用 [`in_segment`](Self::in_segment)。
     ///
     /// ⚠️ **段内 ≠ 出自本池**。本机 DNS 若被劫持，同样可能回 `198.18.x.x`
     /// （2026-08-25 实测：查询 `192.0.2.1` 得到 `198.18.0.211`）。要判断
@@ -168,6 +172,20 @@ impl FakeIpPool {
     pub fn in_range(ip: Ipv4Addr) -> bool {
         let v = u32::from(ip);
         (RANGE_START..=RANGE_END).contains(&v)
+    }
+
+    /// 该 IP 是否落在 `198.18.0.0/15` **整段**内。
+    ///
+    /// 这是「会不会被路由进本 TUN 设备」的判据 —— `device.rs` 用
+    /// `TUN_ADDR/15` 配置接口，**整段**都进设备，不只是可分配的那部分。
+    ///
+    /// 两个判据必须分开，因为差集里那 5 个地址（`198.18.0.0`–`.3` 与
+    /// `198.19.255.255`，其中 `.1` 正是 TUN 网关自己）是真实存在的坑：
+    /// 它们进得了设备却永远反查不到，若按「不在 fake 段」当普通 IP 连出去，
+    /// 包会被路由回本设备 —— 黑洞，且日志上什么都看不出来。
+    pub fn in_segment(ip: Ipv4Addr) -> bool {
+        let o = ip.octets();
+        o[0] == 198 && (o[1] == 18 || o[1] == 19)
     }
 
     /// 池容量（可分配地址总数）。
@@ -321,6 +339,30 @@ mod tests {
         assert!(!FakeIpPool::in_range("198.19.255.255".parse().unwrap()));
         assert!(!FakeIpPool::in_range("198.17.255.255".parse().unwrap()));
         assert_eq!(FakeIpPool::capacity(), RANGE_END - RANGE_START + 1);
+    }
+
+    /// **可分配范围 ⊊ 整段**，两个判据必须分得开。
+    ///
+    /// `device.rs` 用 `198.18.0.1/15` 配 TUN 接口 —— **整段**都被路由进设备，
+    /// 而池只发得出其中一部分。差集里那 5 个地址是真实存在的坑：进得了设备
+    /// 却永远反查不到。`inbound::classify` 因此必须用 `in_segment` 判归属，
+    /// 用 `in_range` 会把它们当公网地址连出去，包绕回本设备形成静默黑洞。
+    #[test]
+    fn the_whole_segment_is_wider_than_the_allocatable_range() {
+        for a in ["198.18.0.0", "198.18.0.1", "198.18.0.3", "198.19.255.255"] {
+            let ip: Ipv4Addr = a.parse().unwrap();
+            assert!(FakeIpPool::in_segment(ip), "{a} 在 /15 段内，会被路由进 TUN");
+            assert!(!FakeIpPool::in_range(ip), "{a} 却不在可分配范围内");
+        }
+        // 段的两侧邻居都在外面：判据不能宽到误伤真实互联网地址。
+        for a in ["198.17.255.255", "198.20.0.0"] {
+            assert!(!FakeIpPool::in_segment(a.parse().unwrap()), "{a} 在段外");
+        }
+        // 可分配范围内的地址当然也在段内 —— 包含关系不能反过来。
+        for a in ["198.18.0.4", "198.19.255.254"] {
+            assert!(FakeIpPool::in_segment(a.parse().unwrap()));
+            assert!(FakeIpPool::in_range(a.parse().unwrap()));
+        }
     }
 
     #[test]

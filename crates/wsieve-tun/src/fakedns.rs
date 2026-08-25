@@ -157,20 +157,26 @@ impl FakeDns {
 
     /// 筛查上游应答，拦下落在 fake-ip 段内的 A 记录。
     ///
-    /// 纯函数，不需要池的状态：这一侧的判据是**段归属**而非池记录。
+    /// 纯函数，不需要池的状态：这一侧的判据是**段归属**（`in_segment`，整个
+    /// `198.18.0.0/15`）而非池记录、也不是可分配范围（`in_range`）。
     /// 与 `fakeip::in_range` 文档里那条「段内 ≠ 出自本池」并不矛盾 ——
     /// 两个方向的问题不同：
     ///   - 入站方向（TUN 拿到目的 IP）问的是「这个地址是不是我发出去的」，
     ///     只有 `lookup()` 能回答
     ///   - 上游方向（这里）问的是「上游有没有资格给出这个地址」，答案永远是
     ///     没有 —— 整段都归我们，上游给出段内地址一定是污染
+    ///
+    /// 为什么必须是整段而不是可分配范围：整段都被路由进 TUN 设备
+    /// （`device.rs` 用 `/15` 配接口）。上游若回一个 `198.18.0.2` 这种落在
+    /// 段内却在池外的地址，客户端连出去照样被捕获、照样反查落空 —— 放行它
+    /// 等于放行一个静默黑洞。
     pub fn screen_upstream(resp: &[u8]) -> Result<Screen, DnsError> {
         let mut msg = Message::from_vec(resp).map_err(|_| DnsError::Malformed)?;
 
         let mut removed = Vec::new();
         let mut kept_a = 0usize;
         msg.answers.retain(|r| match r.data {
-            RData::A(A(ip)) if FakeIpPool::in_range(ip) => {
+            RData::A(A(ip)) if FakeIpPool::in_segment(ip) => {
                 removed.push(ip);
                 false
             }
@@ -465,6 +471,38 @@ mod tests {
                 removed: vec!["198.18.0.207".parse().unwrap()]
             }
         );
+    }
+
+    /// 段内但**池外**的地址同样是污染。
+    ///
+    /// `198.18.0.2` 落在 `/15` 段里却在池的可分配范围之外（前 4 个地址不
+    /// 分配）。判据若用 `in_range`（可分配范围），这条会被放行 —— 而整段
+    /// 都路由进 TUN 设备，客户端拿它去连照样被捕获、照样反查落空。
+    /// 判据必须是 `in_segment`（段归属）。段末的 `198.19.255.255` 同理。
+    #[test]
+    fn in_segment_but_out_of_pool_addresses_are_poison_too() {
+        for a in ["198.18.0.0", "198.18.0.1", "198.18.0.2", "198.19.255.255"] {
+            let r = FakeDns::screen_upstream(&upstream_a("example.com.", &[a])).unwrap();
+            assert_eq!(
+                r,
+                Screen::AllPoisoned {
+                    removed: vec![a.parse().unwrap()]
+                },
+                "{a} 在段内，上游没有资格给出它"
+            );
+        }
+    }
+
+    /// 段外的邻居必须**照常放行**：判据不能宽到误伤真实互联网地址。
+    #[test]
+    fn addresses_just_outside_the_segment_are_not_screened() {
+        for a in ["198.17.255.255", "198.20.0.0"] {
+            assert_eq!(
+                FakeDns::screen_upstream(&upstream_a("example.com.", &[a])).unwrap(),
+                Screen::Clean,
+                "{a} 在段外，是真实可达地址"
+            );
+        }
     }
 
     #[test]

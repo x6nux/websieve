@@ -21,5 +21,6 @@ pub mod device;
 pub mod dns_server;
 pub mod fakedns;
 pub mod fakeip;
+pub mod inbound;
 pub mod managed;
 pub mod routes;
