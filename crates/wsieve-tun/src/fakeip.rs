@@ -174,6 +174,18 @@ impl FakeIpPool {
     pub fn capacity() -> u32 {
         CAPACITY
     }
+
+    /// 把池推进「铺满且无可回收条目」的状态，供**本 crate 的测试**驱动
+    /// 真实的耗尽路径。
+    ///
+    /// 不是替身：被测的仍是 `allocate` 的真实实现，只是省掉逐个分配 13 万
+    /// 个地址那一步（真跑一遍要几秒，且与被测行为无关）。与本模块测试里的
+    /// `pool_with_headroom` 同一个手法，提到这里是因为 `fakedns` 也要用。
+    #[cfg(test)]
+    pub(crate) fn exhaust_for_test(&self) {
+        let mut g = self.inner.lock().expect("fakeip 锁中毒");
+        g.next = RANGE_END + 1;
+    }
 }
 
 impl Inner {
