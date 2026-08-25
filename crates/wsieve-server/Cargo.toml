@@ -33,3 +33,6 @@ rand_chacha = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 wsieve-socks5 = { version = "0.1.0", path = "../wsieve-socks5" }
+# cross_origin_spike：Rust ←→ 真实 WKWebView 的桥用 JSON 交换 fetch 结果。
+serde = { workspace = true }
+serde_json = "1"

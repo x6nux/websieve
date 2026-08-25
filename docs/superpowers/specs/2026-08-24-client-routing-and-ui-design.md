@@ -72,8 +72,9 @@ sid 全程走 **query**，服务端不读 cookie。
 
 > **行动项**（三处，一并处理）：
 > 1. 修正传输 spec §6.2 的 `Cookie: sid=...` 描述，或在实现中改回 cookie。二者必须一致。本设计按**实现现状（query）**推进；若将来改回 cookie，§9.1 必须同步改为「每出站独立 WebView」
-> 2. §9.1 放宽 CORS 后，传输 spec **§6.7 第 3 条**（「CORS 响应头…只对与 `Host` 同域名的 `Origin`」）随之失效，需同步修订
-> 3. `crates/wsieve-server/src/lib.rs:269` 的 `cors_origin` 文档注释同样描述了该限制，需一并更新
+>    —— **代码侧已复核确认走 query**（`wsieve-xhttp/src/client.rs:133`／`:205`／`:453`，服务端 `wsieve-server/src/lib.rs:228`／`:250`；全仓 `crates/` 与 `src-tauri/src/` 对 cookie 零命中）。传输 spec §6.2 的散文仍待订正。
+> 2. ~~§9.1 放宽 CORS 后，传输 spec **§6.7 第 3 条**（「CORS 响应头…只对与 `Host` 同域名的 `Origin`」）随之失效，需同步修订~~ —— **已完成**（提交 `dbb300d`）
+> 3. ~~`crates/wsieve-server/src/lib.rs:269` 的 `cors_origin` 文档注释同样描述了该限制，需一并更新~~ —— **已完成**（提交 `dbb300d`）
 
 ### 3.3 承载方式的可行性边界
 
@@ -485,15 +486,29 @@ WebView → 127.0.0.1:18443（环回，不过 TUN ✓）
 
 **成立前提**是 §3.2——sid 走 query 而非 cookie，因此跨域名请求不受 ITP 第三方 cookie 拦截影响。
 
-**服务端需要的唯一改动**：现有 CORS 逻辑限制「Origin 必须与 Host 同域名」（`server/lib.rs:270`），需放宽为接受任意 Origin。
+> **已实测确证**（2026-08-25，`scripts/spike-cross-origin.sh`，结论见
+> `docs/superpowers/spikes/2026-08-25-cross-origin-carrier-spike.md`）：
+> 单个真实 WKWebView 加载自域名 A 的页面，与 A、B 两个**不同 eTLD+1**
+> （真正的 cross-site）的服务端各完成一次完整 Noise 握手，两个出站的数据面
+> 均跑通、逐字节一致。**`carrier: shared` 成立。**
+> 含反证对照：把 CORS 改回同域名限制则跨域名握手立即被 WebKit 拦掉
+> （`TypeError: Load failed`），确证该 spike 确实在测跨域名能力，
+> 且 CORS 放宽是其必要条件。
+
+**服务端需要的唯一改动**：现有 CORS 逻辑限制「Origin 必须与 Host 同域名」（`server/lib.rs:270`），需放宽为接受任意 Origin。**已完成**（提交 `dbb300d`）。
 
 **安全性基本不变**：真正的防线是「**只有认证成功的响应才带 CORS 头**」，该条保持不动。探测者发不出合法 msg1，永远看不到任何 CORS 痕迹。
 
 **宿主选择**：默认取第一个启用的出站，可由 `carrier-host` 指定。宿主出站下线**不影响**其他出站——页面已加载完毕，JS 继续运行。
 
-**降级路径**：`carrier: isolated` 为每个出站建独立隐藏 WebView。代价是内存随出站数线性增长（每实例数十 MB 量级，**待实测**），换来故障隔离。若将来 sid 改回 cookie，此模式将成为唯一可行方案。
+**降级路径**：`carrier: isolated` 为每个出站建独立隐藏 WebView，换来故障隔离。若将来 sid 改回 cookie，此模式将成为唯一可行方案。
 
-> 待实测项：单个隐藏 WKWebView 的常驻内存。参照传输 spec §9.3 的既有做法，此项不预先设计规避方案，实测后再定是否需要容量上限。
+> **已实测**（2026-08-25）：isolated 的内存代价**不是**「随出站数线性增长的 N×」。
+> 同一进程内的多个 WKWebView 共用 WebContent 进程池，实测为**首个约 128 MB，
+> 其后每个约 27 MB**（1/2/4 个 WebView 分别为 +128 MB / +155 MB / +211 MB）。
+> isolated 比 shared 贵，但远没有 N× 那么贵——将来若因故障隔离等原因需要退回
+> isolated，不应被旧的「N×」说法吓阻。shared 形态下增开出站**不增开 WebView**，
+> 内存不随出站数增长。
 
 ### 9.2 hosts 与端口
 
@@ -840,9 +855,9 @@ traffic_snapshot(window)
 
 沿用传输 spec §9.3 的做法——**不为未实测的问题预先设计规避方案**：
 
-1. **单个隐藏 WKWebView 的常驻内存**。决定 `isolated` 模式是否需要容量上限与淘汰策略
+1. ~~**单个隐藏 WKWebView 的常驻内存**~~ —— **已实测**（2026-08-25）：首个约 128 MB，其后每个约 27 MB（多 WebView 共用 WebContent 进程池，非线性）。见 §9.1 与 `docs/superpowers/spikes/2026-08-25-cross-origin-carrier-spike.md`
 2. **预建 TCP 的安全闲置时长**。中间设备与服务端的超时回收行为需实测，决定有效期与预备数量
-3. **跨域名 fetch 在 WKWebView 下的实际行为**。§9.1 的推论基于 sid 走 query 这一事实，但仍需一次真实的跨域名会话建立来确证
+3. ~~**跨域名 fetch 在 WKWebView 下的实际行为**~~ —— **已实测**（2026-08-25）：单个真实 WKWebView 与两个 *cross-site* 域名（不同 eTLD+1）各完成完整 Noise 握手并跑通数据面，`carrier: shared` **成立**。含反证对照。复现：`scripts/spike-cross-origin.sh`
 
 ---
 

@@ -241,16 +241,14 @@ padding 长度范围 0–1000 字节，每帧独立随机（Xray 经验值为 10
 ### 6.2 HTTP 端点与形态
 
 ```http
-# 握手 + 上行：POST，seq 在 query，sid 在 cookie
-POST /api/sync?n=17 HTTP/2   ← 浏览器↔CDN/源站为 h2 或 h3（§6.8）；CDN Flexible 模式下 CDN↔源站段可能是 h1.1，对客户端无影响
-Cookie: sid=<128-bit 随机的 base64url>
+# 握手 + 上行：POST，seq 与 sid 均在 query
+POST /api/sync?n=17&sid=<128-bit 随机的 base64url> HTTP/2   ← 浏览器↔CDN/源站为 h2 或 h3（§6.8）；CDN Flexible 模式下 CDN↔源站段可能是 h1.1，对客户端无影响
 → 200（n=0 且 msg1 验证通过，body = TU(msg2)）
 → 204（n≥1 且会话有效，body 恒空）
 → 其余（垃圾/重放/无会话/版本不符）：**不产生任何专属响应**，请求原样转交伪装处理器（反代上游，或内嵌 nginx 页的 404）——见 §8
 
 # 下行：一条长 GET
-GET /api/events HTTP/2
-Cookie: sid=<同上>
+GET /api/events?sid=<同上> HTTP/2
 Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 → 200（会话有效）
   Content-Type: text/event-stream
@@ -259,6 +257,24 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 → <TU 密文的持续字节流，永不结束>
 → 其余：同上转交伪装处理器
 ```
+
+> **2026-08-25 订正（重要）**：本节原文写作「sid 在 cookie」并给出
+> `Cookie: sid=...` 请求头。**这与实现不符，且该误述曾导致一次被公开撤回的
+> 错误架构结论**（若 sid 真在 cookie 里，WKWebView 的 ITP 会拦掉跨站第三方
+> cookie，「单 WebView 承载多出站」将结构性地不可能）。
+>
+> **实现事实：sid 自始至终走 query。**
+> 客户端 `crates/wsieve-xhttp/src/client.rs:133`（握手）、`:205`（下行）、
+> `:453`（后续上行）；服务端 `crates/wsieve-server/src/lib.rs:228`、`:250`
+> 均以 `query_param(&uri, "sid")` 取值。全仓 `crates/` 与 `src-tauri/src/`
+> 对 `cookie` 的搜索**零命中**。
+>
+> emitter 的 `credentials:'include'` 只是让 fetch 带上凭据（若有），
+> **与 sid 的传递无关**。
+>
+> 该事实已由 2026-08-25 的跨域名 spike 端到端确证（单 WebView 对两个
+> 不同 eTLD+1 的服务端各完成握手并跑通数据面）。见
+> `docs/superpowers/spikes/2026-08-25-cross-origin-carrier-spike.md`。
 
 设计说明：
 
@@ -271,7 +287,7 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 
 ```
 1. C  生成 sid（128-bit 随机）
-2. C→S POST /api/sync?n=0, Cookie: sid, body = TU(Noise msg1)
+2. C→S POST /api/sync?n=0&sid=<sid>, body = TU(Noise msg1)
       msg1 的 0-RTT payload = [u8 version][u64 ts_ms][u8 mux_count][mux id 列表]（§7.4）
 3. S  尝试用静态私钥解密 msg1。以下任一情况 → **转交伪装处理器**（与普通请求同一出口，不落任何会话状态）：
       - 解密失败（垃圾/探测）
@@ -281,7 +297,7 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
       - 解出的客户端静态公钥不在白名单
       成功 → 建会话（进入 30s attach 窗口）→ 200, body = TU(Noise msg2)
 4. C  收 msg2 → 双方持有传输密钥。mux 协商在握手中完成，零额外 RTT
-5. C→S GET /api/events, Cookie: sid
+5. C→S GET /api/events?sid=<sid>
       sid 无会话或已被挂载 → **转交伪装处理器**；正常 → 200，挂载，开始下发 TU 流
 6. 之后上行 POST n=1,2,3…（每 body 含 1..N 个 TU）
 ```
@@ -388,7 +404,14 @@ WebView 加载的是服务端首页而非 `about:blank`，因此所有代理请�
 
 1. 这些差异全在 TLS 内部，中间人只看到若干条到 `:443` 的连接且 SNI 相同——对外伪装反而**优于**多子域名方案；
 2. CORS 预检被消除而非缓存：emitter 的 `Content-Type` 由 `application/octet-stream` 改为 `text/plain`（CORS 简单请求白名单），实测跨源 POST 预检次数 0 vs 1。服务端因此无需特殊响应 OPTIONS，少一个可探测面；
-3. CORS 响应头只加在**认证成功**的响应上，且只对与 `Host` 同域名的 `Origin`——未认证请求照常走伪装处理器（§8），探测者看不到任何 CORS 痕迹。
+3. CORS 响应头只加在**认证成功**的响应上——未认证请求照常走伪装处理器（§8），探测者看不到任何 CORS 痕迹。
+
+> **2026-08-25 修订**：本条原文为「且只对与 `Host` 同域名的 `Origin`」。该限制已随
+> 客户端 spec §9.1「单 WebView 承载多出站」放宽——服务端无从预知客户端把哪台机器
+> 当宿主，故不能再做同域名判据，现回显任意形态合法的 `Origin`（实现见
+> `crates/wsieve-server/src/lib.rs` 的 `cors_origin`，提交 `dbb300d`）。
+> **防线未变**：判据始终是「认证与否」，不是「同不同域」。原「同域名不同端口」的
+> 多端口条带场景是新判据的一个特例，仍被覆盖。
 
 会话 0 仍加载自转发器的首个端口并使用相对路径，保持完全同源。hosts 不可写（无管理员权限）时降级为单会话 + 警告日志，不阻断启动。
 
