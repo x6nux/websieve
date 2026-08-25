@@ -15,6 +15,7 @@
 mod bridge;
 mod custody;
 mod emitter_src;
+mod outbound;
 mod proxy;
 mod shard;
 mod shard_setup;
