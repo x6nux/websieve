@@ -43,6 +43,49 @@ pub struct AppConfig {
     /// 认证之前，开启它只应发生在完全可信的网段，且必须由用户显式选择。
     /// 因此这里不提供任何「自动开」的路径，开启时也会打一条醒目的告警。
     pub allow_lan: bool,
+    /// 是否启用 TUN 入口（设计文档 §8.3）。
+    ///
+    /// **默认关。** 它需要管理员权限（创建 utun + 写路由表），而且改的是
+    /// 整机的默认路由 —— 比系统代理更重。开启时若权限不足，会打一条可操作
+    /// 的错误并**不启用**，绝不静默降级：静默降级会让用户以为 TUN 开着而
+    /// 实际全部流量走的是混合端口（与 §6.4「禁止回退直连」同源）。
+    pub tun: bool,
+}
+
+/// fake-ip DNS 的上游解析器地址。
+///
+/// **必须是 IP 字面量**：TUN 生效后域名解析会走我们自己，用域名配上游就是
+/// 一个先有鸡还是先有蛋的死结。
+///
+/// 默认 `1.1.1.1:53`，与 `wsieve-dns` 的 bootstrap 默认一致。
+///
+/// ponytail: 上游是显式配置的明文 UDP，不走 DoH/DoT。**上限**：与上游之间
+/// 的查询是明文的，本机到 `1.1.1.1` 这一段可被观测与篡改（`screen_upstream`
+/// 只挡得住段内污染这一类）。**升级路径**：阶段 3 的 `wsieve-dns` 已经有
+/// 完整的 DoH/DoT 上游实现，把 `DnsServer::new` 的第二个参数从 `SocketAddr`
+/// 换成那边的 `Upstream` 即可 —— 本模块只是留了个注入点。
+pub fn dns_upstream() -> anyhow::Result<std::net::SocketAddr> {
+    let raw = std::env::var("WSIEVE_DNS_UPSTREAM").unwrap_or_else(|_| "1.1.1.1:53".to_string());
+    parse_dns_upstream(&raw)
+}
+
+/// `dns_upstream` 的纯函数内核（从 env 里摘出来才好测）。
+///
+/// 先试**裸 IP**：裸 IPv6（`2606:4700:4700::1111`）自己就带一堆冒号，
+/// 靠「有没有冒号」去猜带不带端口必然猜错 —— 那会把一个完全合法的上游
+/// 判成非法，而用户看到的只是「DNS 起不来」。裸 IP 一律补 53。
+/// 不是裸 IP 才按 `地址:端口` 解析，因此 `[::1]:5353` 这类写法照常可用。
+pub fn parse_dns_upstream(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 53));
+    }
+    raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "DNS 上游 {raw} 不是合法的 IP[:端口]（{e}）。\
+             必须写 IP 而非域名 —— TUN 生效后域名解析走我们自己，\
+             用域名配上游是个死结"
+        )
+    })
 }
 
 fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -94,6 +137,10 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
     let allow_lan = std::env::var("WSIEVE_ALLOW_LAN")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
+    // TUN 默认关：要 root，且改的是整机默认路由（见字段注释）。
+    let tun = std::env::var("WSIEVE_TUN")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
     Ok(AppConfig {
         server_url,
         server_pub,
@@ -104,6 +151,7 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
         show_window,
         system_proxy,
         allow_lan,
+        tun,
     })
 }
 

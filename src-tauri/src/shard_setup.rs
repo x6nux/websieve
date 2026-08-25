@@ -12,6 +12,18 @@ use crate::custody::hosts::{HostsCustody, HostsFile};
 use crate::custody::{CustodyGuard, ManagedSystemState};
 use crate::shard::{self, ShardGuard};
 
+/// 解析出服务器真实 IP 之后、起转发器之前的回调。
+///
+/// **这是 §8.3.2 第 2 步「写 bypass 路由」的挂点**，位置不能挪：
+///   - 挪到解析**之前**：那时还不知道服务器 IP，无从写起
+///   - 挪到起转发器**之后**：转发器建立的第一条连接就已经在 TUN 覆盖下裸奔，
+///     而 TUN 此刻可能已经被上一次运行的残留路由接管
+///
+/// 返回 `Err` 时 `plan` **不中止**：转发器与 hosts 归混合端口入口用，与 TUN
+/// 无关，没道理因为 TUN 起不来就把代理整个关掉。错误被记进
+/// [`ShardPlan::bypass_error`]，由调用方据此**拒绝拉起 TUN**。
+pub type UpstreamHook = Arc<dyn Fn(std::net::SocketAddr) -> anyhow::Result<()> + Send + Sync>;
+
 /// 条带编排结果。
 pub struct ShardPlan {
     /// 主 WebView 应加载的 URL（劫持生效时是本地端口）。
@@ -20,6 +32,16 @@ pub struct ShardPlan {
     pub session_bases: Vec<Option<String>>,
     /// 持有转发器与 hosts 清理职责；drop 即摘除 hosts 条目。
     pub guard: Option<ShardGuard>,
+    /// 解析到的服务器真实地址。`None` 表示本次走了降级路径，压根没解析。
+    ///
+    /// **拉起 TUN 的前提**：没有真实 IP 就没有 bypass，而没有 bypass 的 TUN
+    /// 是确定性的环路（§8.3.1）。
+    pub upstream: Option<std::net::SocketAddr>,
+    /// bypass 钩子的失败原因。
+    ///
+    /// `Some` ⇒ **绝不能拉起 TUN**。字符串而非 `anyhow::Error`：这里只用于
+    /// 报给用户，而 `ShardPlan` 要能跨 await 点搬来搬去。
+    pub bypass_error: Option<String>,
 }
 
 impl ShardPlan {
@@ -29,7 +51,18 @@ impl ShardPlan {
             page_url: server_url.to_string(),
             session_bases: vec![None],
             guard: None,
+            upstream: None,
+            bypass_error: None,
         }
+    }
+
+    /// 本次是否可以安全地拉起 TUN。
+    ///
+    /// 两个条件缺一不可：解析到了真实 IP、且 bypass 路由确实写进去了。
+    /// 做成方法而不是让调用方各自判两个字段 —— 漏判任何一个都是环路，
+    /// 而环路是静默的。
+    pub fn tun_may_start(&self) -> bool {
+        self.upstream.is_some() && self.bypass_error.is_none()
     }
 
     /// 实际可用的会话数。
@@ -84,11 +117,15 @@ fn hijackable(host: &str) -> bool {
 }
 
 /// 编排本地条带。`extra_sessions` 为 0 时直接走单会话原路径。
+///
+/// `on_upstream` 在**解析之后、起转发器之前**被调用一次（见 [`UpstreamHook`]）。
+/// TUN 关闭时传 `None`。
 pub async fn plan(
     server_url: &str,
     shard_base_port: u16,
     extra_sessions: usize,
     hosts_path: std::path::PathBuf,
+    on_upstream: Option<UpstreamHook>,
 ) -> ShardPlan {
     let hosts = Arc::new(HostsFile::new(hosts_path));
 
@@ -163,7 +200,21 @@ pub async fn plan(
         return ShardPlan::degraded(server_url);
     }
 
-    // 2) 起转发器，成功后才写 hosts——反过来的话，转发器起不来时域名已被
+    // 2) **写 bypass 路由**（§8.3.2 第 2 步）。必须夹在解析与起转发器之间：
+    //    转发器的第一条连接就要走这条路由绕开 TUN，晚一步就是裸奔。
+    //
+    //    失败**不中止**条带：转发器与 hosts 服务的是混合端口入口，与 TUN
+    //    无关。但错误要原样带回去，调用方据此拒绝拉起 TUN —— 没有 bypass
+    //    的 TUN 是确定性的环路，绝不能靠「大概写上了」蒙混过去。
+    let mut bypass_error = None;
+    if let Some(hook) = on_upstream {
+        if let Err(e) = hook(upstream) {
+            tracing::error!("写 bypass 路由失败（{e:#}）——本次不会拉起 TUN");
+            bypass_error = Some(format!("{e:#}"));
+        }
+    }
+
+    // 3) 起转发器，成功后才写 hosts——反过来的话，转发器起不来时域名已被
     //    指向本地，本机访问该域名会全部失败。
     let forwarder = match shard::spawn(shard_base_port, sessions, upstream).await {
         Ok(f) => f,
@@ -172,7 +223,7 @@ pub async fn plan(
             return ShardPlan::degraded(server_url);
         }
     };
-    // 3) 写 hosts。托管交给 CustodyGuard：持有即生效，drop 即摘除，
+    // 4) 写 hosts。托管交给 CustodyGuard：持有即生效，drop 即摘除，
     //    崩溃残留由下次启动的步骤 0 兜底（§10）。
     let custody = match CustodyGuard::acquire(HostsCustody::new(
         hosts.clone(),
@@ -202,6 +253,8 @@ pub async fn plan(
         page_url: format!("{}/", origin(ports[0])),
         session_bases,
         guard: Some(ShardGuard::new(forwarder, custody)),
+        upstream: Some(upstream),
+        bypass_error,
     }
 }
 
@@ -242,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_extra_sessions_keeps_original_url() {
-        let p = plan("https://x.com/", 18443, 0, "/nonexistent".into()).await;
+        let p = plan("https://x.com/", 18443, 0, "/nonexistent".into(), None).await;
         assert_eq!(p.page_url, "https://x.com/");
         assert_eq!(p.session_count(), 1);
         assert!(p.guard.is_none());
@@ -256,6 +309,7 @@ mod tests {
             18443,
             3,
             "/proc/definitely-not-writable/hosts".into(),
+            None,
         )
         .await;
         assert_eq!(p.page_url, "https://x.com/");
@@ -266,7 +320,7 @@ mod tests {
     #[tokio::test]
     async fn ip_server_url_degrades() {
         let p = temp_hosts("ip-degrade", "127.0.0.1 localhost\n");
-        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone()).await;
+        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone(), None).await;
         assert_eq!(plan0.session_count(), 1);
         assert!(plan0.guard.is_none());
         std::fs::remove_file(&p).ok();
@@ -293,7 +347,7 @@ mod tests {
             "degrade",
             "127.0.0.1 localhost\n127.0.0.1 old.com # wsieve-managed\n",
         );
-        let plan0 = plan("https://x.com/", 18443, 0, p.clone()).await;
+        let plan0 = plan("https://x.com/", 18443, 0, p.clone(), None).await;
         assert!(plan0.guard.is_none(), "条带关掉时不该有 guard");
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(!s.contains("old.com"), "降级路径也必须清掉上次的残留：{s}");
@@ -309,10 +363,68 @@ mod tests {
             "not-hijackable",
             "127.0.0.1 localhost\n127.0.0.1 old.com # wsieve-managed\n",
         );
-        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone()).await;
+        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone(), None).await;
         assert!(plan0.guard.is_none());
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(!s.contains("old.com"), "IP 服务端也必须清掉残留：{s}");
         std::fs::remove_file(&p).ok();
+    }
+
+    /// **降级路径不得让 TUN 起来。**
+    ///
+    /// 降级意味着没解析、没写 bypass。此时若 TUN 照拉，转发器的第一条
+    /// 出网连接就会被捕获、判「走代理」、绕回本机 —— §8.3.1 的环路，
+    /// 而且是静默的。
+    #[tokio::test]
+    async fn a_degraded_plan_never_lets_tun_start() {
+        let p = plan("https://x.com/", 18443, 0, "/nonexistent".into(), None).await;
+        assert!(p.upstream.is_none(), "降级路径压根没解析");
+        assert!(
+            !p.tun_may_start(),
+            "没有真实 IP 就没有 bypass —— 拉起 TUN 必成环路"
+        );
+    }
+
+    /// 钩子失败 ⇒ **条带照常，TUN 不起**。
+    ///
+    /// 两件事必须分开：转发器与 hosts 服务的是混合端口入口，没道理因为
+    /// TUN 起不来就把代理整个关掉；但 bypass 没写成也绝不能拉 TUN。
+    #[test]
+    fn a_failing_bypass_hook_is_recorded_rather_than_swallowed() {
+        let p = ShardPlan {
+            page_url: "https://x.com/".into(),
+            session_bases: vec![None],
+            guard: None,
+            upstream: Some("203.0.113.7:443".parse().unwrap()),
+            bypass_error: Some("must be root to alter routing table".into()),
+        };
+        assert!(!p.tun_may_start(), "bypass 写失败却允许拉 TUN —— 这正是环路");
+        // 解析成功且钩子也成功时才放行。
+        let ok = ShardPlan {
+            bypass_error: None,
+            ..p
+        };
+        assert!(ok.tun_may_start());
+    }
+
+    /// 钩子**排在解析之后**：还没解析就返回的路径上，它一次都不该被调用。
+    ///
+    /// 这是 §8.3.2 第 2 步位置正确的直接证据 —— 钩子若被挪到解析之前，
+    /// 它根本拿不到地址可写，只能写进一条指向虚空的 bypass 路由。
+    #[tokio::test]
+    async fn the_hook_is_not_called_on_paths_that_never_resolve() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<std::net::SocketAddr>::new()));
+        let s = seen.clone();
+        let hook: UpstreamHook = Arc::new(move |addr| {
+            s.lock().unwrap().push(addr);
+            Ok(())
+        });
+        // extra_sessions = 0 ⇒ 在解析之前就返回。
+        let p = plan("https://x.com/", 18443, 0, "/nonexistent".into(), Some(hook)).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "还没解析就调钩子的话，它拿不到任何地址可写"
+        );
+        assert!(!p.tun_may_start());
     }
 }

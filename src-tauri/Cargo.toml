@@ -35,6 +35,10 @@ wsieve-inbound = { path = "../crates/wsieve-inbound" }
 wsieve-route = { path = "../crates/wsieve-route" }
 wsieve-geo = { path = "../crates/wsieve-geo" }
 wsieve-dns = { path = "../crates/wsieve-dns" }
+# TUN 入口的全部纯逻辑（fake-ip / bypass / 路由构造 / 启动顺序）。
+# src-tauri 侧只有 tun.rs 那一层薄编排 —— 判决逻辑必须留在 crate 里才能在
+# `cargo test` 里穷举，而 src-tauri 拖着整个 Tauri（设计文档 §8.3 的分层理由）。
+wsieve-tun = { path = "../crates/wsieve-tun" }
 # 配置的读、校验与「保留注释的定点改写」全在这个 crate 里（设计文档 §5.6）。
 # 命令面**不得**另起一套配置读写：写回若走 serde 序列化，用户手写的规则注释
 # 会在 UI 点一次开关之后全部消失 —— 而那正是 §5.1 选择 YAML 的唯一理由。
