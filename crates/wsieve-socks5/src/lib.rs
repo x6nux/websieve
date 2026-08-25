@@ -31,9 +31,21 @@ pub async fn serve(
         let handler = handler.clone();
         tokio::spawn(async move {
             // 协议/IO 错误按 RFC 语义已尽量在流内回复；此处静默收尾。
-            let _ = handle_conn(tcp, handler).await;
+            let _ = serve_conn(tcp, handler).await;
         });
     }
+}
+
+/// 在**单条**已建立的连接上终止 SOCKS5 协议。
+///
+/// 与 [`serve`] 的区别只是不含 accept 循环。混合端口入口（wsieve-inbound）
+/// 需要它：那边先嗅探首字节判定协议族，再把连接交给对应的处理器，
+/// accept 循环由入口自己持有。
+pub async fn serve_conn(
+    tcp: TcpStream,
+    handler: impl Fn(AddrPort) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>>,
+) -> anyhow::Result<()> {
+    handle_conn(tcp, handler).await
 }
 
 async fn handle_conn(

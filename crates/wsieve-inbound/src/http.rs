@@ -8,6 +8,26 @@
 //! 升级路径：要支持 keep-alive 就得完整解析每一轮请求（后续请求
 //! 仍是绝对 URI 形式），届时引入 httparse 而不是手写。
 
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use wsieve_proto::addr::{AddrPort, TargetAddr};
+
+/// 请求头（含请求行）总字节上限。
+///
+/// 混合端口对内网开放，任何人都能连上来。没有上限的话，一个只发头
+/// 不发空行的客户端能把内存喂到 OOM —— 一条连接拖垮整个进程。
+pub const MAX_HEAD_BYTES: usize = 64 * 1024;
+
+/// 读完整个请求头的时间上限。
+///
+/// 与 [`crate::sniff::DEFAULT_SNIFF_TIMEOUT`] 是两道不同的闸：嗅探那道
+/// 只保证「说了第一个字节」，这道保证「把头说完了」。慢速头攻击
+/// （Slowloris）正是卡在两者之间 —— 每隔几秒挤出一个字节。
+pub const HEAD_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum HttpRequest {
     Connect {
@@ -97,6 +117,185 @@ fn split_host_port(s: &str, default: u16) -> Result<(String, u16), HttpError> {
             Ok((s.to_string(), default))
         }
     }
+}
+
+/// 把 `host:port` 转成下游判决层要的 [`AddrPort`]。
+///
+/// 主机是 IP 字面量时转成 V4/V6，否则当域名。域名长度受 SOCKS5 地址
+/// 编码限制（一字节长度前缀），超过 255 的直接拒绝而不是截断 ——
+/// 截断出来的域名会指向一个完全不同的地方。
+pub fn to_addr_port(host: &str, port: u16) -> Result<AddrPort, HttpError> {
+    let addr = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => TargetAddr::V4(v4.octets()),
+        Ok(std::net::IpAddr::V6(v6)) => TargetAddr::V6(v6.octets()),
+        Err(_) => {
+            if host.is_empty() || host.len() > 255 {
+                return Err(HttpError::BadRequestLine(host.into()));
+            }
+            TargetAddr::Domain(host.to_string())
+        }
+    };
+    Ok(AddrPort { addr, port })
+}
+
+/// 读到 `\r\n\r\n` 为止的请求头。
+///
+/// 返回 (头部字节, 头部之后已经读到的字节)。第二项不能丢：客户端常常
+/// 把头和紧随其后的载荷放在同一个 TCP 分段里发出（CONNECT 之后抢跑的
+/// TLS ClientHello、POST 的请求体）。丢掉它请求就会莫名其妙地卡住。
+async fn read_head(tcp: &mut TcpStream) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(i) = find_head_end(&buf) {
+            let rest = buf.split_off(i);
+            return Ok((buf, rest));
+        }
+        if buf.len() >= MAX_HEAD_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("请求头超过上限 {MAX_HEAD_BYTES} 字节仍未结束"),
+            ));
+        }
+        let n = match tokio::time::timeout(HEAD_READ_TIMEOUT, tcp.read(&mut chunk)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("读取请求头超过 {HEAD_READ_TIMEOUT:?} 未完成"),
+                ))
+            }
+        };
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "请求头未结束对端即关闭",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// 找到 `\r\n\r\n` 之后的位置。返回 None 表示头还没读完。
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// 把头部拆成请求行与其余头字段行。
+fn split_head(head: &str) -> Option<(&str, Vec<&str>)> {
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next()?;
+    Some((request_line, lines.filter(|l| !l.is_empty()).collect()))
+}
+
+/// 转发给上游的头字段：剔除逐跳字段，注入 `Connection: close`。
+///
+/// `Proxy-Connection` / `Proxy-Authorization` 是代理与客户端之间的事，
+/// 原样透传给源站等于把代理的存在泄漏出去。
+fn rebuild_headers(fields: &[&str]) -> String {
+    let mut out = String::new();
+    for line in fields {
+        let name = line.split(':').next().unwrap_or("").trim();
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("proxy-authorization")
+            || name.eq_ignore_ascii_case("keep-alive")
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    // ponytail 的上限在此显形：一条连接一个请求，所以显式 close
+    out.push_str("Connection: close\r\n");
+    out
+}
+
+/// 在单条已建立的连接上处理一个 HTTP 代理请求。
+///
+/// 失败一律给客户端一个合乎 HTTP 语义的响应再关闭，而不是静默断开 ——
+/// 设计文档 §6.4：拒绝要让客户端明确知道。
+pub async fn serve_conn(mut tcp: TcpStream, dispatch: crate::Dispatch) -> anyhow::Result<()> {
+    let (head, mut leftover) = match read_head(&mut tcp).await {
+        Ok(v) => v,
+        Err(e) => {
+            // 头都没读完，能回什么取决于错在哪；一律给 400 好过什么都不说
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return Err(e.into());
+        }
+    };
+
+    let head_str = match std::str::from_utf8(&head) {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            anyhow::bail!("请求头不是合法 UTF-8");
+        }
+    };
+    let Some((request_line, fields)) = split_head(head_str) else {
+        let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        anyhow::bail!("请求头为空");
+    };
+
+    let parsed = match parse_request_line(request_line) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return Err(e.into());
+        }
+    };
+
+    let (target, upstream_prelude) = match parsed {
+        HttpRequest::Connect { host, port } => (to_addr_port(&host, port), None),
+        HttpRequest::Plain {
+            host,
+            port,
+            rewritten,
+        } => {
+            let mut prelude = String::with_capacity(head_str.len() + 32);
+            prelude.push_str(&rewritten);
+            prelude.push_str("\r\n");
+            prelude.push_str(&rebuild_headers(&fields));
+            prelude.push_str("\r\n");
+            (to_addr_port(&host, port), Some(prelude))
+        }
+    };
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+            return Err(e.into());
+        }
+    };
+    let is_connect = upstream_prelude.is_none();
+
+    let mut upstream = match dispatch(target).await {
+        Ok(s) => s,
+        Err(e) => {
+            // 判决为拒绝、或出站不可用。§6.4：拒绝而非静默回退，
+            // 且要让客户端知道是代理侧拒绝的，不是网络抽风。
+            tcp.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            return Err(e.into());
+        }
+    };
+
+    if is_connect {
+        tcp.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+    } else if let Some(prelude) = upstream_prelude {
+        upstream.write_all(prelude.as_bytes()).await?;
+    }
+
+    // 头之后已读到的字节要补给上游：CONNECT 场景是客户端抢跑的载荷，
+    // 普通请求场景是请求体。这两类都不在 copy_bidirectional 的视野里，
+    // 因为它们早已离开了 socket 缓冲区。
+    if !leftover.is_empty() {
+        upstream.write_all(&leftover).await?;
+        leftover.clear();
+    }
+
+    tokio::io::copy_bidirectional(&mut tcp, &mut upstream).await?;
+    Ok(())
 }
 
 #[cfg(test)]
