@@ -1,0 +1,133 @@
+/* websieve 设计 token —— 设计文档 §11.4 的逐条落地。
+ *
+ * 阶段 5 的全部视图只许引用这里的变量，不许现场写 #xxxxxx 或 12px。
+ * 理由是 §11.4 的「颜色纪律」：约 90% 屏幕为中性结构色，彩色只出现在
+ * 出站色码与状态色上。这条纪律靠人自觉守不住，靠「能取到的只有这些」守得住。
+ */
+
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+:root {
+  /* ── 表面：单一色相只移明度，每级 4–7% ───────────────── */
+  --surface-0: #16181b; /* 画布 */
+  --surface-1: #1c1f23; /* 行/面板 */
+  --surface-2: #23272c; /* 悬浮/选中 */
+
+  /* ── 边框：borders-only 深度策略，不混用阴影（浮层除外）── */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  /* ── 文本四级 ─────────────────────────────────────── */
+  --text-1: #e6e8ea; /* 主要 */
+  --text-2: #a4abb3; /* 次要 */
+  --text-3: #6f777f; /* 弱化 */
+  --text-4: #4d545b; /* 极弱（占位、禁用） */
+
+  /* ── 状态色 ───────────────────────────────────────── */
+  --state-live: #3fb27f;
+  --state-warn: #d99a3f;
+  --state-fail: #d1595c;
+  --state-direct: #7d8894;
+
+  /* ── 出站色码：界面中唯一允许的彩色 ───────────────── */
+  --outbound-1: #5b8ff9;
+  --outbound-2: #61ddaa;
+  --outbound-3: #f6bd16;
+  --outbound-4: #7262fd;
+  --outbound-5: #78d3f8;
+  --outbound-6: #f6903d;
+  --outbound-7: #008685;
+  --outbound-8: #f08bb4;
+
+  /* ── 命中热度染色（§11.5 signature ①）───────────────
+   * 用中性色而非出站色，避免与出站色码语义冲突。
+   * 阶段 5 按命中数归一化后在 min..max 之间插值。 */
+  --heat-min: rgba(255, 255, 255, 0.014);
+  --heat-max: rgba(255, 255, 255, 0.052);
+
+  /* ── 字体：IBM Plex，不用 Inter ─────────────────────
+   * 理由见 §11.4：Plex 有 IBM 技术文档的工程血统，同族搭配气质统一。 */
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, system-ui,
+    sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* ── 字阶：1.25 / 14px base。层级靠字重+颜色，不靠字号 ── */
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+  --fs-22: 22px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* ── 间距：基数 4px ───────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ── 密度：§11.4 钉死的行高 ───────────────────────── */
+  --row-rule: 32px; /* 规则行 */
+  --row-outbound: 38px; /* 出站行 */
+
+  /* ── 浮层是 borders-only 的唯一例外 ─────────────────── */
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --radius: 4px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--surface-0);
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-size: var(--fs-14);
+  font-weight: var(--fw-regular);
+  line-height: 1.45;
+  /* 密集界面里默认的字距过松 */
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 数字必须能对齐成列（§11.4：延迟与会话数用 tabular-nums 对齐） */
+.mono,
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 键盘可达性：桑基图的无障碍评级已经是 C（§11.6），
+ * 焦点环这种白送的东西不能再丢。 */
+:focus-visible {
+  outline: 2px solid var(--outbound-1);
+  outline-offset: 1px;
+}
+
+/* §11.6 明确要求：reduced-motion 下流带宽度直接跳变 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
