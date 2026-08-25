@@ -19,7 +19,6 @@
    * ③ **保存失败必须回滚并说出来**。乐观更新 + 静默失败 = 列表显示的顺序
    *    与文件里的顺序不一致，而分流结果只认后者。那比不让排序更糟。
    */
-  import { tick } from 'svelte';
   import Probe from './Probe.svelte';
   import EmptyState from './EmptyState.svelte';
   import { heatColor } from '../lib/heat.js';
@@ -59,6 +58,39 @@
    * 两者的播报时机会互相打断，屏幕阅读器只会读到后到的那一条。
    */
   let announcement = $state('');
+
+  /**
+   * 排序后要把焦点找回来的那条规则（纪律②的另一半）。
+   *
+   * **移动 DOM 节点会让它失去焦点。** 带 key 的 `{#each}` 重排时走的是
+   * `insertBefore`，而把一个已在文档里的元素 insertBefore 到别处，等价于
+   * 先移除再插入 —— 焦点随即落回 `<body>`。实测：按一次 Alt+↓ 之后
+   * `document.activeElement` 就是 `body` 了，**第二次按键根本没有接收者**，
+   * 键盘排序在第一步之后就断了。所以焦点必须手工找回。
+   *
+   * 三个刻意的选择，每一个都是踩出来的：
+   *
+   * - **按 id 找，不按下标。** 下标会取到还没重排的那一行，把焦点抢到
+   *   隔壁规则上 —— 用户再按一次，改的就是他没打算改的那条。
+   * - **普通变量而非 `$state`。** 写成 `$state` 会让「记下待聚焦项」这个
+   *   赋值本身就触发下面那个 effect，而那一刻 DOM 还没重排：聚焦的是
+   *   马上要被移动的节点，随后的重排照样把它 blur 掉，等于没做。
+   *   只让 `rules` 与 `tbodyEl` 当触发源。
+   * - **`tbodyEl` 必须是 `$state`。** `bind:this` 的赋值若不是响应式的，
+   *   effect 在它还是 null 时跑过一次就再也不会重跑，焦点永远找不回来。
+   */
+  let pendingFocus = null;
+  let tbodyEl = $state(null);
+
+  $effect(() => {
+    // 读这两个建立依赖：DOM 重排完（rules 换了新引用）之后这个 effect 才重跑
+    void rules;
+    const tb = tbodyEl;
+    if (pendingFocus === null || !tb) return;
+    const el = tb.querySelector(`.handle[data-rule-id="${pendingFocus}"]`);
+    pendingFocus = null;
+    el?.focus();
+  });
 
   function chip(target) {
     if (target === 'DIRECT') return 'var(--state-direct)';
@@ -102,17 +134,18 @@
    * 排序的唯一出口。拖拽与 Alt+↑/↓ 都走这里 ——
    * 两条路径若各自实现，迟早有一条先被改而另一条不知道。
    */
-  async function commitMove(from, to) {
-    const moved = rules[from];
+  function commitMove(from, to) {
+    // 名字与总数在**动手之前**取。排序由父组件回传新数组完成，
+    // `onreorder` 返回时 `rules` 还是旧的那一份，事后再读会读到过期状态；
+    // 而移动一次不改变条数，总数用旧的那份也是对的。
+    const label = ruleLabel(rules[from]);
+    const total = rules.length;
     onreorder(from, to);
-    // 播报要等 DOM 更新后再发：更新前发的内容会被随后的重排覆盖，
-    // 屏幕阅读器读到的是旧位置。
-    await tick();
-    announcement = positionAnnouncement(to, rules.length, ruleLabel(moved));
+    announcement = positionAnnouncement(to, total, label);
   }
 
   /** 拖拽的键盘等价物：Alt+↑/↓。没有它，排序对键盘用户等于不存在。 */
-  async function onHandleKey(e, i) {
+  function onHandleKey(e, i) {
     if (!e.altKey) return;
     if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
     e.preventDefault();
@@ -122,13 +155,10 @@
       announcement = e.key === 'ArrowUp' ? '已在最前，无法再上移。' : '已在最后，无法再下移。';
       return;
     }
-    const handle = e.currentTarget;
-    await commitMove(i, r.index);
-    // 焦点跟到移动后的位置（reorder.js 的 keyboardMove 返回新 index 就是为了这个）。
-    // DOM 按 key 重排后，原节点可能已被复用给别的行 —— 按新位置重新取。
-    await tick();
-    const rows = handle.closest('tbody')?.querySelectorAll('.handle');
-    rows?.[r.index]?.focus();
+    // 焦点会因 DOM 重排而丢失（见 pendingFocus 的注释）。记下这条规则的 id，
+    // 等父组件把新数组传回来、DOM 重排完之后再按 id 找回来。
+    pendingFocus = rules[i].id;
+    commitMove(i, r.index);
   }
 </script>
 
@@ -179,7 +209,7 @@
           <th scope="col"><span class="sr-only">启用</span></th>
         </tr>
       </thead>
-      <tbody>
+      <tbody bind:this={tbodyEl}>
         {#each rules as r, i (r.id)}
           <tr
             style:background={probing ? undefined : heatColor(r.hits, maxHits)}
@@ -195,6 +225,7 @@
 
             <td class="mark">
               <button type="button" class="handle"
+                      data-rule-id={r.id}
                       aria-label={`移动规则 ${ruleLabel(r)}，当前第 ${i + 1} 条，共 ${rules.length} 条。按 Alt 加上下方向键调整顺序`}
                       draggable="true"
                       ondragstart={(e) => onDragStart(e, i)}

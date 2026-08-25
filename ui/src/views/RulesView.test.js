@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import RulesView from './RulesView.svelte';
+import { move } from '../lib/reorder.js';
 
 const rules = [
   { id: 1, type: 'geosite', value: 'category-ads', target: 'REJECT', hits: 18204, enabled: true },
@@ -287,5 +288,116 @@ describe('探针未就绪时规则视图仍可用', () => {
     const rows = [...container.querySelectorAll('tbody tr')];
     // jsdom 会把 style 属性里的 rgba 规范化成带空格的写法，正则得容忍
     expect(rows[4].getAttribute('style')).toMatch(/rgba\(255,\s*255,\s*255,\s*0\.05/);
+  });
+});
+
+describe('键盘排序的端到端 —— 列表真的重排之后还得能继续按', () => {
+  // 上面那组用的是 mock 的 onreorder，列表**从不改变**，
+  // 于是「移动之后焦点还在不在」这条路径一次都没被走过。
+  // 而它恰恰是键盘排序最容易断的地方：带 key 的 {#each} 重排走 insertBefore，
+  // 把一个已在文档里的元素 insertBefore 到别处等价于先移除再插入，
+  // 焦点随即落回 <body> —— 第二次按键连接收者都没有。
+  const seed = () => [
+    { id: 1, type: 'geosite', value: 'a', target: 'DIRECT', hits: 5, enabled: true },
+    { id: 2, type: 'suffix', value: 'b', target: 'JP', hits: 3, enabled: true },
+    { id: 3, type: 'keyword', value: 'c', target: 'JP', hits: 1, enabled: true },
+  ];
+
+  /** 一个会真的把新数组传回来的父级，与 App.svelte 的 reorder 同形 */
+  function mountLive() {
+    let rules = seed();
+    const props = {
+      rules,
+      colorOf: () => '#5b8ff9',
+      probe: null,
+      ontest: vi.fn(),
+      ontoggle: vi.fn(),
+      onreorder: (f, t) => {
+        rules = move(rules, f, t);
+      },
+    };
+    const r = render(RulesView, props);
+    return {
+      ...r,
+      order: () => rules.map((x) => x.value),
+      sync: () => r.rerender({ rules }),
+    };
+  }
+
+  it('连按两次 Alt+↓ 能把首条一路移到第三位', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'a', 'c']);
+
+    // 第二次按键：焦点若已丢到 body，这一按就什么都不会发生
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'c', 'a']);
+  });
+
+  it('重排后焦点仍在**同一条规则**的把手上，没被抢到隔壁', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+
+    // 焦点必须还在 id=1（value 'a'）那条上，且它现在是第 2 条。
+    // 按下标找回焦点的实现会在这里把焦点放到 id=2 上 ——
+    // 用户再按一次，改的就是他没打算改的那条规则。
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '1');
+    expect(document.activeElement.getAttribute('aria-label')).toMatch(/第 2 条/);
+  });
+
+  it('Alt+↑ 往回移同样能连按', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[2].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['a', 'c', 'b']);
+
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['c', 'a', 'b']);
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '3');
+  });
+
+  it('撞到边界后焦点不丢，还能改方向继续移', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}'); // 首项上移：到头了
+    await v.sync();
+    expect(v.order()).toEqual(['a', 'b', 'c']);
+    // 到头不该把焦点弄丢，否则用户得重新 Tab 回来
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '1');
+
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'a', 'c']);
+  });
+
+  it('播报的名次跟着每一次移动更新', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+    const live = () => v.container.querySelector('[aria-live="polite"][role="status"]').textContent;
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(live()).toMatch(/第 2 条/);
+
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(live()).toMatch(/第 3 条/);
+    expect(live()).toMatch(/最后/);
   });
 });
