@@ -148,6 +148,13 @@ pub struct OutboundInstance {
     state: OutboundState,
     /// 请求立刻重来一轮（UI 的「重连」按钮 / 配置变更）。
     restart: Notify,
+    /// 「本出站刚连上了」的广播。分派层在出站处于 `Connecting` 时短暂排队
+    /// 等它，免得应用刚启动那几秒里所有请求都被拒。
+    ///
+    /// 与 `restart` 分成两个 `Notify` 而不是复用一个：一个是「外面要我重来」，
+    /// 一个是「我连上了」，方向相反。混用会让等待方被重连请求误唤醒，
+    /// 于是它以为出站已就绪，实际拿到的仍是 `None`。
+    connected: Notify,
     /// 请求彻底停下（出站被禁用 / 应用退出）。
     stopping: AtomicBool,
 }
@@ -159,6 +166,7 @@ impl OutboundInstance {
             dialer: RwLock::new(None),
             state: OutboundState::default(),
             restart: Notify::new(),
+            connected: Notify::new(),
             stopping: AtomicBool::new(false),
         })
     }
@@ -194,9 +202,39 @@ impl OutboundInstance {
         self.restart.notify_one();
     }
 
+    /// 等到本出站连上（或至少走完一轮握手尝试）。
+    ///
+    /// **已经连上时立即返回** —— 否则「先查状态、再进来等」这个常见序列会
+    /// 在两步之间错过唤醒，一路等到调用方的超时。
+    ///
+    /// 注意它只是唤醒时机，**不是可用性判据**：醒来后调用方仍必须看
+    /// `dialer()`。状态好看不等于能用（§6.4）。
+    pub async fn wait_connected(&self) {
+        if self.dialer().is_some() {
+            return;
+        }
+        self.connected.notified().await;
+    }
+
     fn set_status(&self, env: &SessionEnv, s: Status) {
         (env.on_status)(&self.cfg.name, &s);
         self.state.set(s);
+    }
+
+    /// 直接摆一个状态，**仅测试可用**。
+    ///
+    /// 会话循环需要真的握手才会走到 `Connecting`/`Connected`，而分派层的
+    /// 「排队等待」分支恰恰要在这些状态下验证。用 `#[cfg(test)]` 而不是
+    /// 公开 API：让生产代码在编译期就够不着它，状态的唯一写入者仍是循环本身。
+    #[cfg(test)]
+    pub fn force_status_for_test(&self, s: Status) {
+        self.state.set(s);
+    }
+
+    /// 发一次「已连上」广播，**仅测试可用**。
+    #[cfg(test)]
+    pub fn notify_connected_for_test(&self) {
+        self.connected.notify_waiters();
     }
 
     /// 会话循环。`core` 由管理器提供，**多个出站共享同一份**（shared 承载）。
@@ -229,6 +267,10 @@ impl OutboundInstance {
                     let sessions = dialer.session_count();
                     *self.dialer.write().unwrap() = Some(dialer);
                     self.set_status(&env, Status::Connected { sessions });
+                    // 唤醒在 `wait_connected()` 上排队的分派请求。必须在装好
+                    // dialer **之后**发，否则被唤醒的一方查 `dialer()` 仍是
+                    // None，白等一场还得到「不可用」。
+                    self.connected.notify_waiters();
 
                     // 等本出站的会话全部死掉（或被叫停/要求重连）。
                     // 注意不等 core —— core 的死亡由管理器感知并广播。
@@ -262,6 +304,10 @@ impl OutboundInstance {
                             reason: format!("{e:#}"),
                         },
                     );
+                    // 也要唤醒排队的分派请求：这一轮已有定论（失败），
+                    // 让它们空等到超时只是把一个已知的坏消息拖慢报出来。
+                    // 醒来后它们查 `dialer()` 仍是 None，照常被拒。
+                    self.connected.notify_waiters();
                 }
             }
 

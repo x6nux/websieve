@@ -97,10 +97,35 @@ pub enum GeoWarning {
 ///
 /// 行号必须随规则一起存下来：`rules` 里没有注释与空行，下标早已与
 /// 用户看到的行号对不上，而 GEO 告警要能把 UI 的光标定到出错那一行。
+///
+/// `text` 存的是用户写的原文（已 trim）。它服务于「交给阶段 4/5 的数据
+/// 契约」：流量视图的桑基图中层要显示「是哪条规则把它送去了这个出站」，
+/// 而判决完就丢掉的话，前端无从反推。由 `Rule` 反向拼回文本会丢掉
+/// 大小写与空格的原貌 —— 用户在 UI 上认的就是自己写的那一行。
 #[derive(Debug)]
 struct Entry {
     rule: Rule,
     line: usize,
+    text: String,
+}
+
+/// 做出判决的那条规则。
+///
+/// `None`（在 `Explained::hit` 里）表示无规则参与：mode 短路，或
+/// 规则表扫穿后落到兜底。两者都不是「某条规则命中」，不能假装是。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleHit {
+    /// 用户配置里的行号（注释与空行也占号）。
+    pub line: usize,
+    /// 规则原文。
+    pub text: String,
+}
+
+/// `evaluate` 的结果，外加「是哪条规则做的判决」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explained {
+    pub verdict: Verdict,
+    pub hit: Option<RuleHit>,
 }
 
 /// 已加载的规则集，供 evaluate() 使用。
@@ -152,7 +177,11 @@ impl RuleSet {
             if rule.kind == RuleKind::Match {
                 fallback = Some(Decision::from(&rule.target));
             }
-            rules.push(Entry { rule, line });
+            rules.push(Entry {
+                rule,
+                line,
+                text: raw.trim().to_string(),
+            });
         }
 
         let fallback = fallback.ok_or(BuildError::MissingMatch)?;
@@ -185,6 +214,21 @@ impl RuleSet {
 
     pub fn global_target(&self) -> &Decision {
         &self.global
+    }
+
+    /// 有多少条规则**会对域名目标触发 DNS 解析**（IP 类且未带 `no-resolve`）。
+    ///
+    /// 用途只有一个：调用方在没有接入解析器时，据此判断「这份配置里有几条
+    /// 规则暂时不会生效」并如实告警。零解析器 + 有 IP 类规则 = 那些规则对
+    /// 域名目标一律不匹配 —— 语义正确但覆盖面小，而**用户必须看得见**这件事，
+    /// 否则他会以为 `GEOIP,CN,DIRECT` 正在生效。
+    pub fn resolving_rule_count(&self) -> usize {
+        self.rules
+            .iter()
+            .filter(|e| {
+                matches!(e.rule.kind, RuleKind::IpCidr | RuleKind::GeoIp) && !e.rule.no_resolve
+            })
+            .count()
     }
 
     /// 加载期的 GEO 引用校验（设计文档 §12）。
@@ -287,10 +331,36 @@ impl RuleSet {
         resolved: Option<&[IpAddr]>,
         geo: &GeoDb,
     ) -> Verdict {
-        // mode 短路
+        self.evaluate_explained(target, resolved, geo).verdict
+    }
+
+    /// 与 `evaluate` 完全同一套逻辑，额外带回**是哪条规则**做的判决。
+    ///
+    /// 分成两个方法而不是让 `evaluate` 直接返回 `Explained`：绝大多数调用方
+    /// （含全部既有测试与 UI 的规则试算）只关心判决本身，多一层解包纯属噪音。
+    /// 而流量视图必须拿到规则原文（见阶段 2 计划「交给阶段 4/5 的数据契约」）
+    /// —— 判决完就丢掉的话，前端无从反推是哪条规则让它走这条路的。
+    pub fn evaluate_explained(
+        &self,
+        target: &AddrPort,
+        resolved: Option<&[IpAddr]>,
+        geo: &GeoDb,
+    ) -> Explained {
+        // mode 短路。此时没有任何规则参与判决，`hit` 只能是 None ——
+        // 硬塞一条规则进去会让 UI 显示一条根本没被执行的规则。
         match self.mode {
-            Mode::Direct => return Verdict::Decided(Decision::Direct),
-            Mode::Global => return Verdict::Decided(self.global.clone()),
+            Mode::Direct => {
+                return Explained {
+                    verdict: Verdict::Decided(Decision::Direct),
+                    hit: None,
+                }
+            }
+            Mode::Global => {
+                return Explained {
+                    verdict: Verdict::Decided(self.global.clone()),
+                    hit: None,
+                }
+            }
             Mode::Rule => {}
         }
 
@@ -303,8 +373,17 @@ impl RuleSet {
 
         for entry in &self.rules {
             let rule = &entry.rule;
+            let decided_by = || {
+                Some(RuleHit {
+                    line: entry.line,
+                    text: entry.text.clone(),
+                })
+            };
             if rule.kind == RuleKind::Match {
-                return Verdict::Decided(Decision::from(&rule.target));
+                return Explained {
+                    verdict: Verdict::Decided(Decision::from(&rule.target)),
+                    hit: decided_by(),
+                };
             }
 
             // 每个 kind 独占一个 arm，穷举性由编译器静态保证，无需 unreachable!()
@@ -344,8 +423,13 @@ impl RuleSet {
                         }
                         match resolved {
                             None => {
-                                return Verdict::NeedResolve {
-                                    domain: domain.clone().unwrap_or_default(),
+                                return Explained {
+                                    verdict: Verdict::NeedResolve {
+                                        domain: domain.clone().unwrap_or_default(),
+                                    },
+                                    // 还没判决，谈不上「哪条规则命中」——
+                                    // 这条只是**触发**了解析。
+                                    hit: None,
                                 };
                             }
                             Some(ips) => ips,
@@ -362,8 +446,11 @@ impl RuleSet {
                         }
                         match resolved {
                             None => {
-                                return Verdict::NeedResolve {
-                                    domain: domain.clone().unwrap_or_default(),
+                                return Explained {
+                                    verdict: Verdict::NeedResolve {
+                                        domain: domain.clone().unwrap_or_default(),
+                                    },
+                                    hit: None,
                                 };
                             }
                             Some(ips) => ips,
@@ -381,12 +468,19 @@ impl RuleSet {
             };
 
             if hit {
-                return Verdict::Decided(Decision::from(&rule.target));
+                return Explained {
+                    verdict: Verdict::Decided(Decision::from(&rule.target)),
+                    hit: decided_by(),
+                };
             }
         }
 
-        // build() 已保证 MATCH 存在，正常走不到这里；保底仍用 fallback
-        Verdict::Decided(self.fallback.clone())
+        // build() 已保证 MATCH 存在，正常走不到这里；保底仍用 fallback。
+        // 没有规则命中，`hit` 只能是 None。
+        Explained {
+            verdict: Verdict::Decided(self.fallback.clone()),
+            hit: None,
+        }
     }
 }
 

@@ -489,3 +489,114 @@ fn geo_warnings_never_block_evaluation() {
     );
 }
 
+
+// ── 判决出处：交给阶段 4/5 的数据契约 ──
+//
+// 流量视图的桑基图中层要显示「是哪条规则把这条流送去了这个出站」。
+// 这几条锁住的是：命中的规则原文与行号能被带出判决路径。判决完就丢掉的话，
+// 前端再也拿不到 —— 事后补采集要么做不到，要么要把判决重跑一遍。
+
+#[test]
+fn a_decision_carries_the_rule_that_made_it() {
+    let set = rs(
+        &[
+            "# 注释也占行号",
+            "DOMAIN-SUFFIX,google.com,日本节点",
+            "MATCH,DIRECT",
+        ],
+        &["日本节点"],
+    );
+    let e = set.evaluate_explained(&domain("www.google.com", 443), None, &geo_stub());
+    assert_eq!(decided(e.verdict), Decision::Outbound("日本节点".into()));
+    let hit = e.hit.expect("命中规则必须带出出处");
+    assert_eq!(hit.text, "DOMAIN-SUFFIX,google.com,日本节点");
+    assert_eq!(hit.line, 2, "行号按用户看到的算，注释也占号");
+}
+
+#[test]
+fn the_fallback_match_is_itself_a_rule_hit() {
+    // MATCH 是用户显式写下的一行，它做出的判决同样要能反查到出处。
+    let set = rs(&["DOMAIN,a.com,DIRECT", "MATCH,日本节点"], &["日本节点"]);
+    let e = set.evaluate_explained(&domain("nothing-matches.example", 443), None, &geo_stub());
+    assert_eq!(decided(e.verdict), Decision::Outbound("日本节点".into()));
+    assert_eq!(e.hit.expect("MATCH 也是规则").text, "MATCH,日本节点");
+}
+
+#[test]
+fn mode_shortcuts_report_no_rule_hit() {
+    // global / direct 模式下没有任何规则被执行。硬塞一条进去，
+    // UI 就会显示一条其实没跑过的规则 —— 那是在编造证据。
+    let known: HashSet<String> = ["日本节点"].iter().map(|s| s.to_string()).collect();
+    for mode in [Mode::Global, Mode::Direct] {
+        let set = RuleSet::build(
+            &["DOMAIN,a.com,DIRECT".to_string(), "MATCH,日本节点".to_string()],
+            mode,
+            "",
+            &known,
+        )
+        .unwrap();
+        let e = set.evaluate_explained(&domain("a.com", 443), None, &geo_stub());
+        assert!(e.hit.is_none(), "{mode:?} 模式不该报告规则命中：{:?}", e.hit);
+    }
+}
+
+#[test]
+fn need_resolve_is_not_a_rule_hit() {
+    // NeedResolve 时还没有判决，那条 IP 规则只是**触发**了解析而非命中它。
+    let set = rs(&["GEOIP,CN,DIRECT", "MATCH,日本节点"], &["日本节点"]);
+    let e = set.evaluate_explained(&domain("a.com", 443), None, &geo_stub());
+    assert!(matches!(e.verdict, Verdict::NeedResolve { .. }));
+    assert!(e.hit.is_none(), "尚未判决，不能算命中");
+}
+
+#[test]
+fn explained_and_plain_evaluate_never_disagree() {
+    // evaluate 现在是 evaluate_explained 的薄包装。若哪天有人给其中一条
+    // 加了分支而忘了另一条，判决与「规则试算」就会开始给出不同答案。
+    let set = rs(
+        &[
+            "DST-PORT,22,REJECT",
+            "DOMAIN-KEYWORD,ads,REJECT",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "MATCH,日本节点",
+        ],
+        &["日本节点"],
+    );
+    let geo = geo_stub();
+    let cases = [
+        domain("x.com", 22),
+        domain("some-ads-host.com", 443),
+        domain("plain.example", 443),
+        ipv4([10, 1, 2, 3], 443),
+        ipv4([1, 1, 1, 1], 80),
+    ];
+    for t in cases {
+        assert_eq!(
+            set.evaluate(&t, None, &geo),
+            set.evaluate_explained(&t, None, &geo).verdict,
+            "两条路径对 {} 给出了不同判决",
+            t.display()
+        );
+    }
+}
+
+#[test]
+fn resolving_rules_are_counted_so_the_gap_can_be_reported() {
+    // 没接解析器时，这些规则对**域名**目标一条都不会命中。调用方据此告警
+    // —— 静默的覆盖面缺失比报错更危险：用户会以为 GEOIP,CN,DIRECT 在生效。
+    let set = rs(
+        &[
+            "DOMAIN,a.com,DIRECT",              // 不需要解析
+            "GEOIP,CN,DIRECT",                  // 需要
+            "IP-CIDR,1.0.0.0/8,DIRECT",         // 需要
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", // 明确说了不解析，不算
+            "DST-PORT,22,REJECT",               // 不需要
+            "MATCH,PROXY",
+        ],
+        &["PROXY"],
+    );
+    assert_eq!(set.resolving_rule_count(), 2);
+
+    let none = rs(&["DOMAIN,a.com,DIRECT", "MATCH,PROXY"], &["PROXY"]);
+    assert_eq!(none.resolving_rule_count(), 0, "无 IP 类规则时不该告警");
+}

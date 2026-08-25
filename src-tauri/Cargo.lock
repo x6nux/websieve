@@ -5733,11 +5733,34 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "tracing-subscriber",
+ "wsieve-geo",
+ "wsieve-inbound",
  "wsieve-mux",
  "wsieve-proto",
+ "wsieve-route",
  "wsieve-socks5",
  "wsieve-transport",
  "wsieve-xhttp",
+]
+
+[[package]]
+name = "wsieve-geo"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "wsieve-inbound"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "wsieve-proto",
+ "wsieve-socks5",
 ]
 
 [[package]]
@@ -5771,6 +5794,16 @@ dependencies = [
  "tokio",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "wsieve-route"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "thiserror 2.0.20",
+ "wsieve-geo",
+ "wsieve-proto",
 ]
 
 [[package]]

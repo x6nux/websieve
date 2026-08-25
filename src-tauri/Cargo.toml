@@ -17,6 +17,9 @@ wsieve-transport = { path = "../crates/wsieve-transport" }
 wsieve-xhttp = { path = "../crates/wsieve-xhttp" }
 wsieve-mux = { path = "../crates/wsieve-mux" }
 wsieve-socks5 = { path = "../crates/wsieve-socks5" }
+wsieve-inbound = { path = "../crates/wsieve-inbound" }
+wsieve-route = { path = "../crates/wsieve-route" }
+wsieve-geo = { path = "../crates/wsieve-geo" }
 
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["full"] }
