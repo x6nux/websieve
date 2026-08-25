@@ -7,3 +7,7 @@
 //! 之所以能这么拆：SOCKS5 与 HTTP CONNECT 本就把域名原样递过来，代理模式下
 //! 客户端无需解析即可路由转发。解析只在一处被需要 —— 让 GEOIP / IP-CIDR
 //! 这类规则对域名目标生效。那是内部查询，不是对外服务。
+
+pub mod upstream;
+
+pub use upstream::{parse_nameserver, UpstreamError};
