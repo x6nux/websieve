@@ -183,6 +183,12 @@
           "markdownDescription": "emitter IPC: heartbeat + raw frame channels (app commands)\n#### This default permission set includes:\n\n- `allow-wsieve-heartbeat`\n- `allow-wsieve-raw-post`\n- `allow-wsieve-raw-stream`"
         },
         {
+          "description": "允许控制窗口读取结构化配置（含 client-priv，仅本地 origin）",
+          "type": "string",
+          "const": "allow-config-get",
+          "markdownDescription": "允许控制窗口读取结构化配置（含 client-priv，仅本地 origin）"
+        },
+        {
           "description": "Allows the emitter heartbeat command",
           "type": "string",
           "const": "allow-wsieve-heartbeat",

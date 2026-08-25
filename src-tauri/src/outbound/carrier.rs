@@ -80,10 +80,13 @@ pub const SHARED_WINDOW: &str = "main";
 
 /// `isolated` 模式下每出站独占窗口的标签前缀。
 ///
-/// 注意 `src-tauri/capabilities/default.json` 目前只把 IPC 授权给
-/// `windows: ["main"]`。启用 `isolated` 时必须把 `wsieve-transport-*`
-/// 一并加进去，否则新窗口里的 emitter 一 invoke 就被 ACL 拒掉。
+/// `src-tauri/capabilities/transport.json` 的 `windows` 里必须同时有
+/// `wsieve-transport-*` 这条 glob，否则 `isolated` 下新窗口里的 emitter
+/// 一 invoke 就被 ACL 拒掉，表现为「出站永远握不上手」。
 /// 已实测 `glob::Pattern("wsieve-transport-*")` 能匹配含中文的标签。
+///
+/// 反过来这条 glob 也匹配不到控制窗口的 `control` 标签 —— 传输侧与控制侧
+/// 的权限面分家（capability 交集为空）正是靠这个前缀不重叠守住的。
 pub const ISOLATED_WINDOW_PREFIX: &str = "wsieve-transport-";
 
 impl CarrierPlan {
@@ -459,7 +462,7 @@ mod tests {
 
     #[test]
     fn isolated_window_labels_are_actually_granted_by_the_capability_file() {
-        // capabilities/default.json 用 glob 授权窗口。isolated 建的窗口若不在
+        // capabilities/transport.json 用 glob 授权窗口。isolated 建的窗口若不在
         // 授权表里，窗口里的 emitter 一 invoke 就被 ACL 拒掉，表现为「这个出站
         // 永远握不上手」—— 而且只在真跑起来时才暴露。
         //
@@ -467,9 +470,9 @@ mod tests {
         // 测试照样绿。
         let caps = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/capabilities/default.json"
+            "/capabilities/transport.json"
         ))
-        .expect("读不到 capabilities/default.json");
+        .expect("读不到 capabilities/transport.json");
         let caps: serde_json::Value = serde_json::from_str(&caps).unwrap();
         let patterns: Vec<glob::Pattern> = caps["windows"]
             .as_array()
@@ -484,7 +487,7 @@ mod tests {
         for (label, _) in c.windows() {
             assert!(
                 patterns.iter().any(|p| p.matches(&label)),
-                "isolated 的窗口 {label} 没有被 capabilities/default.json 授权"
+                "isolated 的窗口 {label} 没有被 capabilities/transport.json 授权"
             );
         }
         // shared 用的主窗口同样要在表里。

@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "control",
+  "description": "控制窗口 control：加载 tauri://localhost 的本地 Svelte 资产。授权配置与控制命令。绝不能有 remote 字段——一旦有，远端页面就能借这个 capability 读到含 client-priv 私钥的配置。permissions 随 Part B 的每个命令逐条加回，保持每一步都可构建、可测试。",
+  "windows": [
+    "control"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-config-get"
+  ],
+  "local": true
+}
