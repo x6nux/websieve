@@ -10,6 +10,7 @@ members = [
     "crates/wsieve-mux",
     "crates/wsieve-server",
     "crates/wsieve-socks5",
+    "crates/wsieve-inbound",
 ]
 
 [workspace.dependencies]

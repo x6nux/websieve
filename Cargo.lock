@@ -2839,6 +2839,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "wsieve-inbound"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wsieve-proto",
+ "wsieve-socks5",
+]
+
+[[package]]
 name = "wsieve-mux"
 version = "0.1.0"
 dependencies = [
@@ -2901,6 +2914,8 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "snow",
  "tokio",
  "tokio-rustls",
