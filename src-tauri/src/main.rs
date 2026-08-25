@@ -31,6 +31,7 @@ mod bridge;
 mod control;
 mod custody;
 mod emitter_src;
+mod events;
 mod outbound;
 mod router;
 mod shard;
@@ -237,6 +238,12 @@ fn main() {
             if let Err(e) = control::open(&app.handle().clone()) {
                 tracing::error!("控制窗口创建失败：{e:#}");
             }
+
+            // 事件聚合节流（设计文档 §11.2）。必须在建完控制窗口之后起：
+            // emit_control 会先查窗口在不在，不在就短路。
+            let agg = events::Aggregator::new();
+            agg.spawn(app.handle().clone());
+            app.manage(agg);
 
             let handle = app.handle().clone();
             let bind = inbound_bind.clone();
