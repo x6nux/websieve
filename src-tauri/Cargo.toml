@@ -20,6 +20,7 @@ wsieve-socks5 = { path = "../crates/wsieve-socks5" }
 wsieve-inbound = { path = "../crates/wsieve-inbound" }
 wsieve-route = { path = "../crates/wsieve-route" }
 wsieve-geo = { path = "../crates/wsieve-geo" }
+wsieve-dns = { path = "../crates/wsieve-dns" }
 
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["full"] }

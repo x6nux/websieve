@@ -233,10 +233,29 @@ async fn relay(
 
 /// 解析真实服务端地址。
 ///
-/// **必须在写 hosts 之前调用**：hosts 一旦把域名指向 127.0.0.1，系统解析器
+/// **必须走 bootstrap 解析器，绝不能走我们自己的 DNS**（设计文档 §7.2 纪律①）。
+/// 也**必须在写 hosts 之前调用**：hosts 一旦把域名指向 127.0.0.1，解析器
 /// 就会返回本地地址，转发器再解析就指向自己，形成死循环。
-pub async fn resolve_upstream(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+///
+/// 两道防线针对的是两件不同的事，缺一不可：
+/// - 「先解析后写 hosts」防的是**我们自己**写进 hosts 的那一行
+/// - 「走 bootstrap」防的是阶段 6 的 **fake-ip**：届时系统 DNS 查询会被
+///   劫持并返回 198.18.x.x，转发器会连向虚空，且完全静默 —— 表现为
+///   「握手一直不成功」，没有任何一条日志会说是解析出了假 IP
+///
+/// 收的是 `&TokioResolver`（bootstrap 那一族）而**不是** `DnsResolver`，
+/// 这不是风格问题：类型不同，判决用的那个解析器根本递不进来，纪律①因此
+/// 由编译器把关，而不是靠调用方自觉。
+pub async fn resolve_upstream(
+    boot: &wsieve_dns::TokioResolver,
+    host: &str,
+    port: u16,
+) -> anyhow::Result<SocketAddr> {
+    let lookup = boot
+        .lookup_ip(host)
+        .await
+        .map_err(|e| anyhow::anyhow!("bootstrap 解析 {host} 失败: {e}"))?;
+    let addrs: Vec<SocketAddr> = lookup.iter().map(|ip| SocketAddr::new(ip, port)).collect();
     // 优先 IPv4：hosts 里我们只写 127.0.0.1，链路两端保持同族更少意外。
     addrs
         .iter()
@@ -585,5 +604,60 @@ mod tests {
         assert!(is_loopback(&"127.0.0.1:443".parse().unwrap()));
         assert!(is_loopback(&"[::1]:443".parse().unwrap()));
         assert!(!is_loopback(&"1.2.3.4:443".parse().unwrap()));
+    }
+
+    // ── 纪律①：出站域名走 bootstrap 解析器（设计文档 §7.2）──
+
+    /// 解析确实由 **bootstrap 解析器**完成，且 IPv4 优先仍然生效。
+    ///
+    /// 这里用真解析器（`wsieve_dns::bootstrap()`，读系统配置的那一个）解
+    /// `localhost` —— 脱外网、每台机器都有、结果确定。
+    ///
+    /// 挑 `localhost` 不是图省事，是因为它**双栈且 IPv6 在前**：本机实测
+    /// `bootstrap()` 返回 `[::1, 127.0.0.1]`。于是「优先 IPv4」这条逻辑真的
+    /// 被考到了 —— 若谁把它改成朴素的 `.first()`，拿到的会是 `[::1]`，
+    /// 下面的断言立刻变红。换个单栈域名来测，这条断言就成了摆设。
+    #[tokio::test]
+    async fn resolve_upstream_goes_through_bootstrap_and_prefers_ipv4() {
+        let boot = wsieve_dns::bootstrap().expect("系统 DNS 配置应可读");
+        let addr = resolve_upstream(&boot, "localhost", 8443)
+            .await
+            .expect("localhost 在任何机器上都解析得出来");
+        assert_eq!(
+            addr,
+            "127.0.0.1:8443".parse::<SocketAddr>().unwrap(),
+            "双栈结果里必须挑 IPv4；拿到 [::1] 说明「优先 IPv4」被改坏了"
+        );
+    }
+
+    /// 解析失败**必须报错**，绝不静默返回一个凑合的地址。
+    ///
+    /// 上游指向本机一个**没人监听**的 UDP 端口 —— 不用 RFC 5737 的
+    /// `192.0.2.1`：本机实测那个地址 5ms 就返回了 `[fc00::d1, 198.18.0.211]`
+    /// （链路上的 DNS 拦截给的 fake-ip，198.18.0.0/15 恰是 fake-ip 段），
+    /// 拿它当黑洞会让测试在别人的机器上随机变红。本地端口是我们自己选的，
+    /// 没有任何中间人能替它回话。
+    ///
+    /// 这条锁的是 `shard_setup` 的降级路径有东西可降级：解析失败要能被
+    /// `match ... Err(e)` 接住并打出告警，而不是拿到一个错的地址继续往下跑
+    /// —— 后者会把转发器指向虚空，且完全静默。
+    #[tokio::test]
+    async fn a_bootstrap_failure_is_reported_not_swallowed() {
+        // 先占下一个 UDP 端口拿到号，再释放：这样端口号确定且几乎不可能
+        // 在测试期间被别人抢去回话。
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let boot = wsieve_dns::bootstrap_with(&[format!("udp://127.0.0.1:{dead_port}")])
+            .expect("上游是 IP 字面量，应能建起来");
+        let e = resolve_upstream(&boot, "no-such-host.invalid", 443)
+            .await
+            .expect_err("上游不可达时必须报错，不能返回一个凑合的地址");
+        let msg = e.to_string();
+        assert!(
+            msg.contains("no-such-host.invalid"),
+            "错误要点名是解析谁失败了，否则排查时无从下手：{msg}"
+        );
     }
 }

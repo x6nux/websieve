@@ -136,9 +136,20 @@ pub async fn plan(
         return ShardPlan::degraded(server_url);
     }
 
-    // 1) 解析真实地址。残留已在步骤 0 清掉，此刻系统解析器不受我们污染
+    // 1) 解析真实地址。残留已在步骤 0 清掉，此刻解析器不受我们污染
     //    ——否则会拿到环回地址，转发器就转给自己。
-    let upstream = match shard::resolve_upstream(&host, port).await {
+    //
+    //    走 bootstrap 解析器而非系统 `lookup_host`：阶段 6 的 fake-ip 生效后，
+    //    系统查询会被劫持成 198.18.x.x，转发器连向虚空且完全静默
+    //    （设计文档 §7.2 纪律①）。今天两者行为等价，趁改动无风险时先换掉。
+    let boot = match wsieve_dns::bootstrap() {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("条带禁用：bootstrap 解析器建立失败（{e}）——退回单会话");
+            return ShardPlan::degraded(server_url);
+        }
+    };
+    let upstream = match shard::resolve_upstream(&boot, &host, port).await {
         Ok(a) => a,
         Err(e) => {
             tracing::warn!("条带禁用：解析 {host}:{port} 失败（{e}）——退回单会话");

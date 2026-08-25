@@ -14,21 +14,22 @@
 //! 那不是可用性折衷，是隐私事故。
 //!
 //! **两阶段判决**（§4.2 纪律① / §6.2）：`RuleSet::evaluate` 是同步的，
-//! 需要 DNS 时返回 `Verdict::NeedResolve` 把需求抛回给调用方 —— 也就是这里。
-//! 本模块把两阶段协议整个委托给 `RoutingResolver`，见 `decide()` 的注释。
+//! 需要 DNS 时返回 `Verdict::NeedResolve` 把需求抛回给调用方。那个「接住
+//! NeedResolve、解析、再来一轮」的循环**不在本模块**，而是整个委托给
+//! `wsieve_dns::decide()` —— 见 `Router::decide` 的注释。
 
 use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::DuplexStream;
 use tokio::net::TcpStream;
+use wsieve_dns::RoutingResolver;
 use wsieve_geo::GeoDb;
 use wsieve_proto::addr::{AddrPort, TargetAddr};
-use wsieve_route::{Decision, RuleHit, RuleSet, Verdict};
+use wsieve_route::{Decision, RuleSet};
 
 use crate::outbound::instance::{OutboundInstance, Status};
 
@@ -50,33 +51,27 @@ pub const DEFAULT_START_WAIT: Duration = Duration::from_secs(3);
 /// `ponytail:` 10s 拍脑袋，未实测。
 pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// 判决路径需要的全部解析能力。
+/// 一次判决的完整记录，直接复用 `wsieve_dns` 的那一个。
 ///
-/// 形状与阶段 3 的 `wsieve_dns::RoutingResolver` 逐字对齐（含 `?Sized` 友好的
-/// boxed future 写法），阶段 3 接入时把本 trait 换成那个即可，`decide()` 的
-/// 调用点一个字都不用改。
-///
-/// **返回值里没有 `Result`**：调用方因此无法表达「DNS 失败就阻断连接」。
-/// 纪律被编码进类型，而不是写在注释里等人遵守 —— 解析失败应当让 IP 类规则
-/// 视为不匹配、流程继续（设计文档 §6.2），绝不是把连接掐掉。
-pub trait RoutingResolver: Send + Sync {
-    /// 解析域名。**永不失败**：超时、NXDOMAIN、上游不可达一律返回空 Vec。
-    fn resolve<'a>(
-        &'a self,
-        domain: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<IpAddr>> + Send + 'a>>;
-}
+/// 阶段 2 曾在本模块自带一份同形状的 `Routed`，因为当时 `wsieve_dns::decide()`
+/// 还不存在（两者并行开发）。阶段 3 接入后不再保留第二份：同一个数据契约
+/// 存两处，迟早有一处先长出字段而另一处不知道。
+pub use wsieve_dns::Outcome;
 
-/// 阶段 2 的解析器占位实现：不做任何 DNS 查询，恒返回空。
+/// 不做任何 DNS 查询、恒返回空的解析器。
 ///
 /// **这不是 mock，也不是临时凑合**。按设计文档 §6.2，解析失败本就该传空切片
 /// 让流程继续，因此它的行为语义完全正确：「所有 IP 类规则对域名目标都不匹配」。
-/// 阶段 2 尚未接入 DNS 解析器（那是阶段 3 的内容），此时选择「不解析」而不是
-/// 「猜一个结果」，是唯一诚实的做法 —— 它既不会泄漏 DNS 查询，也不会让判决
-/// 建立在编造的 IP 上。
 ///
-/// 覆盖面的缺失是真实的，且**必须让用户看得见**：`Router::new` 在规则表含
-/// IP 类规则时会告警一次，说明这些规则对域名目标暂不生效。
+/// 阶段 3 之后它仍有真实职责：`main.rs` 的启动配置是**环境变量**式的
+/// （见 `bootstrap::AppConfig`），里面没有 `dns.nameserver` 字段可读。
+/// 在配置文件接入之前（阶段 4），给 `DnsResolver::new` 硬编一个上游等于
+/// 替用户决定他的 DNS 走谁 —— 那比不解析更糟。此时选择「不解析」而不是
+/// 「猜一个结果」，是唯一诚实的做法：既不泄漏 DNS 查询，也不让判决建立在
+/// 编造的 IP 上。
+///
+/// 覆盖面的缺失是真实的，且**必须让用户看得见**：`Router::without_resolver`
+/// 在规则表含 IP 类规则时会告警一次，说明这些规则对域名目标暂不生效。
 #[derive(Debug, Default)]
 pub struct NoResolver;
 
@@ -89,27 +84,6 @@ impl RoutingResolver for NoResolver {
     }
 }
 
-/// 一次判决的完整记录。
-///
-/// 字段构成「交给阶段 4/5 的数据契约」的前三样（第四样 `bytes` 只有连接
-/// 结束时才知道，由 `dispatch` 的调用方在收尾时补）。这些在判决路径上本就
-/// 全部已知，顺手带出去接近零成本；事后补采集则要把判决再跑一遍。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Routed {
-    pub decision: Decision,
-    /// 做出判决的那条规则。`None` = 没有规则参与（mode 短路或扫穿兜底）。
-    pub rule: Option<RuleHit>,
-    /// 是否真的发生了 DNS 查询。多数流量在域名类规则处就命中，此值为 false
-    /// —— 这正是两阶段协议「不需要时零 DNS 泄漏」的可观测证据。
-    pub resolved: bool,
-    /// 解析得到的 IP。
-    ///
-    /// **只用于判决与展示，绝不改写传给出站的地址**（设计文档 §6.3）：
-    /// 判决走代理时仍把**域名**递给出站，由服务端做远程解析 —— 服务端离
-    /// 目标更近，且不受本地污染影响。
-    pub ips: Vec<IpAddr>,
-}
-
 /// 分派器：持规则、GEO、出站表与解析器。
 pub struct Router {
     rules: Arc<RuleSet>,
@@ -118,8 +92,6 @@ pub struct Router {
     outbounds: BTreeMap<String, Arc<OutboundInstance>>,
     resolver: Arc<dyn RoutingResolver>,
     start_wait: Duration,
-    /// 解析次数计数，用来在测试里锁住「最多解析一次」。
-    resolver_calls: AtomicUsize,
 }
 
 impl Router {
@@ -135,16 +107,20 @@ impl Router {
             outbounds,
             resolver,
             start_wait: DEFAULT_START_WAIT,
-            resolver_calls: AtomicUsize::new(0),
         }
     }
 
-    /// 用阶段 2 的占位解析器（`NoResolver`）构造，并如实告警覆盖面。
+    /// 用 `NoResolver` 构造，并如实告警覆盖面。
     ///
     /// 「有 IP 类规则却没有解析器」不是错误 —— 判决照常给出，语义也正确
     /// （解析失败视为不匹配，§6.2）。但它**必须被说出来**：不告警的话，
     /// 用户会以为自己写的 `GEOIP,CN,DIRECT` 正在生效，而对域名目标它一条
     /// 都不会命中。静默的覆盖面缺失比报错更危险。
+    ///
+    /// 这条路径在阶段 3 之后仍然存在，理由见 `NoResolver` 的注释：
+    /// 启动配置目前是环境变量式的，没有 `dns.nameserver` 可读，硬编一个
+    /// 上游等于替用户决定他的 DNS 走谁。等阶段 4 接入配置文件后，这里改成
+    /// `Self::new(.., Arc::new(DnsResolver::new(&cfg.dns.nameserver, ..)?))`。
     pub fn without_resolver(
         rules: Arc<RuleSet>,
         geo: Arc<GeoDb>,
@@ -171,50 +147,18 @@ impl Router {
         self
     }
 
-    /// 已解析次数。
-    ///
-    /// `#[cfg(test)]`：它存在的唯一理由是让测试能断言「最多解析一次」
-    /// 与「域名类规则命中时零解析」—— 两条纪律都只有靠计数才证明得了。
-    #[cfg(test)]
-    fn resolver_calls(&self) -> usize {
-        self.resolver_calls.load(Ordering::Relaxed)
-    }
-
     /// 走完两阶段协议，返回判决与它的出处。
     ///
-    /// - 第一轮 `evaluate(target, None, ..)`；命中即返回，**不发任何 DNS**
-    /// - 抛出 `NeedResolve` 才解析，然后 `evaluate(target, Some(&ips), ..)`
-    /// - 解析失败/超时得到空切片，该 IP 规则视为不匹配，流程继续
+    /// **循环本身不在这里，整个委托给 `wsieve_dns::decide()`。**
     ///
-    /// 第二轮**永不**再抛 `NeedResolve` —— 那是 `wsieve-route` 的协议承诺。
-    /// 走到那里说明引擎违约，静默兜底只会让 bug 藏进生产环境。
-    pub async fn decide(&self, target: &AddrPort) -> Routed {
-        let first = self.rules.evaluate_explained(target, None, &self.geo);
-        match first.verdict {
-            Verdict::Decided(decision) => Routed {
-                decision,
-                rule: first.hit,
-                resolved: false,
-                ips: Vec::new(),
-            },
-            Verdict::NeedResolve { domain } => {
-                self.resolver_calls.fetch_add(1, Ordering::Relaxed);
-                let ips = self.resolver.resolve(&domain).await;
-                let second = self.rules.evaluate_explained(target, Some(&ips), &self.geo);
-                match second.verdict {
-                    Verdict::Decided(decision) => Routed {
-                        decision,
-                        rule: second.hit,
-                        resolved: true,
-                        ips,
-                    },
-                    Verdict::NeedResolve { domain } => unreachable!(
-                        "第二轮不该再请求解析（domain={domain}）——\
-                         这是 wsieve-route::evaluate 的协议违约，见设计文档 §4.2 纪律①"
-                    ),
-                }
-            }
-        }
+    /// 阶段 2 曾在本模块自带一份同样的循环 —— 当时 `wsieve_dns` 还不存在，
+    /// 两者并行开发。阶段 3 接入后立刻删掉那一份：两阶段协议要证明的三件事
+    /// （最多解析一次、第二轮永不再抛 `NeedResolve`、解析失败不阻断连接）
+    /// 若各证一遍，迟早有一份先被改动而另一份不知道，届时「判决为什么不一样」
+    /// 会成为一个没人查得动的问题。UI 的规则试算（§11.2）走的也是同一个
+    /// `decide()`，试算与真实判决因此不可能各说各话。
+    pub async fn decide(&self, target: &AddrPort) -> Outcome {
+        wsieve_dns::decide(&self.rules, target, &self.geo, self.resolver.as_ref()).await
     }
 
     /// 判决并按判决建立连接。返回的是「已经连上目标」的双向管道。
@@ -230,7 +174,7 @@ impl Router {
     pub async fn dispatch_reported(
         &self,
         target: AddrPort,
-    ) -> io::Result<(DuplexStream, Routed)> {
+    ) -> io::Result<(DuplexStream, Outcome)> {
         let routed = self.decide(&target).await;
         let stream = match &routed.decision {
             Decision::Reject => Err(io::Error::new(
@@ -345,6 +289,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wsieve_route::Mode;
 
     use crate::outbound::instance::OutboundCfg;
@@ -429,30 +374,51 @@ mod tests {
     }
 
     /// 注入式解析器，用来验证两阶段协议闭环。
-    struct FixedResolver(Vec<IpAddr>);
+    /// 注入式解析器，用来验证两阶段协议闭环。
+    ///
+    /// 它**自己**记账被调了几次。计数原先是 `Router` 的一个 `#[cfg(test)]`
+    /// 字段，但两阶段循环搬去 `wsieve_dns::decide()` 之后，`Router` 已经不再
+    /// 经手那一步 —— 计数留在它身上就成了「数一个自己没做的动作」。放在
+    /// 解析器这一侧数，量的才是真正发生过的调用，与 `wsieve-dns` 的
+    /// `CountingResolver` 同理。
+    struct FixedResolver {
+        ips: Vec<IpAddr>,
+        calls: AtomicUsize,
+    }
+
+    impl FixedResolver {
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
 
     impl RoutingResolver for FixedResolver {
         fn resolve<'a>(
             &'a self,
             _domain: &'a str,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<IpAddr>> + Send + 'a>> {
-            let ips = self.0.clone();
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let ips = self.ips.clone();
             Box::pin(async move { ips })
         }
     }
 
-    fn test_router_with_resolver(lines: &[&str], ips: &[&str]) -> Router {
+    /// 建一个带计数解析器的 router，并把解析器另拿一份出来供断言。
+    fn test_router_with_resolver(lines: &[&str], ips: &[&str]) -> (Router, Arc<FixedResolver>) {
         let o = inst("日本节点");
         let mut m = BTreeMap::new();
         m.insert("日本节点".to_string(), o);
-        Router::new(
+        let resolver = Arc::new(FixedResolver {
+            ips: ips.iter().map(|s| s.parse().unwrap()).collect(),
+            calls: AtomicUsize::new(0),
+        });
+        let router = Router::new(
             ruleset(lines, &["日本节点"]),
             geo_stub(),
             m,
-            Arc::new(FixedResolver(
-                ips.iter().map(|s| s.parse().unwrap()).collect(),
-            )),
-        )
+            resolver.clone(),
+        );
+        (router, resolver)
     }
 
     #[tokio::test]
@@ -574,14 +540,15 @@ mod tests {
     #[tokio::test]
     async fn need_resolve_triggers_second_pass() {
         // 两阶段协议在这里闭环。
-        let r = test_router_with_resolver(&["GEOIP,CN,DIRECT", "MATCH,日本节点"], &["1.2.3.4"]);
+        let (r, res) =
+            test_router_with_resolver(&["GEOIP,CN,DIRECT", "MATCH,日本节点"], &["1.2.3.4"]);
         let d = r.decide(&domain("a.com", 443)).await;
         assert!(
             matches!(&d.decision, Decision::Outbound(n) if n == "日本节点"),
             "{:?}",
             d.decision
         );
-        assert_eq!(r.resolver_calls(), 1, "只该解析一次");
+        assert_eq!(res.calls(), 1, "只该解析一次");
         assert!(d.resolved, "确实解析过");
         assert_eq!(d.ips, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
     }
@@ -590,13 +557,13 @@ mod tests {
     async fn a_domain_rule_hit_never_triggers_dns() {
         // 两阶段协议的收益就在这里：多数流量在域名类规则处命中，
         // 一个 DNS 包都不发。这是「不需要时零 DNS 泄漏」的可观测证据。
-        let r = test_router_with_resolver(
+        let (r, res) = test_router_with_resolver(
             &["DOMAIN-SUFFIX,a.com,日本节点", "GEOIP,CN,DIRECT", "MATCH,DIRECT"],
             &["1.2.3.4"],
         );
         let d = r.decide(&domain("www.a.com", 443)).await;
         assert!(matches!(&d.decision, Decision::Outbound(n) if n == "日本节点"));
-        assert_eq!(r.resolver_calls(), 0, "域名类规则命中时不该有任何解析");
+        assert_eq!(res.calls(), 0, "域名类规则命中时不该有任何解析");
         assert!(!d.resolved);
     }
 
@@ -604,7 +571,7 @@ mod tests {
     async fn a_failing_resolver_does_not_block_the_connection() {
         // 解析失败传空切片让流程继续（§6.2）。若改成阻断，一次 DNS 抖动
         // 就会让本可直连的流量整片失败。
-        let r = test_router_with_resolver(&["GEOIP,CN,DIRECT", "MATCH,日本节点"], &[]);
+        let (r, _) = test_router_with_resolver(&["GEOIP,CN,DIRECT", "MATCH,日本节点"], &[]);
         let d = r.decide(&domain("a.com", 443)).await;
         assert!(matches!(&d.decision, Decision::Outbound(n) if n == "日本节点"));
         assert!(d.resolved, "问过了");

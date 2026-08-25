@@ -17,3 +17,12 @@ pub use decide::{decide, Outcome};
 pub use inject::RoutingResolver;
 pub use resolver::{bootstrap, bootstrap_with, DnsResolver, ResolverError};
 pub use upstream::{parse_nameserver, UpstreamError};
+
+/// `bootstrap()` 返回的解析器类型，从本 crate 转出。
+///
+/// `bootstrap()` 的返回值是 hickory 的类型，调用方（`shard::resolve_upstream`）
+/// 要在签名里写出它。转出一份而非让调用方自己依赖 `hickory-resolver`：
+/// 版本号只钉在本 crate 的 Cargo.toml 一处，下游跟着走。两处各写一个版本
+/// 约束的话，升级时会出现「同一个 `TokioResolver` 却是两个类型」这种
+/// 极难读懂的编译错误。
+pub use hickory_resolver::TokioResolver;
