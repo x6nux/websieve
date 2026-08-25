@@ -1,12 +1,15 @@
-//! 本地条带的启动编排：解析 → 写 hosts → 起转发器，以及失败时的降级。
+//! 本地条带的启动编排：清残留 → 解析 → 起转发器 → 写 hosts，以及失败时的降级。
 //!
-//! 顺序是关键（见 `plan` 的注释）：先清残留、再解析、最后写 hosts。任何一步
-//! 失败都降级到单会话继续跑，而不是拒绝启动——与 mux 协商失败的处理一致
-//! （优先建立连接 + 警告日志）。
+//! 顺序是关键（见 `plan` 的注释）：**清残留在最前面且无条件执行**，
+//! 然后才解析、起转发器、最后写 hosts。任何一步失败都降级到单会话继续跑，
+//! 而不是拒绝启动——与 mux 协商失败的处理一致（优先建立连接 + 警告日志）。
+//!
+//! hosts 条目的托管本身归 `crate::custody`（设计文档 §10），本模块只管编排。
 
 use std::sync::Arc;
 
-use crate::hosts::HostsFile;
+use crate::custody::hosts::{HostsCustody, HostsFile};
+use crate::custody::{CustodyGuard, ManagedSystemState};
 use crate::shard::{self, ShardGuard};
 
 /// 条带编排结果。
@@ -87,6 +90,24 @@ pub async fn plan(
     extra_sessions: usize,
     hosts_path: std::path::PathBuf,
 ) -> ShardPlan {
+    let hosts = Arc::new(HostsFile::new(hosts_path));
+
+    // 0) 无条件先清残留 —— 在任何早退分支之前。
+    //
+    // 这一步与「本次要不要劫持」无关：上一次运行被 SIGKILL 时条目留在了
+    // hosts 里，而本次可能因为条带被关掉、URL 变成 IP、服务端换了域名等
+    // 任何理由直接降级。清理只发生在「本次也打算劫持」的路径上的话，
+    // 残留就会一直留着，那个域名从此永远指向一个不在跑的转发器。
+    // 这正是 §10 里 clear_stale 与 apply 分开的理由。
+    if let Err(e) = HostsCustody::cleanup_only(hosts.clone()).clear_stale() {
+        // 不可写属常态（没管理员权限），降到 debug；其余照常告警。
+        if hosts.writable() {
+            tracing::warn!("清理 hosts 残留失败（{e:#}）——若上次异常退出，条目可能仍在");
+        } else {
+            tracing::debug!("hosts 不可写，跳过残留清理：{e:#}");
+        }
+    }
+
     if extra_sessions == 0 {
         return ShardPlan::degraded(server_url);
     }
@@ -106,7 +127,6 @@ pub async fn plan(
         return ShardPlan::degraded(server_url);
     }
 
-    let hosts = Arc::new(HostsFile::new(hosts_path));
     if !hosts.writable() {
         tracing::warn!(
             "条带禁用：{} 不可写——退回单会话。要启用多 TCP 条带，请以管理员身份运行，\
@@ -116,14 +136,8 @@ pub async fn plan(
         return ShardPlan::degraded(server_url);
     }
 
-    // 1) 先清残留：上一次运行若非正常退出，hosts 里还指着 127.0.0.1，
-    //    此时解析会拿到环回地址，转发器就会转给自己。
-    if let Err(e) = hosts.clear_managed() {
-        tracing::warn!("条带禁用：清理 hosts 残留失败（{e}）——退回单会话");
-        return ShardPlan::degraded(server_url);
-    }
-
-    // 2) 再解析真实地址（此刻系统解析器已不受我们污染）。
+    // 1) 解析真实地址。残留已在步骤 0 清掉，此刻系统解析器不受我们污染
+    //    ——否则会拿到环回地址，转发器就转给自己。
     let upstream = match shard::resolve_upstream(&host, port).await {
         Ok(a) => a,
         Err(e) => {
@@ -138,7 +152,7 @@ pub async fn plan(
         return ShardPlan::degraded(server_url);
     }
 
-    // 3) 起转发器，成功后才写 hosts——反过来的话，转发器起不来时域名已被
+    // 2) 起转发器，成功后才写 hosts——反过来的话，转发器起不来时域名已被
     //    指向本地，本机访问该域名会全部失败。
     let forwarder = match shard::spawn(shard_base_port, sessions, upstream).await {
         Ok(f) => f,
@@ -147,10 +161,19 @@ pub async fn plan(
             return ShardPlan::degraded(server_url);
         }
     };
-    if let Err(e) = hosts.set_managed("127.0.0.1", &[host.clone()]) {
-        tracing::warn!("条带禁用：写 hosts 失败（{e}）——退回单会话");
-        return ShardPlan::degraded(server_url);
-    }
+    // 3) 写 hosts。托管交给 CustodyGuard：持有即生效，drop 即摘除，
+    //    崩溃残留由下次启动的步骤 0 兜底（§10）。
+    let custody = match CustodyGuard::acquire(HostsCustody::new(
+        hosts.clone(),
+        "127.0.0.1".into(),
+        vec![host.clone()],
+    )) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!("条带禁用：写 hosts 失败（{e:#}）——退回单会话");
+            return ShardPlan::degraded(server_url);
+        }
+    };
 
     let ports = forwarder.ports().to_vec();
     let origin = |p: u16| format!("{scheme}://{host}:{p}");
@@ -167,7 +190,7 @@ pub async fn plan(
     ShardPlan {
         page_url: format!("{}/", origin(ports[0])),
         session_bases,
-        guard: Some(ShardGuard::new(forwarder, hosts)),
+        guard: Some(ShardGuard::new(forwarder, custody)),
     }
 }
 
@@ -231,8 +254,54 @@ mod tests {
 
     #[tokio::test]
     async fn ip_server_url_degrades() {
-        let p = plan("https://127.0.0.1:8443/", 18443, 3, "/tmp/x".into()).await;
-        assert_eq!(p.session_count(), 1);
-        assert!(p.guard.is_none());
+        let p = temp_hosts("ip-degrade", "127.0.0.1 localhost\n");
+        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone()).await;
+        assert_eq!(plan0.session_count(), 1);
+        assert!(plan0.guard.is_none());
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 每个测试一份独立临时 hosts —— **绝不指向真实 /etc/hosts**。
+    fn temp_hosts(tag: &str, content: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "wsieve-shard-setup-{}-{tag}",
+            std::process::id()
+        ));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// 崩溃恢复的关键回归：**降级路径也必须清残留**。
+    ///
+    /// 场景：上次运行劫持了 old.com 后被 SIGKILL；这次用户把条带关了
+    /// （extra_sessions=0）。旧实现在这条分支上第一行就 return，
+    /// clear 永远跑不到，old.com 从此一直指向一个不在跑的转发器。
+    #[tokio::test]
+    async fn stale_entry_is_cleared_even_when_this_run_degrades() {
+        let p = temp_hosts(
+            "degrade",
+            "127.0.0.1 localhost\n127.0.0.1 old.com # wsieve-managed\n",
+        );
+        let plan0 = plan("https://x.com/", 18443, 0, p.clone()).await;
+        assert!(plan0.guard.is_none(), "条带关掉时不该有 guard");
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(!s.contains("old.com"), "降级路径也必须清掉上次的残留：{s}");
+        assert_eq!(s, "127.0.0.1 localhost\n", "用户条目必须字节还原");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// 同一个洞的另一条腿：服务端换成了 IP，于是本次不劫持，
+    /// 但上次留下的域名条目照样得清。
+    #[tokio::test]
+    async fn stale_entry_is_cleared_when_host_is_no_longer_hijackable() {
+        let p = temp_hosts(
+            "not-hijackable",
+            "127.0.0.1 localhost\n127.0.0.1 old.com # wsieve-managed\n",
+        );
+        let plan0 = plan("https://127.0.0.1:8443/", 18443, 3, p.clone()).await;
+        assert!(plan0.guard.is_none());
+        let s = std::fs::read_to_string(&p).unwrap();
+        assert!(!s.contains("old.com"), "IP 服务端也必须清掉残留：{s}");
+        std::fs::remove_file(&p).ok();
     }
 }

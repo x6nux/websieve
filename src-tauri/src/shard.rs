@@ -12,7 +12,6 @@
 //! 出站连接上，就等于自己把 h2 复用又做了一遍，整个特性归零。
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
 
@@ -104,27 +103,27 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-/// 本地条带的运行态：转发器 + 已写入的 hosts，drop 时自动摘除 hosts 条目。
+/// 本地条带的运行态：转发器 + hosts 托管，drop 时自动摘除 hosts 条目。
+///
+/// 摘除动作不在这里写 —— 它归 `CustodyGuard<HostsCustody>`（设计文档 §10）。
+/// 本结构只负责「转发器与 hosts 条目同生共死」：字段顺序即 drop 顺序，
+/// **先摘 hosts 再停转发器**，反过来的话中间那一小段时间里域名已经指向
+/// 一个刚被 abort 的监听口，本机访问该域名会失败。
 pub struct ShardGuard {
+    /// 持有即生效：drop 时摘除 hosts 托管条目。
+    _hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
     /// 持有即保活：drop 时 listener 任务被 abort。
     _forwarder: Forwarder,
-    hosts: Arc<crate::hosts::HostsFile>,
 }
 
 impl ShardGuard {
-    pub fn new(forwarder: Forwarder, hosts: Arc<crate::hosts::HostsFile>) -> Self {
-        Self { _forwarder: forwarder, hosts }
-    }
-}
-
-impl Drop for ShardGuard {
-    fn drop(&mut self) {
-        // 不摘除的话，域名会一直指向已经不在跑的转发器 —— 本机之后访问
-        // 该域名全部失败。崩溃路径由启动时的 clear_managed 兜底。
-        if let Err(e) = self.hosts.clear_managed() {
-            tracing::warn!("清理 hosts 托管条目失败: {e}");
-        } else {
-            tracing::info!("已清理 hosts 托管条目");
+    pub fn new(
+        forwarder: Forwarder,
+        hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
+    ) -> Self {
+        Self {
+            _hosts: hosts,
+            _forwarder: forwarder,
         }
     }
 }
@@ -133,6 +132,7 @@ impl Drop for ShardGuard {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// 假上游：回显 + 统计 accept 次数。

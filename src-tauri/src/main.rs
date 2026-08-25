@@ -15,7 +15,6 @@
 mod bridge;
 mod custody;
 mod emitter_src;
-mod hosts;
 mod proxy;
 mod shard;
 mod shard_setup;
@@ -47,7 +46,7 @@ fn main() {
         &cfg.server_url,
         cfg.shard_base_port,
         extra_sessions,
-        hosts::system_path(),
+        custody::hosts::system_path(),
     ));
     let server_url = plan.page_url.clone();
     let show_window = cfg.show_window;
