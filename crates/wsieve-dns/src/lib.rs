@@ -8,8 +8,10 @@
 //! 客户端无需解析即可路由转发。解析只在一处被需要 —— 让 GEOIP / IP-CIDR
 //! 这类规则对域名目标生效。那是内部查询，不是对外服务。
 
+pub mod inject;
 pub mod resolver;
 pub mod upstream;
 
+pub use inject::RoutingResolver;
 pub use resolver::{bootstrap, bootstrap_with, DnsResolver, ResolverError};
 pub use upstream::{parse_nameserver, UpstreamError};
