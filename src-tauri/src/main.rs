@@ -37,6 +37,7 @@ mod router;
 mod shard;
 mod shard_setup;
 mod stats;
+mod tray;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -232,6 +233,12 @@ fn main() {
                 )
                 .initialization_script(bootstrap::loader_js())
                 .build()?;
+            }
+
+            // 托盘先于窗口建：窗口建失败时用户至少还有托盘可用（这两条
+            // 生命周期是独立的，见 tray.rs 模块注释）。同样不阻断代理。
+            if let Err(e) = tray::build(&app.handle().clone()) {
+                tracing::error!("托盘创建失败：{e:#}");
             }
 
             // 控制窗口（设计文档 §11.3）。建不起来不阻断代理 —— 用户至少
