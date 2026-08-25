@@ -4,4 +4,5 @@
 //! `(AddrPort, 双向流)`，下游对入口类型无感 —— TUN 因此是纯增量，
 //! 加一个入口不动其余任何一层。
 
+pub mod http;
 pub mod sniff;
