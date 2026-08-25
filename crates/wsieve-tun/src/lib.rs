@@ -24,3 +24,4 @@ pub mod fakeip;
 pub mod inbound;
 pub mod managed;
 pub mod routes;
+pub mod startup;
