@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { move, keyboardMove, positionAnnouncement } from './reorder.js';
+import { move, keyboardMove, positionAnnouncement, reorderOps } from './reorder.js';
 
 const L = ['a', 'b', 'c', 'd'];
 
@@ -107,5 +107,79 @@ describe('positionAnnouncement —— 键盘排序后的位置播报', () => {
     expect(positionAnnouncement(-1, 3, 'x')).toBe('');
     expect(positionAnnouncement(5, 3, 'x')).toBe('');
     expect(positionAnnouncement(NaN, 3, 'x')).toBe('');
+  });
+});
+
+describe('reorderOps —— 排序翻译成 config_save 的定点改写', () => {
+  // 形状取自 config_get 的返回：rules[] 每项带 { value, line }，
+  // 前端解析出 type/target 后仍必须把 line 与原文 raw 一路带下去。
+  const R = [
+    { id: 1, line: 12, raw: 'GEOSITE,category-ads,REJECT' },
+    { id: 2, line: 13, raw: 'DOMAIN-SUFFIX,googleapis.com,新加坡' },
+    { id: 3, line: 15, raw: 'DOMAIN-KEYWORD,google,日本节点' },
+    { id: 4, line: 16, raw: 'MATCH,日本节点' },
+  ];
+
+  it('相邻互换只发两条 op —— 未变动的行一个字节都不碰', () => {
+    const ops = reorderOps(R, 1, 2);
+    expect(ops).toHaveLength(2);
+    expect(ops.map((o) => o.line).sort()).toEqual([13, 15]);
+  });
+
+  it('line 来自 config_get 的快照，逐条对得上', () => {
+    const ops = reorderOps(R, 0, 3);
+    // 行号不连续（14 行是注释），op 必须用真实行号而不是下标+1
+    for (const o of ops) expect(R.some((r) => r.line === o.line)).toBe(true);
+    expect(ops.some((o) => o.line === 14)).toBe(false);
+  });
+
+  it('expect 是那一行的原值，不是排序后的新值', () => {
+    const ops = reorderOps(R, 0, 1);
+    const first = ops.find((o) => o.line === 12);
+    // 第 12 行原本是 category-ads，排序后要变成 googleapis
+    expect(first.expect).toBe('GEOSITE,category-ads,REJECT');
+    expect(first.value).toBe('DOMAIN-SUFFIX,googleapis.com,新加坡');
+  });
+
+  it('expect 与 value 从不相等 —— 相等的行不该出现在 ops 里', () => {
+    for (const [f, t] of [[0, 3], [3, 0], [1, 2], [0, 1]]) {
+      for (const o of reorderOps(R, f, t)) expect(o.expect).not.toBe(o.value);
+    }
+  });
+
+  it('op 名与 Rust 侧的 kebab-case 标签一致', () => {
+    // RuleOp 是 #[serde(tag = "op", rename_all = "kebab-case")]，
+    // 写成 replaceRule 会被 deny_unknown_fields 拒掉。
+    for (const o of reorderOps(R, 0, 2)) expect(o.op).toBe('replace-rule');
+  });
+
+  it('原地不动不发任何 op —— 不去推 mtime', () => {
+    expect(reorderOps(R, 1, 1)).toEqual([]);
+    expect(reorderOps(R, 9, 0)).toEqual([]);
+  });
+
+  it('值集合守恒 —— 排序不该凭空造出或吃掉规则', () => {
+    const ops = reorderOps(R, 0, 3);
+    const after = R.map((r) => {
+      const o = ops.find((x) => x.line === r.line);
+      return o ? o.value : r.raw;
+    });
+    expect([...after].sort()).toEqual([...R.map((r) => r.raw)].sort());
+  });
+
+  it('缺 line 时抛错而不是静默跳过 —— 静默会让排序「看着生效了」', () => {
+    const bad = R.map((r, i) => (i === 1 ? { ...r, line: undefined } : r));
+    expect(() => reorderOps(bad, 0, 2)).toThrow(/行号/);
+  });
+
+  it('缺 raw 时抛错 —— expect 不能由前端 state 拼凑', () => {
+    const bad = R.map((r, i) => (i === 0 ? { ...r, raw: undefined } : r));
+    expect(() => reorderOps(bad, 0, 2)).toThrow(/原文|expect/);
+  });
+
+  it('不改写输入', () => {
+    const snapshot = JSON.stringify(R);
+    reorderOps(R, 0, 3);
+    expect(JSON.stringify(R)).toBe(snapshot);
   });
 });
