@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import Sankey from './Sankey.svelte';
 import { WEIGHT_BYTES, WEIGHT_CONNS } from '../lib/flows.js';
@@ -156,3 +156,132 @@ describe('几何与着色', () => {
     expect(container.querySelector('figcaption')).toBeNull();
   });
 });
+
+/**
+ * 阶段 5 完成标准里的两条，此前只有实现没有测试。
+ *
+ * 「代码里写着 prefersReducedMotion.current」与「reduced-motion 下真的
+ * 跳变」不是一回事 —— 本项目已经反复抓到过这类靠肉眼验收的条目
+ * （托盘菜单从未挂上 builder，而清单上写着「五项俱全」）。
+ */
+describe('实时更新的两条纪律（完成标准的自动化）', () => {
+  const grow = connRows.map((r) => ({ ...r, weight: r.weight * 4, conns: r.conns * 4 }));
+  /** 各列内的节点 y 序，用来判断「顺序有没有变」 */
+  const orderOf = (container) =>
+    [...container.querySelectorAll('rect.node')]
+      .map((r) => ({
+        x: Number(r.getAttribute('x')),
+        y: Number(r.getAttribute('y')),
+        label: r.getAttribute('aria-label'),
+      }))
+      .sort((a, b) => a.x - b.x || a.y - b.y)
+      .map((n) => n.label.split('，')[0]);
+
+  it('数据连续变化时节点顺序不变，只有粗细动（§11.6）', async () => {
+    const { container, rerender } = render(Sankey, { rows: connRows, colorOf });
+    const before = orderOf(container);
+    expect(before.length).toBe(7);
+
+    // 同一批流带、量翻四倍：这正是 1s 一次的真实更新形态
+    await rerender({ rows: grow, colorOf });
+    expect(orderOf(container)).toEqual(before);
+  });
+
+  it('上游把行重排了，图上的节点位次**依然**不动', async () => {
+    /*
+     * 这一条才是 applyFrozenOrder 存在的理由，上面两条都不是。
+     *
+     * 布局侧的 nodeSort(null) 已经保证「列内顺序 = 输入数组顺序」，
+     * 而 toGraph 按首次出现建节点 —— 所以只要行的**顺序**没变，
+     * 图就不会重排，跟冻不冻结无关。等比放大与名次互换都属于这种情况，
+     * 拿它们去测冻结，会得到一个删掉 frozen 也照样通过的断言。
+     *
+     * 真正会让位次跳动的是**行本身被重排**：aggregate.js 的 Top N 按量
+     * 排序，量一变，行的先后就变了 —— 而这正是 1s 一次的更新里必然发生的事。
+     * 冻结要挡住的就是它。
+     */
+    const { container, rerender } = render(Sankey, { rows: connRows, colorOf });
+    const before = orderOf(container);
+    // 同一批流，顺序倒过来（模拟 Top N 重新排序后的输出）
+    await rerender({ rows: [...connRows].reverse(), colorOf });
+    expect(orderOf(container)).toEqual(before);
+  });
+
+  it('新节点出现时追加在末尾，已有节点不被重排', async () => {
+    const { container, rerender } = render(Sankey, { rows: connRows, colorOf });
+    const before = orderOf(container);
+    const withNew = [
+      ...connRows,
+      { site: 'z.com', rule: 'final *', outbound: 'JP', bytes: 0, conns: 1, weight: 1, weightUnit: WEIGHT_CONNS },
+    ];
+    await rerender({ rows: withNew, colorOf });
+    const after = orderOf(container);
+    // 已有的七个还在，且相对次序没变
+    expect(after.filter((x) => before.includes(x))).toEqual(before);
+    expect(after.length).toBe(8);
+  });
+
+  /**
+   * 比例变化，而不是整体放大。
+   *
+   * d3-sankey 会把布局**归一化到给定高度**，因此把所有流量同时乘 4，
+   * 算出来的宽度一模一样 —— 第一版就是这么写的，于是「跳没跳变」这件事
+   * 根本没被测到。要让宽度真的动，必须改变流带之间的**比例**。
+   */
+  const skew = [
+    { ...connRows[0], conns: 30, weight: 30 },
+    connRows[1],
+    connRows[2],
+  ];
+
+  /**
+   * skew 那组数据的**终值**宽度：直接把它当初始数据渲染一次即得
+   * （首帧没有可插值的前值，必然是终值）。不写死数字 —— 写死的话
+   * 布局参数一改，这两条测试会以一个看不懂的方式失败。
+   */
+  let finalWidths;
+  beforeAll(() => {
+    const { container, unmount } = render(Sankey, { rows: skew, colorOf });
+    finalWidths = widthsOf(container);
+    unmount();
+    // 三条流经两跳（站点→规则、规则→出站），聚合后是 5 条流带。
+    // 这一句不是装饰：不确认拿到了真实宽度，下面两条断言可能都在跟空数组比，
+    // 而跟空数组比的 not.toEqual 永远通过。
+    expect(finalWidths).toHaveLength(5);
+    expect(Math.max(...finalWidths)).toBeGreaterThan(0);
+  });
+
+  it('reduced-motion 下直接跳变，不留插值中间态', async () => {
+    // 这一条是无障碍要求（§11.6 明确写了）。前庭功能障碍的用户开着这个
+    // 系统偏好，而一张持续做宽度插值的图会让他们直接无法使用界面。
+    const { setMediaMatches } = await import('../test-setup.js');
+    setMediaMatches((q) => q.includes('prefers-reduced-motion'));
+    try {
+      const { container, rerender } = render(Sankey, { rows: connRows, colorOf });
+      const before = widthsOf(container);
+      await rerender({ rows: skew, colorOf });
+      // 跳变 = 下一帧就是终值
+      expect(widthsOf(container)).toEqual(finalWidths);
+      expect(widthsOf(container)).not.toEqual(before);
+    } finally {
+      setMediaMatches(() => false);
+    }
+  });
+
+  it('未开 reduced-motion 时确实在插值 —— 上一条才有对照', async () => {
+    // 没有这条对照，「跳变」那条测的可能只是「渲染同步完成」，
+    // 而它在两种设置下都会通过 —— 又一个不可能失败的断言。
+    const { container, rerender } = render(Sankey, { rows: connRows, colorOf });
+    await rerender({ rows: skew, colorOf });
+    // 插值中：此刻还没走到终值
+    expect(widthsOf(container)).not.toEqual(finalWidths);
+  });
+});
+
+/** 当前各流带的宽度，排序后比较（顺序由布局决定，不是这条测试关心的） */
+function widthsOf(container) {
+  return [...container.querySelectorAll('.links path')]
+    .map((p) => Number(p.getAttribute('stroke-width')))
+    .sort((a, b) => a - b);
+}
+
