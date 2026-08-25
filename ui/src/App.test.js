@@ -314,10 +314,12 @@ describe('组装：诚实的计量口径', () => {
   ];
 
   it('没有逐流字节时，合计带的量词是「条连接」而非字节单位', async () => {
-    render(App);
+    const { container } = render(App);
     await settled();
     await emit('connection', { items: deltas, dropped: false });
-    expect(screen.getByText(/3 条连接/)).toBeInTheDocument();
+    // 工具条上的合计。桑基图的文字摘要里也有同一个数（那是等价视图的一部分），
+    // 所以这里按位置取，不用 getByText —— 否则会撞上两处
+    expect(container.querySelector('.total').textContent).toMatch(/3 条连接/);
   });
 
   it('绝不拿连接数假装成字节 —— 图上不出现 KB / MB / GB', async () => {

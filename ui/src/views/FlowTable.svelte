@@ -256,6 +256,15 @@
     text-align: inherit;
   }
   th button:hover { color: var(--text-2); }
+  /* `all: unset` 把 outline 一并清掉了，tokens.css 的全局 :focus-visible
+     因此落不到这里。这是无障碍审计抓出来的：表视图是桑基图**必需的等价视图**
+     （§11.6），而排序是它唯一的交互 —— 键盘用户看不见焦点停在哪一列，
+     排序就等于不可用。失败方式还是静默的：视觉上一切正常。
+     偏移取 -2px 把焦点环收进单元格内侧，免得被相邻表头的边框裁掉。 */
+  th button:focus-visible {
+    outline: 2px solid var(--outbound-1);
+    outline-offset: -2px;
+  }
 
   .arrow { display: inline-block; width: 1em; color: var(--text-2); }
 

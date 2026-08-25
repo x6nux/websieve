@@ -66,7 +66,7 @@ describe('粗细的含义写在图上，不靠注释', () => {
 
   it('图的朗读摘要说清了粗细代表什么', () => {
     const { container } = render(Sankey, { rows: connRows, colorOf });
-    const svg = container.querySelector('svg[role="img"]');
+    const svg = container.querySelector('svg[role="group"]');
     expect(svg.getAttribute('aria-label')).toMatch(/流带粗细代表连接数/);
     expect(svg.getAttribute('aria-label')).toMatch(/表视图/);
   });

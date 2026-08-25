@@ -11,6 +11,21 @@
    * 只有选中项 tabindex=0（roving tabindex）：radiogroup 的键盘约定是
    * Tab 进出整组、方向键在组内移动。每一项都能 Tab 到会让选项一多
    * 就需要按十几次 Tab 才能跨过去。
+   *
+   * ## keydown 挂在 radio 上，不挂在 radiogroup 上
+   *
+   * 这条是无障碍审计（a11y.test.js）逼出来的。原先挂在容器上，Svelte 报
+   * `a11y_interactive_supports_focus`：「带 radiogroup 这个交互角色的元素
+   * 必须有 tabindex」—— 这是本仓库当时唯一的构建警告。
+   *
+   * **但按它说的加 tabindex 是错的。** ARIA 的 roving tabindex 模式要求
+   * 容器**不进** tab 序：加了之后 Tab 会先停在一个什么都不是的 div 上，
+   * 再按一次才进到选项，而屏幕阅读器会把这一站读成一个空的分组。
+   * 那是为了消警告而制造一个真的可用性缺陷。
+   *
+   * 正确的解法是把处理器挪到真正持有焦点的那个元素上：radio 自身。
+   * 事件本来就从它那里冒泡上来，行为完全等价，而容器回归成一个纯粹的
+   * 语义分组，警告随之消失 —— 消失是因为问题没了，不是因为被压住了。
    */
   let { options = [], value, onchange = () => {}, label = '' } = $props();
 
@@ -36,12 +51,13 @@
   }
 </script>
 
-<div class="seg" role="radiogroup" aria-label={label} onkeydown={onKey} bind:this={root}>
+<div class="seg" role="radiogroup" aria-label={label} bind:this={root}>
   {#each options as o (o.value)}
     <button type="button" role="radio"
             aria-checked={o.value === value}
             class:on={o.value === value}
             tabindex={o.value === value ? 0 : -1}
+            onkeydown={onKey}
             onclick={() => onchange(o.value)}>{o.label}</button>
   {/each}
 </div>

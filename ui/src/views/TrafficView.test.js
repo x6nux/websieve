@@ -36,7 +36,7 @@ describe('图与表共享同一份数据', () => {
 
   it('默认是图，不是表 —— 打开即见走向', () => {
     const { container } = render(TrafficView, { flows: many, colorOf, connected: true });
-    expect(container.querySelector('svg[role="img"]')).not.toBeNull();
+    expect(container.querySelector('svg[role="group"]')).not.toBeNull();
     expect(screen.queryByRole('table')).toBeNull();
   });
 
@@ -62,7 +62,7 @@ describe('流数少于 3 时自动降级', () => {
       colorOf,
       connected: true,
     });
-    expect(container.querySelector('svg[role="img"]')).toBeNull();
+    expect(container.querySelector('svg[role="group"]')).toBeNull();
     expect(screen.getByRole('table')).toBeInTheDocument();
     expect(screen.getByText(/流数少于 3 条/)).toBeInTheDocument();
   });
@@ -73,7 +73,7 @@ describe('流数少于 3 时自动降级', () => {
       colorOf,
       connected: true,
     });
-    expect(container.querySelector('svg[role="img"]')).not.toBeNull();
+    expect(container.querySelector('svg[role="group"]')).not.toBeNull();
     expect(screen.queryByText(/流数少于 3 条/)).toBeNull();
   });
 });
@@ -164,6 +164,6 @@ describe('键盘可达', () => {
     within(group).getByRole('radio', { name: '图' }).focus();
     await u.keyboard('{ArrowRight}');
     expect(screen.getByRole('table')).toBeInTheDocument();
-    expect(container.querySelector('svg[role="img"]')).toBeNull();
+    expect(container.querySelector('svg[role="group"]')).toBeNull();
   });
 });

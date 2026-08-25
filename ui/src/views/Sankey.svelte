@@ -123,6 +123,19 @@
   }
 
   const layerNoun = (layer) => (layer === 0 ? '站点' : layer === 1 ? '规则' : '出站');
+
+  /**
+   * 图的文字摘要。**只此一处**，容器的 aria-label 与下面那段 .sr-only 共用它 ——
+   * 两边各写一句，迟早有一句先被改而另一句不知道，而屏幕阅读器用户听到的
+   * 恰恰可能是没被改的那一句。
+   *
+   * 「完整数据请切换到表视图」不是客套：§11.6 记录桑基图的无障碍评级为 C，
+   * 图的职责就是给摘要并指路，真正的数据在表里。
+   */
+  const summary = $derived(
+    `流量走向桑基图：${rows.length} 条流，合计 ${weightSummary(total, unit)}。` +
+      `流带粗细代表${noun}。完整数据请切换到表视图。`,
+  );
 </script>
 
 {#if conflicted}
@@ -131,8 +144,26 @@
   <p class="conflict" role="alert">{UNIT_CONFLICT_MSG}</p>
 {:else if model}
   <figure>
-    <svg viewBox="0 0 {width} {height}" role="img"
-         aria-label="流量走向桑基图：{rows.length} 条流，合计 {weightSummary(total, unit)}。流带粗细代表{noun}。完整数据请切换到表视图。">
+    <!--
+      role="group" 而**不是** role="img" —— 这一条是无障碍审计抓出来的。
+
+      `role="img"` 的语义是「一张不可再分的图」，它的子节点对辅助技术
+      **一律不暴露**（ARIA 的 presentational children 规则）。而下面那些 rect
+      是 tabindex=0 的可聚焦节点：§11.6 要求点击出站节点能跳到规则视图，
+      键盘等价物就是它们。两者放在一起自相矛盾 —— axe 的 nested-interactive
+      报的正是这个，实际后果则取决于屏幕阅读器的实现：要么那些节点根本读不到
+      （于是键盘能 Tab 进去却听不到自己在哪），要么读到一堆按 ARIA 规范
+      本不该存在的东西。两种都不可接受。
+
+      `role="group"` 支持可聚焦后代，进入时播报 aria-label。图的职责一个字
+      没变（§11.6：图本身评级 C，它只负责给摘要 + 指向表视图），
+      只是换了一个不与交互打架的容器角色。
+
+      摘要另外用 .sr-only 在下面写了一份可见于无障碍树的文本：group 的名字
+      在部分屏幕阅读器里只在「进入」那一刻播报一次，用户往回走就再也听不到。
+      一段能被正常导航读到的文字比一个只播一次的名字可靠。
+    -->
+    <svg viewBox="0 0 {width} {height}" role="group" aria-label={summary}>
       <defs>
         {#each dests as d (d)}
           <!-- userSpaceOnUse：整条路径共享同一个渐变，而非每段各自从头开始。
@@ -189,6 +220,12 @@
         {/if}
       {/each}
     </svg>
+
+    <!-- 图的文字摘要。**必须存在且可被正常导航读到** —— §11.6 把结构性流图的
+         无障碍评级定为 C，图的职责因此不是「传达数据」而是「给出摘要并指向
+         能传达数据的地方」。放在 svg 之后而不是只挂在 aria-label 上，
+         是因为容器名在部分屏幕阅读器里只在进入那一刻播报一次。 -->
+    <p class="sr-only">{summary}</p>
 
     <!-- 图例不是装饰：桑基图这个形态本身在暗示吞吐量，不写清楚就等于默认标错轴。
          它必须跟着 weightUnit 变，且视觉上可见（不能藏进 sr-only）。 -->
