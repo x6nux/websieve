@@ -397,9 +397,11 @@ evaluate(target, resolved, rules, geo)：
 
 **① 出站服务器域名绝不走本系统的 DNS。**
 
-`shard.rs:90 resolve_upstream` 必须拿到真实 IP，且**必须早于写 hosts**（代码中已有该防线）。一旦 fake-ip 生效，它会拿到 `198.18.x.x`，转发器连向虚空。
+`shard.rs` 的 `resolve_upstream` 必须拿到真实 IP，且**必须早于写 hosts**（代码中已有该防线）。一旦 fake-ip 生效，它会拿到 `198.18.x.x`，转发器连向虚空。
 
 纪律：服务器域名走**独立 bootstrap 解析器**（系统 DNS，绕过一切劫持与 fake-ip），且这些域名永久列入 `fake-ip-filter`。
+
+> 已落地（阶段 3 Task 6）：`resolve_upstream` 的签名收 `&wsieve_dns::TokioResolver`（bootstrap 那一族）而**不是** `DnsResolver`。两者类型不同，判决用的解析器根本递不进来 —— 纪律①由此从「注释里的约定」变成编译器把关的事实。
 
 **② DoH 上游一律用 IP 字面量配置。** 否则 DoH 服务器自身的域名由谁解析？用 `https://1.1.1.1/dns-query` 这类形式，不给自己留解析需求。
 
