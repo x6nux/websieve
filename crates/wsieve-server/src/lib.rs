@@ -267,21 +267,26 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
     }
 }
 
-/// 跨源许可：仅当 `Origin` 与 `Host` 同域名（端口可不同）时返回该 Origin。
+/// 跨源许可：回显请求的 `Origin`。
 ///
-/// 多端口条带（客户端 hosts 劫持 + 本地转发，见 src-tauri/src/shard.rs）产生的
-/// 正是这种「同域名不同端口」的跨源 fetch。其他任何 Origin 一律不回 CORS 头：
-/// CORS 头出现在 nginx 默认页上本身就是可探测特征，而这里的判据要求探测者
-/// 精确构造与 Host 同域的 Origin 才能触发，且只有认证成功的响应才带头
-/// （§8：未认证请求一律走伪装处理器，那条路径不经过这里）。
+/// **这个函数看起来很宽松，但它不是防线。** 真正的防线在调用点：
+/// `apply_cors` 只加在**认证成功**的响应上（§8：未认证请求一律走伪装处理器，
+/// 那条路径根本不经过这里）。探测者发不出合法的 msg1，就永远看不到任何
+/// CORS 痕迹 —— 无论他把 Origin 构造成什么样。
+///
+/// 放宽的原因（设计文档 §9.1）：单 WebView 承载多出站时，页面加载自宿主
+/// 出站的域名，而请求发往其他出站的域名，二者本就不同域。服务端无从预知
+/// 客户端把哪台机器当宿主，因此不能再做同域名判据。
+///
+/// 历史：此前限制为「Origin 与 Host 同域名」，那是为多端口条带
+/// （同域名不同端口）设计的。该场景仍被覆盖 —— 它是本函数的一个特例。
 fn cors_origin(req: &axum::http::Request<Body>) -> Option<String> {
     let origin = req.headers().get(header::ORIGIN)?.to_str().ok()?;
-    let host = req.headers().get(header::HOST)?.to_str().ok()?;
-    // ponytail: 按 ':' 切端口，对 IPv6 字面量不成立；客户端侧 hijackable()
-    // 已排除 IP 主机，条带只对域名启用。真要支持 IPv6 host 再换正式解析。
-    let o_host = origin.split("://").nth(1)?.split(':').next()?;
-    let h_host = host.split(':').next()?;
-    (o_host == h_host && !o_host.is_empty()).then(|| origin.to_string())
+    // 仅做最低限度的形态校验：必须是个 scheme://host 形状的东西。
+    // 目的不是安全（安全由调用点保证），而是避免把垃圾原样回显进响应头。
+    let rest = origin.split("://").nth(1)?;
+    let host = rest.split('/').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| origin.to_string())
 }
 
 /// 给协议响应补 CORS 头。仅用于认证成功的响应，伪装路径绝不调用。
@@ -678,5 +683,49 @@ mod tests {
         let (chosen, fb) = pick_mux(&[MuxId::Yamux], &[]);
         assert_eq!(chosen, MuxId::Yamux);
         assert!(fb); // 注意：即使客户端要的就是 yamux，服务端未启用也算 fallback
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use axum::body::Body;
+    use axum::http::{header, Request};
+
+    fn req(origin: &str, host: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::ORIGIN, origin)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn same_domain_different_port_still_allowed() {
+        // 多端口条带的既有场景，不能回归
+        let r = req("https://a.com:18444", "a.com");
+        assert_eq!(super::cors_origin(&r).as_deref(), Some("https://a.com:18444"));
+    }
+
+    #[test]
+    fn cross_domain_is_now_allowed() {
+        // 单 WebView 承载多出站：页面在 A，请求发往 B
+        let r = req("https://host-a.com", "server-b.net");
+        assert_eq!(super::cors_origin(&r).as_deref(), Some("https://host-a.com"));
+    }
+
+    #[test]
+    fn missing_origin_yields_none() {
+        // 同源请求不带 Origin —— 不该凭空造一个 CORS 头出来
+        let r = Request::builder()
+            .header(header::HOST, "a.com")
+            .body(Body::empty())
+            .unwrap();
+        assert!(super::cors_origin(&r).is_none());
+    }
+
+    #[test]
+    fn malformed_origin_yields_none() {
+        let r = req("not-a-url", "a.com");
+        assert!(super::cors_origin(&r).is_none());
     }
 }

@@ -428,25 +428,26 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
     }
 }
 
-/// CORS 头只出现在**认证成功**的响应上，且只对同域名的 Origin。
+/// CORS 头只出现在**认证成功**的响应上 —— 判据是「认证与否」，不是「同不同域」。
 ///
-/// 多端口条带（客户端 hosts 劫持 + 本地转发）会让各会话落在同域名的不同端口，
-/// 于是 fetch 变成跨源，需要 CORS 头才能被 JS 读取。但 CORS 头出现在 nginx
-/// 默认页上本身就是可探测特征，所以：未认证请求走伪装路径、绝不带头；
-/// 非同域 Origin 也绝不带头。
+/// 两种场景都需要跨源 fetch：多端口条带（同域名不同端口）与单 WebView 承载
+/// 多出站（彻底不同域名，设计文档 §9.1）。服务端无从预知客户端把哪台机器当
+/// 宿主，故 Origin 一律回显。真正的防线是「未认证请求走伪装路径、绝不带头」：
+/// CORS 头出现在 nginx 默认页上本身就是可探测特征，而探测者发不出合法 msg1
+/// 就永远看不到任何 CORS 痕迹。
 #[tokio::test]
-async fn cors_headers_only_on_authenticated_same_domain_responses() {
+async fn cors_headers_only_on_authenticated_responses() {
     let rig = start_server().await;
     let c = reqwest::Client::new();
     let base = format!("http://{}", rig.addr);
     let host = rig.addr.to_string();
-    // Origin 与 Host 同域名、端口不同 —— 正是条带产生的形态
-    let same_domain_origin = format!("http://{}:19999", rig.addr.ip());
+    // 彻底不同域名的 Origin —— 单 WebView 承载多出站产生的正是这种形态
+    let cross_domain_origin = "https://wsieve-host-a.example".to_string();
 
     // 1) 未认证的协议路径 → 走伪装，绝不带 CORS 头
     let r = c
         .post(format!("{base}/api/sync?n=7&sid=AAAAAAAAAAAAAAAAAAAAAA"))
-        .header("Origin", &same_domain_origin)
+        .header("Origin", &cross_domain_origin)
         .header("Host", &host)
         .body("garbage")
         .send()
@@ -460,7 +461,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     // 2) 完全无关的路径（纯伪装页）→ 同样不带
     let r = c
         .get(format!("{base}/"))
-        .header("Origin", &same_domain_origin)
+        .header("Origin", &cross_domain_origin)
         .header("Host", &host)
         .send()
         .await
@@ -472,7 +473,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     let transport = std::sync::Arc::new(CorsProbeTransport {
         client: c.clone(),
         base: base.clone(),
-        origin: same_domain_origin.clone(),
+        origin: cross_domain_origin.clone(),
         host: host.clone(),
         seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     });
@@ -492,7 +493,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     let handshake_hdrs = recorded.first().expect("应记录到握手响应头");
     assert_eq!(
         handshake_hdrs.0.as_deref(),
-        Some(same_domain_origin.as_str()),
+        Some(cross_domain_origin.as_str()),
         "认证成功的响应应回显具体 Origin"
     );
     assert_eq!(handshake_hdrs.1.as_deref(), Some("true"), "应允许携带凭据");
