@@ -4,6 +4,7 @@ members = [
     "crates/wsieve-geo",
     "crates/wsieve-route",
     "crates/wsieve-config",
+    "crates/wsieve-dns",
     "crates/wsieve-proto",
     "crates/wsieve-transport",
     "crates/wsieve-xhttp",
