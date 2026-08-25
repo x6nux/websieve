@@ -364,7 +364,43 @@ pub fn parse_netstat_by_gateway(text: &str, gw: &str) -> Vec<RouteEntry> {
         .collect()
 }
 
-/// fake-ip 段当前归谁管。返回接口名（如 `utun49`），无路由则 `None`。
+/// fake-ip 段的归属判定结果。
+///
+/// 为什么不是简单的 `Option<String>`：接口名单独看**答不出问题**。
+/// 2026-08-25 本机的两次实测给出了完全相反的表象：
+///
+/// | 时刻 | `route -n get 198.18.0.4` | 真实状况 |
+/// |---|---|---|
+/// | 另一个 TUN 在跑 | `destination: 128.0.0.0`, iface `utun49` | 段被 utun49 接管，**冲突** |
+/// | 该 TUN 退出后 | `destination: default`, iface `en0` | 无人认领，**没冲突** |
+///
+/// 两次都返回了一个非空接口名。只看接口就会在干净机器上误报冲突，
+/// 而误报的代价是「拒绝启动」——用户完全无从下手。
+///
+/// 真正的判据是 **`destination` 那一行**：它报的是**命中的那条路由**。
+/// 命中 `default` 说明只是兜底转发，没人专门认领这个段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeIpRangeOwner {
+    /// 无人专门认领：要么无路由，要么只命中了 `default` 兜底。
+    /// 这是我们可以安全启用 fake-ip 的状态。
+    Unclaimed,
+    /// 有一条比 `default` 更具体的路由盖住了这个段。
+    Claimed {
+        /// 命中的路由的目的地，如 `128.0.0.0`（那条 /1）。
+        destination: String,
+        /// 承载该路由的接口，如 `utun49`。
+        interface: Option<String>,
+    },
+}
+
+impl FakeIpRangeOwner {
+    /// 该段是否已被别人接管。
+    pub fn is_claimed(&self) -> bool {
+        matches!(self, FakeIpRangeOwner::Claimed { .. })
+    }
+}
+
+/// fake-ip 段当前归谁管。
 ///
 /// # 为什么需要这个
 ///
@@ -373,26 +409,30 @@ pub fn parse_netstat_by_gateway(text: &str, gw: &str) -> Vec<RouteEntry> {
 /// 用 `0/1 + 128.0/1` 盖住了默认路由，于是：
 ///
 /// ```text
-/// route -n get 198.18.0.207  →  gateway 172.18.0.1, interface utun49
+/// route -n get 198.18.0.207  →  destination 128.0.0.0, gateway 172.18.0.1, utun49
 /// ```
 ///
 /// 发往 `8.8.8.8` 的查询根本没离开本机，被 utun49 截下用**它的** fake-ip
 /// 池作答。两个 fake-ip 池共用 `198.18.0.0/15`，分配出的假 IP 会互相
 /// 撞车，反查时各自认领对方的地址 —— 表现是随机的域名错连，无从排查。
 ///
-/// 因此启动前必须问一句这个段归谁。**判据是接口名**：不是我们的 utun，
-/// 该段就已经被别人接管了。
+/// 因此启动前必须问一句这个段归谁。
+///
+/// # 判据是 `destination`，不是接口名
+///
+/// 见 [`FakeIpRangeOwner`] 的表：干净机器上这个查询照样返回一个接口名
+/// （`en0`），因为它命中了 `default` 兜底。只看接口会把干净机器误判成
+/// 冲突。`0/1 + 128.0/1` 这个「盖住 default 而不删它」的手法，也正是
+/// 我们自己用的 —— 所以「默认路由是不是我们的」看 `default` 那一行
+/// 同样答不出来，两处是同一个陷阱。
 ///
 /// # 这里只提供事实，不做决策
 ///
-/// 「发现冲突后是拒绝启动还是降级」属于启动顺序纪律（Task 10）的判断，
-/// 本模块只负责把路由表的事实取回来 —— 与 `RouteBackend` 同一条缝：
+/// 「发现冲突后是拒绝启动、换段还是降级」属于启动顺序纪律（Task 10）的
+/// 判断，本模块只负责把路由表的事实取回来 —— 与 `RouteBackend` 同一条缝：
 /// 需要特权 / 需要策略的部分都不放在这里。
-///
-/// 注意 `route get` 报的 `destination` 是**命中的那条路由**（上例里是
-/// `128.0.0.0`），不是查询地址本身，所以判断只能看 `interface`。
 #[cfg(target_os = "macos")]
-pub fn fakeip_range_owner(probe: std::net::Ipv4Addr) -> anyhow::Result<Option<String>> {
+pub fn fakeip_range_owner(probe: std::net::Ipv4Addr) -> anyhow::Result<FakeIpRangeOwner> {
     let addr = probe.to_string();
     let out = std::process::Command::new("/sbin/route")
         .args(["-n", "get", &addr])
@@ -401,9 +441,22 @@ pub fn fakeip_range_owner(probe: std::net::Ipv4Addr) -> anyhow::Result<Option<St
     if !out.status.success() {
         // 没有可用路由时 route 也会失败（"not in table"）—— 那恰恰说明
         // 该段没人管，是我们想要的状态，不是错误。
-        return Ok(None);
+        return Ok(FakeIpRangeOwner::Unclaimed);
     }
-    Ok(crate::routes::parse_route_get(&String::from_utf8_lossy(&out.stdout)).interface)
+    Ok(classify_route_get(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// 从 `route -n get` 的输出判定归属（从 IO 里摘出来才好测）。
+pub fn classify_route_get(out: &str) -> FakeIpRangeOwner {
+    let q = crate::routes::parse_route_get(out);
+    match q.destination.as_deref() {
+        // 命中兜底：没人专门认领这个段。
+        None | Some("default") | Some("0.0.0.0") => FakeIpRangeOwner::Unclaimed,
+        Some(dest) => FakeIpRangeOwner::Claimed {
+            destination: dest.to_string(),
+            interface: q.interface,
+        },
+    }
 }
 
 /// 物理网关地址 —— 全部 bypass 路由的下一跳。
@@ -844,5 +897,135 @@ default            10.0.0.1           UGScg                 en0
         let r = parse_netstat_by_gateway(REAL_NETSTAT, "172.18.0.1");
         assert!(!r.iter().any(|e| e.dest == "Destination"), "{r:?}");
         assert!(!r.iter().any(|e| e.dest == "Routing"), "{r:?}");
+    }
+
+    // ---- 真机只读探测 ----
+    //
+    // 下面两条**真的调用系统命令**，这是本文件里唯一碰真实系统的地方。
+    // 安全性来自它们全是只读的：`route -n get` 与 `netstat -rn` 都不改
+    // 路由表（实测不需要 root），改路由表的 add/delete 一律走 `FakeBackend`。
+    // 断言只挑「无论开发机处于什么网络状态都成立」的性质，否则在没有默认
+    // 路由的 CI 上会假失败。
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_gateway_reads_the_real_routing_table_or_says_why_not() {
+        // 网关取错的话，每一条 bypass 路由都指向不通的下一跳，出站全部
+        // 连不上而路由表看上去一切正常 —— 所以这里要么拿到一个能解析成
+        // IP 的地址，要么给出一句说得清的错，不允许有第三种结果。
+        match default_gateway() {
+            Ok(gw) => {
+                assert!(
+                    gw.parse::<std::net::IpAddr>().is_ok(),
+                    "网关必须是可解析的 IP，拿到的是 {gw:?}"
+                );
+            }
+            Err(e) => {
+                // 没有默认路由（离线机器 / 容器）是合法状态，但错误必须
+                // 点明是哪一步，不能只丢一个退出码。
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("default") || msg.contains("网关"),
+                    "错误信息说不清所以然：{msg}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fakeip_range_owner_is_answerable_without_root() {
+        // 冲突检测的可行性本身就是个待验证项：这条断言的是「无 root 也能
+        // 问出这个段归谁」。两种结果都是合法事实（本机在同一天里两种都
+        // 出现过 —— 另一个 TUN 客户端中途退出了），报错才是问题。
+        let probe: std::net::Ipv4Addr = "198.18.0.4".parse().unwrap();
+        let owner = fakeip_range_owner(probe).expect("只读探测不该失败");
+        if let FakeIpRangeOwner::Claimed { destination, .. } = &owner {
+            assert!(!destination.is_empty(), "认领者的目的地不该是空串");
+            assert_ne!(destination, "default", "命中 default 不算认领");
+        }
+    }
+
+    /// 本机 2026-08-25 **另一个 TUN 客户端在跑时**的真实输出。
+    const REAL_CLAIMED: &str = "\
+   route to: 198.18.0.4
+destination: 128.0.0.0
+       mask: 128.0.0.0
+    gateway: 172.18.0.1
+  interface: utun49
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING>
+";
+
+    /// 同一台机器，**那个 TUN 客户端退出之后**的真实输出。
+    /// 注意接口名照样非空 —— 这正是「只看接口会误报」的实证。
+    const REAL_UNCLAIMED: &str = "\
+   route to: 198.18.0.4
+destination: default
+       mask: default
+    gateway: 10.0.0.1
+  interface: en0
+      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>
+";
+
+    #[test]
+    fn a_foreign_tun_covering_the_fakeip_range_is_detected() {
+        // 两个 fake-ip 池共用 198.18.0.0/15 会互相吞对方的应答，
+        // 表现是随机的域名错连。必须能认出来。
+        let o = classify_route_get(REAL_CLAIMED);
+        assert!(o.is_claimed(), "utun49 盖着这个段，必须判为已被认领：{o:?}");
+        match o {
+            FakeIpRangeOwner::Claimed {
+                destination,
+                interface,
+            } => {
+                assert_eq!(destination, "128.0.0.0", "命中的是那条 /1");
+                assert_eq!(interface.as_deref(), Some("utun49"));
+            }
+            other => panic!("应判为 Claimed：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_clean_machine_is_not_mistaken_for_a_collision() {
+        // **这条是本组的核心。** 干净机器上这个查询照样返回接口名 en0
+        // （命中 default 兜底）。只看接口名就会把干净机器判成冲突，
+        // 而误报的代价是拒绝启动 —— 用户完全无从下手。
+        let o = classify_route_get(REAL_UNCLAIMED);
+        assert_eq!(o, FakeIpRangeOwner::Unclaimed, "命中 default 不算冲突");
+        assert!(!o.is_claimed());
+    }
+
+    #[test]
+    fn the_two_measured_states_differ_only_in_destination() {
+        // 把上面两条钉在一起：两次实测的**接口名都非空**，区别全在
+        // destination 那一行。这就是判据必须选 destination 的全部理由。
+        let claimed = crate::routes::parse_route_get(REAL_CLAIMED);
+        let unclaimed = crate::routes::parse_route_get(REAL_UNCLAIMED);
+        assert!(claimed.interface.is_some());
+        assert!(unclaimed.interface.is_some(), "干净机器照样有接口名");
+        assert_ne!(claimed.destination, unclaimed.destination);
+        assert!(classify_route_get(REAL_CLAIMED).is_claimed());
+        assert!(!classify_route_get(REAL_UNCLAIMED).is_claimed());
+    }
+
+    #[test]
+    fn unroutable_output_counts_as_unclaimed() {
+        // route 查不到时（"not in table"）说明没人管这个段 —— 那正是
+        // 我们想要的状态，不该被当成错误或冲突。
+        assert_eq!(classify_route_get(""), FakeIpRangeOwner::Unclaimed);
+        assert_eq!(
+            classify_route_get("route: writing to routing socket: not in table\n"),
+            FakeIpRangeOwner::Unclaimed
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scanning_the_real_table_for_a_gateway_nobody_uses_claims_nothing() {
+        // 托管判据的安全性验证，跑在**真实**路由表上：拿一个没人会用的
+        // TUN 地址去扫，必须一条都认领不到。认领到了就意味着 clear_stale
+        // 会去删别人的路由。
+        let ours = scan_by_gateway("198.18.255.254").expect("netstat 只读，不该失败");
+        assert!(ours.is_empty(), "不该认领任何不属于我们的路由：{ours:?}");
     }
 }
