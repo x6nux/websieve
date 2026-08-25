@@ -1,3 +1,5 @@
 /target
 /.research
 /.superpowers
+/ui/node_modules
+/ui/dist
