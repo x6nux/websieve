@@ -121,6 +121,26 @@ body {
   outline-offset: 1px;
 }
 
+/* 屏幕阅读器可读、视觉上不可见。
+ * 桑基图这类结构性流图的无障碍评级只有 C（§11.6）—— 形状与颜色传达的
+ * 信息，屏幕阅读器一点也拿不到。表视图的 <caption>、图的文字摘要、
+ * 各处只给辅助技术看的 <th> 标签都要靠它，属于无障碍硬要求而非样式偏好。
+ *
+ * 用 clip-path 而非 clip：后者已废弃，且在 WebKit 下与 position:absolute
+ * 的组合有历史包袱。width/height 保留 1px 而不是 0 —— 0 尺寸元素会被部分
+ * 屏幕阅读器当作不可见而跳过，那就白写了。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 /* §11.6 明确要求：reduced-motion 下流带宽度直接跳变 */
 @media (prefers-reduced-motion: reduce) {
   *,
