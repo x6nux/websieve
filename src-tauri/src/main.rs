@@ -54,6 +54,9 @@ fn main() {
     // guard 持有 hosts 清理职责；进程正常退出时由 RunEvent::Exit 显式 drop，
     // 崩溃路径由下次启动的 clear_managed 兜底。
     let shard_guard = std::sync::Mutex::new(plan.guard);
+    // 系统代理托管（spec §8.2 / §10）。同 hosts 一样：持有即生效、drop 即恢复，
+    // 崩溃残留由启动时的 clear_stale 兜底。
+    let sysproxy_guard = std::sync::Mutex::new(setup_system_proxy(&cfg));
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -105,12 +108,101 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("tauri build")
         .run(move |_app, event| {
-            // 退出时摘除 hosts 托管条目：不摘的话域名会一直指向已经不在跑的
-            // 转发器，本机之后访问该域名全部失败。
+            // 退出时摘除全部外部系统状态托管（spec §10）：
+            // hosts 不摘的话域名会一直指向已经不在跑的转发器；系统代理不关的话
+            // 用户整机断网。两者的崩溃路径都由下次启动的 clear_stale 兜底。
             if let tauri::RunEvent::Exit = event {
+                sysproxy_guard.lock().unwrap().take();
                 shard_guard.lock().unwrap().take();
             }
         });
+}
+
+/// 建立系统代理托管。
+///
+/// **无论 `system-proxy` 开没开，都要先清一次残留** —— 用户上次崩溃后
+/// 把开关关掉，残留就再也没人清了。这与 `shard_setup` 里 hosts 清残留
+/// 放在所有早退分支之前是同一条纪律（spec §10）。
+///
+/// 任何一步失败都只告警不阻断启动：代理本身还能用，用户手工设一次即可，
+/// 而拒绝启动等于整个程序不可用。
+fn setup_system_proxy(
+    cfg: &bootstrap::AppConfig,
+) -> Option<custody::CustodyGuard<custody::sysproxy::SysProxyCustody>> {
+    use custody::sysproxy::SysProxyCustody;
+    use custody::{CustodyGuard, ManagedSystemState};
+
+    let services = match SysProxyCustody::enumerate_services() {
+        Ok(s) => s,
+        Err(e) => {
+            // 非 macOS 平台走的就是这条（见 sysproxy 的 ponytail 标注）。
+            if cfg.system_proxy {
+                tracing::warn!("系统代理未启用：枚举网络服务失败（{e:#}）——请手工设置");
+            } else {
+                tracing::debug!("跳过系统代理托管：{e:#}");
+            }
+            return None;
+        }
+    };
+
+    // SOCKS 监听口就是要写进系统设置的地址。
+    let (host, port) = match parse_listen(&cfg.socks_listen) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("系统代理未启用：监听地址 {} 解析失败（{e}）", cfg.socks_listen);
+            return None;
+        }
+    };
+
+    let custody = match SysProxyCustody::new(host, port, services) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("系统代理未启用：{e:#}");
+            return None;
+        }
+    };
+
+    if !cfg.system_proxy {
+        // 本次不开，但残留照清。
+        if let Err(e) = custody.clear_stale() {
+            tracing::warn!("清理系统代理残留失败（{e:#}）——若上次异常退出，设置可能仍在");
+        }
+        return None;
+    }
+
+    match CustodyGuard::acquire(custody) {
+        Ok(g) => {
+            tracing::info!("系统代理已指向 {}", cfg.socks_listen);
+            Some(g)
+        }
+        Err(e) => {
+            tracing::warn!("系统代理未启用（{e:#}）——请手工设置");
+            None
+        }
+    }
+}
+
+/// 从 `host:port` 取出两段。IPv6 字面量形如 `[::1]:1080`。
+fn parse_listen(s: &str) -> anyhow::Result<(String, u16)> {
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (h, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow::anyhow!("IPv6 字面量不完整"))?;
+        (
+            h.to_string(),
+            tail.strip_prefix(':')
+                .ok_or_else(|| anyhow::anyhow!("缺少端口"))?,
+        )
+    } else {
+        let (h, p) = s
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("缺少端口"))?;
+        (h.to_string(), p)
+    };
+    if host.is_empty() {
+        anyhow::bail!("缺少主机");
+    }
+    Ok((host, port.parse()?))
 }
 
 #[tauri::command]
@@ -185,4 +277,36 @@ async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<
         other => return Err(format!("bad kind {other}")),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_addr_splits_host_and_port() {
+        assert_eq!(
+            parse_listen("127.0.0.1:1080").unwrap(),
+            ("127.0.0.1".to_string(), 1080)
+        );
+        // IPv6 字面量：rsplit_once(':') 会切在地址中间，必须走方括号分支
+        assert_eq!(
+            parse_listen("[::1]:7890").unwrap(),
+            ("::1".to_string(), 7890)
+        );
+        assert_eq!(
+            parse_listen("[::]:7890").unwrap(),
+            ("::".to_string(), 7890)
+        );
+    }
+
+    #[test]
+    fn malformed_listen_addr_is_an_error_not_a_guess() {
+        // 猜错了就把系统代理指向一个不存在的地址，用户整机断网。
+        assert!(parse_listen("127.0.0.1").is_err(), "缺端口");
+        assert!(parse_listen(":1080").is_err(), "缺主机");
+        assert!(parse_listen("127.0.0.1:not-a-port").is_err());
+        assert!(parse_listen("[::1:7890").is_err(), "方括号不闭合");
+        assert!(parse_listen("[::1]7890").is_err(), "方括号后缺冒号");
+    }
 }

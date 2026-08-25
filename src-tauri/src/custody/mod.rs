@@ -14,6 +14,7 @@
 //! 都被执行 —— 包括本次根本不打算 `apply` 的那些早退分支。
 
 pub mod hosts;
+pub mod sysproxy;
 
 /// 一项被托管的系统状态。
 ///

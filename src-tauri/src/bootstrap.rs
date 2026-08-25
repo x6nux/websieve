@@ -23,6 +23,11 @@ pub struct AppConfig {
     /// 传输前提，见 spec §6.7），日常运行没有理由摆在用户面前。默认隐藏，
     /// 排障时置 `WSIEVE_SHOW_WINDOW=1` 打开看页面实际加载成什么样。
     pub show_window: bool,
+    /// 是否把本机系统代理指向我们的 SOCKS 监听口（spec §5.2 `system-proxy`）。
+    ///
+    /// 默认关：它改的是全局系统设置，开着崩一次就让用户整机断网。
+    /// 崩溃残留由启动时的 `clear_stale` 兜底（spec §8.2 / §10）。
+    pub system_proxy: bool,
 }
 
 fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -66,6 +71,10 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
     let show_window = std::env::var("WSIEVE_SHOW_WINDOW")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
+    // 系统代理默认关：改的是全局设置，崩一次就让用户整机断网（见字段注释）。
+    let system_proxy = std::env::var("WSIEVE_SYSTEM_PROXY")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
     Ok(AppConfig {
         server_url,
         server_pub,
@@ -74,6 +83,7 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
         socks_listen,
         shard_base_port,
         show_window,
+        system_proxy,
     })
 }
 
