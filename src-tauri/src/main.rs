@@ -38,6 +38,7 @@ mod router;
 mod shard;
 mod shard_setup;
 mod stats;
+mod tun;
 mod tray;
 
 use std::collections::BTreeMap;
@@ -113,13 +114,54 @@ fn main() {
     };
     let base_port = ports[&outbound_name][0];
 
+    // ── TUN 的前两步（§8.3.2 的第 0 与第 2 步）────────────────────────────
+    //
+    // 顺序纪律钉死的六步在这里与 `shard_setup::plan` 交错：
+    //   0) 查 fake-ip 段归属      ← 这里（只读、无需 root，掉头最干净）
+    //   1) 解析真实 IP            ← plan 内部
+    //   2) 写 bypass 路由         ← plan 内部，经下面这个钩子
+    //   3) 起转发器               ← plan 内部
+    //   4) 写 hosts               ← plan 内部
+    //   5) 最后拉起 TUN           ← 建 WebView 之后，run_stack 里
+    //
+    // 第 2 步必须夹在 1 与 3 之间，因此只能做成钩子递进去 —— 那正是
+    // `UpstreamHook` 存在的全部理由。
+    let tun_setup = tun_prepare(&cfg);
+    let bypass_hook = tun_setup.as_ref().map(|t| {
+        Arc::new(tun::bypass_hook(
+            t.bypass.clone(),
+            t.routes.clone(),
+            outbound_name.clone(),
+        )) as shard_setup::UpstreamHook
+    });
+
     let plan = tauri::async_runtime::block_on(shard_setup::plan(
         &cfg.server_url,
         base_port,
         extra_sessions,
         custody::hosts::system_path(),
+        bypass_hook,
     ));
+    // 没有 bypass 就绝不拉 TUN（§8.3.1）。这不是保守，是确定性：
+    // 转发器的第一条出网连接会被 TUN 捕获、判「走代理」、绕回本机。
+    let mut tun_setup = match (tun_setup, plan.tun_may_start()) {
+        (Some(t), true) => Some(t),
+        (Some(_), false) => {
+            tracing::error!(
+                "TUN 未启用：{}。混合端口入口不受影响，代理照常可用",
+                plan.bypass_error
+                    .as_deref()
+                    .unwrap_or("服务器地址未解析成功，没有 bypass 就拉起 TUN 必成环路")
+            );
+            None
+        }
+        (None, _) => None,
+    };
     let page_url = plan.page_url.clone();
+    // 退出时要撤的 TUN 路由。与 hosts / 系统代理并列的第三项托管（§10）。
+    // 单独留一个句柄而不是靠 `TunSetup` —— 后者被 move 进 setup 闭包里了，
+    // 而撤销发生在 `RunEvent::Exit`，两处的生命周期不重叠。
+    let tun_routes = std::sync::Mutex::new(tun_setup.as_ref().map(|t| t.routes.clone()));
     let show_window = cfg.show_window;
     let session_bases = plan.session_bases.clone();
 
@@ -273,8 +315,9 @@ fn main() {
             let rules = rules.clone();
             let geo = geo.clone();
             let win = carrier_window.clone();
+            let tun = tun_setup.take();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_stack(handle, bind, win, ob, rules, geo).await {
+                if let Err(e) = run_stack(handle, bind, win, ob, rules, geo, tun).await {
                     tracing::error!("入口/出站栈退出: {e:#}");
                 }
             });
@@ -296,9 +339,26 @@ fn main() {
         .expect("tauri build")
         .run(move |app, event| {
             // 退出时**按获取的相反顺序**摘除全部外部系统状态托管（spec §10）：
+            // TUN 路由不撤的话半个 IPv4 空间指向一个即将消失的 utun；
             // 系统代理不关的话用户整机断网；hosts 不摘的话域名会一直指向
-            // 已经不在跑的转发器。两者的崩溃路径都由下次启动的 clear_stale 兜底。
+            // 已经不在跑的转发器。三者的崩溃路径都由下次启动的 clear_stale 兜底。
             if let tauri::RunEvent::Exit = event {
+                // TUN 最先撤：它接管的是**默认路由**，影响面最大。撤晚了的话，
+                // 在系统代理与 hosts 摘除的那一小段时间里，流量仍在往一个
+                // 正在拆的 TUN 里走。
+                if let Some(r) = tun_routes.lock().unwrap().take() {
+                    use crate::custody::ManagedSystemState;
+                    if let Err(e) = ManagedSystemState::revert(&*r) {
+                        // drop 路径上报不了给用户，日志是唯一去处。
+                        tracing::error!(
+                            "撤销 TUN 路由失败（{e:#}）：可能残留 0/1 与 128.0/1。\
+                             default 未被改写，基本上网不受影响；\
+                             下次启动会自动清理，也可手工执行 netstat -rn 检查"
+                        );
+                    } else {
+                        tracing::info!("已撤销 TUN 路由");
+                    }
+                }
                 sysproxy_guard.lock().unwrap().take();
                 shard_guard.lock().unwrap().take();
 
@@ -330,6 +390,148 @@ fn geo_path(env: &str, name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from(name))
 }
 
+/// TUN 拉起前就该准备好的东西：bypass 名单、路由托管、fake-ip 池。
+///
+/// 之所以要在建 WebView 之前构造，是因为 `bypass_hook` 必须递进
+/// `shard_setup::plan` —— 那是 §8.3.2 第 2 步唯一正确的位置。
+struct TunSetup {
+    bypass: wsieve_tun::bypass::BypassSet,
+    routes: Arc<wsieve_tun::managed::TunRoutes>,
+    pool: Arc<wsieve_tun::fakeip::FakeIpPool>,
+}
+
+/// §8.3.2 的第 0 步：查 fake-ip 段归属，并备好路由托管与 fake-ip 池。
+///
+/// 返回 `None` = 本次不开 TUN。**每一条 `None` 路径都必须留下一条可操作的
+/// 日志**（M8）：静默不开会让用户以为 TUN 在跑而实际全部流量走的是混合端口，
+/// 与 §6.4「禁止回退直连」同源。
+///
+/// **无论开不开 TUN，路由残留都先清一次**（§10）：用户上次崩溃后把开关关掉，
+/// 残留的 `0/1` 就再也没人清了 —— 那条路由指向一个已经消失的 utun，会把半个
+/// IPv4 空间黑洞掉，而用户在任何界面上都看不出这跟本程序有关。这与
+/// `setup_system_proxy` 里「本次不开也照清」是同一条纪律。
+#[cfg(target_os = "macos")]
+fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
+    use wsieve_tun::managed::{self, FakeIpRangeOwner, MacRouteBackend, TunRoutes};
+
+    // 物理网关取不到就不能继续：全部 bypass 路由都要指向它，猜错的话每条
+    // 出站都连不上，而路由表看上去一切正常。
+    let phys_gw = match managed::default_gateway() {
+        Ok(g) => g,
+        Err(e) => {
+            if cfg.tun {
+                tracing::error!("TUN 未启用：取不到物理网关（{e:#}）——没有它就写不出 bypass 路由");
+            } else {
+                tracing::debug!("跳过 TUN 路由残留清理：{e:#}");
+            }
+            return None;
+        }
+    };
+    let backend = Arc::new(MacRouteBackend::new(wsieve_tun::device::TUN_ADDR));
+    let routes = TunRoutes::new(backend, wsieve_tun::device::TUN_ADDR, &phys_gw);
+
+    if !cfg.tun {
+        // 本次不开，但残留照清。清不掉多半是没 root —— 说清楚怎么办。
+        if let Err(e) = routes.clear_stale() {
+            tracing::warn!(
+                "清理 TUN 路由残留失败（{e:#}）——若上次异常退出，\
+                 残留的 0/1 路由可能仍在黑洞流量。可用 sudo 启动一次让它自清，\
+                 或手工执行：sudo route -n delete -net 0.0.0.0/1"
+            );
+        }
+        return None;
+    }
+
+    // §8.3.2 第 0 步：段归属。只读、无需 root，是唯一「发现问题可以干净掉头」
+    // 的时刻 —— 此刻还没动过系统任何状态。
+    match managed::fakeip_range_owner(tun::RANGE_PROBE) {
+        Ok(FakeIpRangeOwner::Unclaimed) => {}
+        Ok(FakeIpRangeOwner::Claimed {
+            destination,
+            interface,
+        }) => {
+            // 两个 fake-ip 池共用一个段会互相认领对方分配的假 IP，
+            // 表现为随机的域名错连且无从排查。拒绝，并说清关谁。
+            tracing::error!(
+                "TUN 未启用：fake-ip 段 198.18.0.0/15 已被{}接管（命中路由 {destination}），\
+                 多半是机器上另有一个 TUN 代理在跑。两个 fake-ip 池共用同一个段会互相认领\
+                 对方分配的假 IP，表现为随机的域名错连且无从排查。\
+                 请关闭另一个代理的 TUN 模式后重试",
+                match &interface {
+                    Some(i) => format!("接口 {i}"),
+                    None => "一个未知接口".to_string(),
+                }
+            );
+            return None;
+        }
+        Err(e) => {
+            // 「问不出来」绝不能当成「没人占」—— 那等于在一台状况不明的
+            // 机器上照常拉起 TUN。
+            tracing::error!("TUN 未启用：查询 fake-ip 段归属失败（{e:#}）");
+            return None;
+        }
+    }
+
+    // 残留必须在 apply 之前清 —— 且是在**已经决定要开**之后清，
+    // 否则刚写好的条目会被紧接着的清理抹掉（`CustodyGuard::acquire` 的顺序）。
+    if let Err(e) = routes.clear_stale() {
+        tracing::error!(
+            "TUN 未启用：清理路由残留失败（{e:#}）。\
+             写路由需要管理员权限，请用 sudo 启动，或在配置里关掉 tun.enable"
+        );
+        return None;
+    }
+
+    // 出站服务器域名自动并入 fake-ip filter（§7.2 纪律①）：它一旦拿到假 IP，
+    // 转发器就连向虚空，且全程零报错。用户不该需要记住这件事。
+    let server_domain = server_host(&cfg.server_url);
+    let pool = tun::build_pool(Vec::new(), server_domain.as_slice());
+
+    Some(TunSetup {
+        bypass: wsieve_tun::bypass::BypassSet::new(),
+        routes: Arc::new(routes),
+        pool,
+    })
+}
+
+/// 其余平台：TUN 不可用，明确说出来而不是静默什么都不做。
+///
+/// 静默的后果与 M8 同源 —— 用户以为 TUN 开着，实际全部流量走的是别的路。
+#[cfg(not(target_os = "macos"))]
+fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
+    if cfg.tun {
+        tracing::error!(
+            "TUN 未启用：本平台暂不支持（阶段 6 只完整实现 macOS）。\
+             Linux 需要 CAP_NET_ADMIN 与 netlink 路由实现，\
+             Windows 需要 wintun.dll 与 IPHLPAPI 路由实现，二者均待补。\
+             混合端口入口不受影响"
+        );
+    }
+    None
+}
+
+/// 从服务端 URL 取出主机名，供 fake-ip filter 用。
+///
+/// 取不到时返回空 vec 而不是 panic：URL 非法在 `shard_setup::plan` 那边
+/// 已经会降级并告警，这里再报一次只是噪音。但**空 filter 要能被察觉** ——
+/// 由调用方的日志承担。
+fn server_host(url: &str) -> Vec<String> {
+    let Some((_, rest)) = url.split_once("://") else {
+        return Vec::new();
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        // IPv6 字面量不需要进 filter：fake-ip 只发 IPv4，撞不上。
+        Some(_) => return Vec::new(),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        // IP 字面量同理：它压根不经过 DNS。
+        return Vec::new();
+    }
+    vec![host.to_string()]
+}
+
 /// 出站管理器 + 路由分派 + 混合端口入口的总装与看护。
 ///
 /// 一代「承载」= 一个 `TransportCore`。core 死（页面崩了、心跳停摆）时
@@ -347,6 +549,7 @@ async fn run_stack(
     ob_cfg: outbound::instance::OutboundCfg,
     rules: Arc<wsieve_route::RuleSet>,
     geo: Arc<wsieve_geo::GeoDb>,
+    tun_setup: Option<TunSetup>,
 ) -> anyhow::Result<()> {
     let inst = outbound::instance::OutboundInstance::new(ob_cfg);
     let mut table = BTreeMap::new();
@@ -369,18 +572,34 @@ async fn run_stack(
         .await
         .map_err(|e| anyhow::anyhow!("入口监听 {bind} 失败: {e}"))?;
     tracing::info!("混合端口入口就绪：{bind}（SOCKS5 与 HTTP 同口）");
-    {
+    // **一个 dispatch，两个入口。** 这是「TUN 只是又一个入口」的实体：
+    // 下面把同一个 `dispatch` 分别递给混合端口的 `serve` 与 TUN 的 `run`。
+    // 若哪天这里需要第二个 dispatch，说明有人在 TUN 那边另建了一条通路 ——
+    // 那正是 §4.2 纪律②禁止的事。
+    let dispatch: wsieve_inbound::Dispatch = {
         let router = router.clone();
-        let dispatch: wsieve_inbound::Dispatch = Arc::new(move |target| {
+        Arc::new(move |target| {
             let router = router.clone();
             Box::pin(async move { router.dispatch(target).await })
-        });
+        })
+    };
+    {
+        let dispatch = dispatch.clone();
         tokio::spawn(async move {
             if let Err(e) = wsieve_inbound::serve(listener, dispatch).await {
                 // accept 循环退出 = 入口彻底失守，绝不静默。
                 tracing::error!("混合端口入口退出：{e}");
             }
         });
+    }
+
+    // §8.3.2 的第 5 步，也是最后一步：拉起 TUN。
+    //
+    // 走到这里意味着前四步都已完成 —— 段归属查过、真实 IP 解析过、bypass
+    // 路由写过、转发器与 hosts 就位（`tun_may_start()` 在 main 里把关）。
+    // DNS 劫持从这一刻起生效，此后任何解析都可能是 fake-ip。
+    if let Some(t) = tun_setup {
+        bring_up_tun(t, dispatch.clone()).await;
     }
 
     // 承载代循环：core 死一次就换一代。
@@ -421,6 +640,91 @@ async fn run_stack(
         // 给页面一点时间重新加载并把 emitter 注回去。
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// §8.3.2 的第 5 步：创建 utun、写默认路由、起 fake-ip DNS、跑入站循环。
+///
+/// **本函数不阻塞调用方**：TUN 入站循环与 DNS 服务器都 spawn 出去，
+/// `run_stack` 继续跑它的承载代循环。
+///
+/// 失败一律**明确报错并不启用**，绝不静默降级（M8）—— 静默降级会让用户
+/// 以为 TUN 开着而实际全部流量走的是混合端口，与 §6.4 同源。
+async fn bring_up_tun(t: TunSetup, dispatch: wsieve_inbound::Dispatch) {
+    use crate::custody::ManagedSystemState;
+
+    // 1) 写两条 /1 默认路由。**先于**创建设备：设备起来了而路由没写，
+    //    TUN 什么都收不到，用户看到的是「开了 TUN 但毫无变化」。
+    //    路由写失败的最常见原因是没 root —— `MacRouteBackend` 已经把它
+    //    翻译成一句可操作的话。
+    if let Err(e) = ManagedSystemState::apply(&*t.routes) {
+        tracing::error!(
+            "TUN 未启用：写默认路由失败（{e:#}）。\
+             创建 utun 与写路由都需要管理员权限，请用 sudo 启动，\
+             或在配置里关掉 tun.enable。混合端口入口不受影响"
+        );
+        // 写了一半的要撤干净，否则残留的 0/1 指向一个根本没建的设备。
+        if let Err(e2) = ManagedSystemState::revert(&*t.routes) {
+            tracing::error!("回滚 TUN 路由同样失败（{e2:#}）——请手工检查 netstat -rn");
+        }
+        return;
+    }
+
+    // 2) 创建 utun 并对接 netstack。
+    let stack = match wsieve_tun::device::spawn_netstack().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "TUN 未启用：创建 utun 设备失败（{e}）。\
+                 需要管理员权限，请用 sudo 启动，或在配置里关掉 tun.enable"
+            );
+            // 设备没建成，路由必须撤 —— 留着就是指向虚空的黑洞。
+            if let Err(e2) = ManagedSystemState::revert(&*t.routes) {
+                tracing::error!("撤销 TUN 路由失败（{e2:#}）——请手工执行 netstat -rn 检查 0/1 与 128.0/1");
+            }
+            return;
+        }
+    };
+    tracing::info!(
+        "TUN 设备就绪：{}（{}/{}），默认路由已接管",
+        stack.if_name,
+        wsieve_tun::device::TUN_ADDR,
+        wsieve_tun::device::TUN_PREFIX
+    );
+
+    // 3) fake-ip DNS。**与入站共用同一个池** —— 两个池的话 DNS 发出去的
+    //    地址在入站那边永远反查不到，每条连接都被拒，表现是「TUN 一开
+    //    什么都打不开」而两边日志都显示自己正常。
+    let fake = Arc::new(wsieve_tun::fakedns::FakeDns::new(t.pool.clone()));
+    match bootstrap::dns_upstream() {
+        Ok(upstream) => {
+            let server = Arc::new(wsieve_tun::dns_server::DnsServer::new(fake, upstream));
+            // 绑 TUN 网关的 53：段内流量都进本设备，客户端把 DNS 指到
+            // 网关上就能被我们接住，不需要动系统 DNS 设置。
+            let listen = std::net::SocketAddr::new(
+                wsieve_tun::device::TUN_ADDR.parse().expect("TUN_ADDR 是常量字面量"),
+                53,
+            );
+            match server.serve(listen).await {
+                Ok(handle) => {
+                    tracing::info!("fake-ip DNS 就绪：{}（上游 {upstream}）", handle.local_addr());
+                    // 句柄要活到进程结束 —— drop 掉会 abort 掉监听任务，
+                    // 53 端口从此没人应答，整机 DNS 静默失败。
+                    std::mem::forget(handle);
+                }
+                Err(e) => tracing::error!(
+                    "fake-ip DNS 启动失败（{e}）：域名规则（GEOSITE / DOMAIN-SUFFIX）\
+                     将无法命中，TUN 只能按 IP 分流"
+                ),
+            }
+        }
+        Err(e) => tracing::error!(
+            "fake-ip DNS 未启动（{e:#}）：域名规则将无法命中，TUN 只能按 IP 分流"
+        ),
+    }
+
+    // 4) 入站循环。dispatch 就是混合端口用的那一个。
+    let inbound = Arc::new(wsieve_tun::inbound::TunInbound::new(t.pool, t.bypass));
+    tokio::spawn(tun::run(stack, inbound, dispatch));
 }
 
 /// 盯住 core：心跳超时就标死。返回即代表本代承载结束。
@@ -672,5 +976,53 @@ mod tests {
         assert!(parse_listen("127.0.0.1:not-a-port").is_err());
         assert!(parse_listen("[::1:7890").is_err(), "方括号不闭合");
         assert!(parse_listen("[::1]7890").is_err(), "方括号后缺冒号");
+    }
+
+    /// 服务器域名必须能从 URL 里取出来 —— 它是 fake-ip filter 的唯一来源。
+    ///
+    /// 取不出来的后果不是「少一条 filter」，而是**服务器域名会拿到 fake-ip**，
+    /// 转发器随即连向虚空，且全程零报错（§7.2 纪律①）。
+    #[test]
+    fn the_server_host_is_extracted_for_the_fake_ip_filter() {
+        assert_eq!(server_host("https://srv.example.com/"), vec!["srv.example.com"]);
+        assert_eq!(server_host("https://srv.example.com:8443/p"), vec!["srv.example.com"]);
+        assert_eq!(server_host("http://srv.example.com"), vec!["srv.example.com"]);
+    }
+
+    /// IP 字面量与畸形 URL 不进 filter，但也不能 panic。
+    ///
+    /// IP 压根不经过 DNS，往 filter 里放它没有意义；而 URL 非法时
+    /// `shard_setup::plan` 那边已经会降级并告警，这里再报一次只是噪音。
+    #[test]
+    fn ip_literals_and_malformed_urls_yield_no_filter_entry() {
+        assert!(server_host("https://203.0.113.7/").is_empty(), "IPv4 字面量不走 DNS");
+        assert!(server_host("https://[2001:db8::1]:443/").is_empty(), "IPv6 字面量同理");
+        assert!(server_host("srv.example.com").is_empty(), "缺 scheme");
+        assert!(server_host("https://").is_empty(), "缺主机");
+        assert!(server_host("").is_empty());
+    }
+
+    /// DNS 上游必须是 IP —— 用域名配上游是个先有鸡还是先有蛋的死结。
+    ///
+    /// 裸 IPv6 是这里唯一的坑：它自己就带一堆冒号，靠「有没有冒号」猜带不带
+    /// 端口必然猜错，把一个完全合法的上游判成非法。用户看到的只是
+    /// 「DNS 起不来」，而域名规则会因此全部失效。
+    #[test]
+    fn the_dns_upstream_takes_bare_ips_and_rejects_domains() {
+        use bootstrap::parse_dns_upstream as p;
+        assert_eq!(p("1.1.1.1").unwrap().to_string(), "1.1.1.1:53", "裸 IPv4 补 53");
+        assert_eq!(p("1.1.1.1:5353").unwrap().port(), 5353, "显式端口要保住");
+        assert_eq!(
+            p("2606:4700:4700::1111").unwrap().port(),
+            53,
+            "裸 IPv6 不能被当成「带端口」误解析"
+        );
+        assert_eq!(p("[2606:4700:4700::1111]:5353").unwrap().port(), 5353);
+
+        // 域名一律拒绝，且错误要说清为什么。
+        let e = p("dns.example.com").unwrap_err().to_string();
+        assert!(e.contains("必须写 IP"), "错误要点明原因：{e}");
+        assert!(p("dns.example.com:53").is_err());
+        assert!(p("").is_err());
     }
 }
