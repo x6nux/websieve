@@ -13,6 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod bridge;
+mod custody;
 mod emitter_src;
 mod hosts;
 mod proxy;
