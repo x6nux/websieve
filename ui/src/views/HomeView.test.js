@@ -3,12 +3,8 @@ import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import HomeView from './HomeView.svelte';
 
-const colorOf = () => '#5b8ff9';
-
 const base = () => ({
   groups: [],
-  colorOf,
-  allowLan: false,
   systemProxy: false,
   tunEnabled: false,
   preset: 'custom',

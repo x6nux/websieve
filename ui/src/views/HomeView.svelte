@@ -14,12 +14,11 @@
   import Switch from '../lib/Switch.svelte';
   import EmptyState from './EmptyState.svelte';
   import { bytes } from '../lib/format.js';
+  import { PRESET_OPTIONS } from '../lib/routing-preset.js';
 
   let {
     /** proxy-groups 的全量列表（已脱敏 config 的一部分） */
     groups = [],
-    colorOf,
-    allowLan = false,
     systemProxy = false,
     tunEnabled = false,
     /** 与 RulesView 顶部同一份状态：direct / global / china / custom */
@@ -33,13 +32,6 @@
     ontunchange = () => {},
     onpresetchange = () => {},
   } = $props();
-
-  const PRESET_OPTIONS = [
-    { value: 'direct', label: '全局直连' },
-    { value: 'global', label: '全局代理' },
-    { value: 'china', label: '中国大陆' },
-    { value: 'custom', label: '规则' },
-  ];
 
   const selectGroups = $derived(groups.filter((g) => g.kind === 'select'));
   let activeGroupName = $state('');
@@ -113,6 +105,8 @@
     <h2>流量统计</h2>
     <div class="spark" aria-hidden="true">
       {#each spark as v, i (i)}
+        <!-- 对数刻度：一次流量尖峰不该把其余柱子全部压扁成看不出差异的平线。
+             *6 后夹在 [1, 40]px 之间——40 留出一点余量，对应 .spark 容器的 44px 高。 -->
         <i style:height="{Math.max(1, Math.min(40, Math.log10(v + 1) * 6))}px"></i>
       {/each}
     </div>
