@@ -251,6 +251,149 @@ pub fn insert_rule_line(src: &str, anchor_line: u64, value: &str) -> Result<Stri
     Err(EditError::NotASequenceItem(anchor_line))
 }
 
+/// 在 `proxies:` 列表末尾追加一个新的服务器块。`lines` 是调用方已经按
+/// 固定缩进格式化好的若干行（每行是 `- name: ...` 这一级的内容，本函数
+/// 统一在每行前面补两格缩进），不接受任意文本——UI 端拼好结构，这里只
+/// 负责找到插入点。`proxies: []`（空流式）会被就地展开成块式。
+///
+/// `proxies:` 键不存在时报错，不猜测——本项目的默认配置与
+/// `Config::default()` 都会写这个键，不存在意味着文件被手动删过这个键。
+pub fn append_proxy_block(src: &str, lines: &[String]) -> Result<String, EditError> {
+    if lines.is_empty() {
+        return Err(EditError::EmptyValue);
+    }
+
+    let all: Vec<&str> = split_keep_ends(src);
+    let key_idx = all
+        .iter()
+        .position(|l| {
+            let (body, _) = split_eol(l);
+            body == "proxies:" || body.trim_end() == "proxies: []"
+        })
+        .ok_or(EditError::NotASequenceItem(0))?;
+
+    let (key_body, key_eol) = split_eol(all[key_idx]);
+    let sep = if key_eol.is_empty() { "\n" } else { key_eol };
+
+    let mut block = String::new();
+    for l in lines {
+        block.push_str("  ");
+        block.push_str(l);
+        block.push_str(sep);
+    }
+
+    if key_body.trim_end() == "proxies: []" {
+        let expanded = format!("proxies:{sep}{block}");
+        let mut out = String::with_capacity(src.len() + expanded.len());
+        for (i, l) in all.iter().enumerate() {
+            if i == key_idx {
+                out.push_str(&expanded);
+            } else {
+                out.push_str(l);
+            }
+        }
+        return Ok(out);
+    }
+
+    // 块式：找列表结束的位置——遇到缩进为 0 的非空行（下一个顶层键）
+    // 或文件结束为止。空行仍算列表内的间隔，不当作结束标志。
+    let mut end = all.len();
+    for i in (key_idx + 1)..all.len() {
+        let (body, _) = split_eol(all[i]);
+        if body.trim().is_empty() {
+            continue;
+        }
+        if indent_width(body) == 0 {
+            end = i;
+            break;
+        }
+    }
+
+    let mut out = String::with_capacity(src.len() + block.len());
+    for l in &all[..end] {
+        out.push_str(l);
+    }
+    if end == all.len() {
+        if let Some(last) = all.last() {
+            let (_, last_eol) = split_eol(last);
+            if last_eol.is_empty() {
+                out.push_str(sep);
+            }
+        }
+    }
+    out.push_str(&block);
+    for l in &all[end..] {
+        out.push_str(l);
+    }
+    Ok(out)
+}
+
+/// 按 `name` 定位并删除对应的服务器块，从它的 `- name: ...` 行到下一个
+/// 同级 `- name:`（或列表结束）为止，整段删掉，其余字节不动。
+///
+/// 认 `- name: "日本节点"` 与 `- name: 日本节点` 两种写法（带引号与不带）。
+/// 找不到匹配的名字、或 `proxies:` 键本身不存在/是空列表，都报错——
+/// 删除一个不存在的东西不该悄悄什么都不做。
+pub fn delete_proxy_block(src: &str, name: &str) -> Result<String, EditError> {
+    let all: Vec<&str> = split_keep_ends(src);
+    let key_idx = all
+        .iter()
+        .position(|l| {
+            let (body, _) = split_eol(l);
+            body == "proxies:" || body.trim_end() == "proxies: []"
+        })
+        .ok_or(EditError::NotASequenceItem(0))?;
+
+    let (key_body, _) = split_eol(all[key_idx]);
+    if key_body.trim_end() == "proxies: []" {
+        return Err(EditError::NotASequenceItem(key_idx as u64 + 1));
+    }
+
+    let mut start: Option<usize> = None;
+    let mut end = all.len();
+    let mut i = key_idx + 1;
+    while i < all.len() {
+        let (body, _) = split_eol(all[i]);
+        if body.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        if indent_width(body) == 0 {
+            end = i;
+            break;
+        }
+        let trimmed = body.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("- ") {
+            if start.is_some() {
+                end = i;
+                break;
+            }
+            if item_name_matches(rest, name) {
+                start = Some(i);
+            }
+        }
+        i += 1;
+    }
+    let start = start.ok_or(EditError::NotASequenceItem(key_idx as u64 + 1))?;
+
+    let mut out = String::with_capacity(src.len());
+    for (idx, l) in all.iter().enumerate() {
+        if idx < start || idx >= end {
+            out.push_str(l);
+        }
+    }
+    Ok(out)
+}
+
+/// 判断 `- ` 之后的这一行内容（形如 `name: "xxx"` 或 `name: xxx`）
+/// 是否是 `target` 这个名字——认引号也认不带引号两种写法。
+fn item_name_matches(rest: &str, target: &str) -> bool {
+    let Some(value) = rest.strip_prefix("name:").map(str::trim) else {
+        return false;
+    };
+    value.trim_matches('"') == target
+}
+
 /// 在第 `at`（0-based）行之后插入 `new_line`；若该行原本没有换行符
 /// （文件不以换行结尾），先补一个，避免原内容与新行糊成一行。
 fn splice_after(lines: &[&str], at: usize, orig_eol: &str, new_line: &str) -> String {
@@ -939,6 +1082,100 @@ rules:
         assert!(matches!(
             insert_rule_line(src, 99, "GEOSITE,cn,DIRECT"),
             Err(EditError::LineOutOfRange(99, 2))
+        ));
+    }
+
+    #[test]
+    fn append_proxy_expands_an_empty_flow_sequence() {
+        let src = "mixed-port: 25500\nproxies: []\nrules: []\n";
+        let lines = vec![
+            "- name: \"日本节点\"".to_string(),
+            "  type: websieve".to_string(),
+            "  url: https://example.com/".to_string(),
+            "  server-pub: \"aa\"".to_string(),
+            "  client-priv: \"bb\"".to_string(),
+        ];
+        let out = append_proxy_block(src, &lines).unwrap();
+        assert_eq!(
+            out,
+            "mixed-port: 25500\nproxies:\n  - name: \"日本节点\"\n    type: websieve\n    url: https://example.com/\n    server-pub: \"aa\"\n    client-priv: \"bb\"\nrules: []\n"
+        );
+    }
+
+    #[test]
+    fn append_proxy_after_an_existing_block() {
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\nrules: []\n";
+        let lines = vec!["- name: \"香港节点\"".to_string(), "  type: websieve".to_string()];
+        let out = append_proxy_block(src, &lines).unwrap();
+        assert_eq!(
+            out,
+            "proxies:\n  - name: \"日本节点\"\n    type: websieve\n  - name: \"香港节点\"\n    type: websieve\nrules: []\n"
+        );
+    }
+
+    #[test]
+    fn append_proxy_when_the_list_runs_to_end_of_file() {
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\n";
+        let lines = vec!["- name: \"香港节点\"".to_string(), "  type: websieve".to_string()];
+        let out = append_proxy_block(src, &lines).unwrap();
+        assert_eq!(
+            out,
+            "proxies:\n  - name: \"日本节点\"\n    type: websieve\n  - name: \"香港节点\"\n    type: websieve\n"
+        );
+    }
+
+    #[test]
+    fn append_proxy_untouched_bytes_stay_untouched() {
+        let src = "mixed-port: 25500\nproxies:\n  - name: \"日本节点\"\n    type: websieve\nrules:\n  - MATCH,日本节点\n";
+        let lines = vec!["- name: \"香港节点\"".to_string(), "  type: websieve".to_string()];
+        let out = append_proxy_block(src, &lines).unwrap();
+        assert!(out.starts_with("mixed-port: 25500\nproxies:\n  - name: \"日本节点\"\n    type: websieve\n"));
+        assert!(out.ends_with("rules:\n  - MATCH,日本节点\n"));
+    }
+
+    #[test]
+    fn append_proxy_rejects_empty_lines() {
+        let src = "proxies: []\n";
+        assert!(matches!(append_proxy_block(src, &[]), Err(EditError::EmptyValue)));
+    }
+
+    #[test]
+    fn append_proxy_missing_key_is_an_error() {
+        let src = "mixed-port: 25500\nrules: []\n";
+        let lines = vec!["- name: \"x\"".to_string()];
+        assert!(matches!(
+            append_proxy_block(src, &lines),
+            Err(EditError::NotASequenceItem(0))
+        ));
+    }
+
+    #[test]
+    fn delete_proxy_removes_the_named_block_and_nothing_else() {
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\n  - name: \"香港节点\"\n    type: websieve\nrules: []\n";
+        let out = delete_proxy_block(src, "日本节点").unwrap();
+        assert_eq!(out, "proxies:\n  - name: \"香港节点\"\n    type: websieve\nrules: []\n");
+    }
+
+    #[test]
+    fn delete_proxy_that_is_the_last_item_before_eof() {
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\n";
+        let out = delete_proxy_block(src, "日本节点").unwrap();
+        assert_eq!(out, "proxies:\n");
+    }
+
+    #[test]
+    fn delete_proxy_matches_an_unquoted_name_too() {
+        let src = "proxies:\n  - name: 日本节点\n    type: websieve\nrules: []\n";
+        let out = delete_proxy_block(src, "日本节点").unwrap();
+        assert_eq!(out, "proxies:\nrules: []\n");
+    }
+
+    #[test]
+    fn delete_proxy_unknown_name_is_an_error_not_a_silent_noop() {
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\nrules: []\n";
+        assert!(matches!(
+            delete_proxy_block(src, "幽灵节点"),
+            Err(EditError::NotASequenceItem(_))
         ));
     }
 }
