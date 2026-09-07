@@ -36,13 +36,13 @@ pub enum ConfigError {
     UnsupportedProxyType { name: String, kind: String },
     #[error("出站名重复：{0}。规则用名字引用出站，重名会产生歧义")]
     DuplicateProxyName(String),
-    #[error("代理组名 {0:?} 重复——组名必须唯一，UI 靠它定位该改写哪个组块")]
+    #[error("代理组名 {0} 重复——组名必须唯一，UI 靠它定位该改写哪个组块")]
     DuplicateProxyGroupName(String),
-    #[error("代理组名 {0:?} 与一个出站名重复——组名与出站名共享同一个命名空间，规则引用时才不会混淆")]
+    #[error("代理组名 {0} 与一个出站名重复——组名与出站名共享同一个命名空间，规则引用时才不会混淆")]
     GroupNameCollidesWithOutbound(String),
     #[error("代理组 {group:?} 的成员 {member:?} 不是一个已存在的出站名（也不允许引用另一个组）")]
     UnknownGroupMember { group: String, member: String },
-    #[error("代理组 {group:?} 的 selected 是 {selected:?}，但它不在自己的 proxies 成员列表里")]
+    #[error("代理组 {group:?} 的 selected 是 {selected:?}，但它不在自己的 proxies 成员列表里——UI 只会从 proxies 里列选项，selected 落在列表外就会显示成一个选不中的空选项")]
     SelectedNotAMember { group: String, selected: String },
     #[error("{field} 的值 {value:?} 不合法，应为 {legal} 之一")]
     BadEnumField {
@@ -136,48 +136,49 @@ impl Config {
             &["custom", "china"],
             "custom / china",
         )?;
-        {
-            let mut seen_groups: HashSet<&str> = HashSet::new();
-            let outbound_names = self.outbound_names();
-            for g in &self.proxy_groups {
-                if !seen_groups.insert(g.name.as_str()) {
-                    return Err(ConfigError::DuplicateProxyGroupName(g.name.clone()));
-                }
-                if outbound_names.contains(g.name.as_str()) {
-                    return Err(ConfigError::GroupNameCollidesWithOutbound(g.name.clone()));
-                }
-                check_enum(
-                    "proxy-groups[].kind",
-                    &g.kind,
-                    &["select", "auto", "load-balance"],
-                    "select / auto / load-balance",
-                )?;
-                for m in &g.proxies {
-                    if !outbound_names.contains(m.as_str()) {
-                        return Err(ConfigError::UnknownGroupMember {
-                            group: g.name.clone(),
-                            member: m.clone(),
-                        });
-                    }
-                }
-                if g.kind == "select" && !g.proxies.iter().any(|m| m == &g.selected) {
-                    return Err(ConfigError::SelectedNotAMember {
+        let mut seen_groups: HashSet<&str> = HashSet::new();
+        let outbound_names = self.outbound_names();
+        for g in &self.proxy_groups {
+            // seen_groups 顺带把「组名互相之间不能重复」也一并挡住了：
+            // 遍历到第二个同名组时 insert 会失败。
+            if !seen_groups.insert(g.name.as_str()) {
+                return Err(ConfigError::DuplicateProxyGroupName(g.name.clone()));
+            }
+            if outbound_names.contains(g.name.as_str()) {
+                return Err(ConfigError::GroupNameCollidesWithOutbound(g.name.clone()));
+            }
+            // 归一化后再比较：check_enum 本身按 trim + 转小写判定合法性，
+            // 若下面的 == 比较仍用原始 g.kind，像 "Select" 这种大小写变体会
+            // 通过 check_enum 却在这里被当成"未知 kind"而跳过后续校验。
+            let kind = g.kind.trim().to_ascii_lowercase();
+            check_enum(
+                "proxy-groups[].kind",
+                &kind,
+                &["select", "auto", "load-balance"],
+                "select / auto / load-balance",
+            )?;
+            for m in &g.proxies {
+                if !outbound_names.contains(m.as_str()) {
+                    return Err(ConfigError::UnknownGroupMember {
                         group: g.name.clone(),
-                        selected: g.selected.clone(),
+                        member: m.clone(),
                     });
                 }
-                if g.kind == "load-balance" {
-                    check_enum(
-                        "proxy-groups[].strategy",
-                        &g.strategy,
-                        &["consistent-hash", "round-robin"],
-                        "consistent-hash / round-robin",
-                    )?;
-                }
             }
-            // 组名互相之间也不能重复（第二个组名与第一个组名相同的场景已被
-            // seen_groups 挡住；这里再补一条组名之间不能与任一其他组名相同——
-            // 与上面的 seen_groups 是同一次遍历完成的，无需额外循环）。
+            if kind == "select" && !g.proxies.iter().any(|m| m == &g.selected) {
+                return Err(ConfigError::SelectedNotAMember {
+                    group: g.name.clone(),
+                    selected: g.selected.clone(),
+                });
+            }
+            if kind == "load-balance" {
+                check_enum(
+                    "proxy-groups[].strategy",
+                    &g.strategy,
+                    &["consistent-hash", "round-robin"],
+                    "consistent-hash / round-robin",
+                )?;
+            }
         }
         check_enum("carrier", &self.carrier, &["shared", "isolated"], "shared / isolated")?;
         check_enum(
@@ -592,6 +593,38 @@ proxies:
 proxy-groups:
   - name: 我的组
     kind: select
+    proxies: [日本节点]
+    selected: 香港节点
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::SelectedNotAMember { group: ref g, .. } if g == "我的组"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_select_group_whose_selected_is_not_a_member_even_with_mixed_case_kind() {
+        // kind 写成 "Select"（大小写不同于 schema 里的 "select"）也必须走完
+        // select 分支该有的校验，不能因为 check_enum 归一化后就漏判 == "select"
+        // 而让下面这条本该失败的 selected 检查被静默跳过。
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+  - name: \"香港节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 我的组
+    kind: Select
     proxies: [日本节点]
     selected: 香港节点
 rules:
