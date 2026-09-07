@@ -73,6 +73,15 @@ pub struct ConfigView {
     pub config: serde_json::Value,
     /// 规则连同它在文件里的 1-based 行号。
     pub rules: Vec<RuleView>,
+    /// `rules:` 键本身所在的 1-based 行号。规则列表为空时，UI 没有任何
+    /// 已有规则的行号可以当插入锚点，只能靠这个字段——见 `RuleOp::InsertRule`。
+    pub rules_key_line: u64,
+    /// `rules_key_line` 那一行的原样文本（`"rules:"` 或 `"rules: []"`）。
+    /// `RuleOp::InsertRule` 拿 `rules_key_line` 当 anchor 时，`anchor_expect`
+    /// 必须填这一行**当前实际的**文本——前端拿不到这份文本就只能猜，
+    /// 猜错了并发校验会拒绝一次本该成功的插入。单独给一个字段，
+    /// 不指望前端凭空知道空列表在文件里到底写的是哪一种空写法。
+    pub rules_key_text: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,17 +113,29 @@ pub enum RuleOp {
         /// 调用方看到的当前值（并发校验）
         expect: String,
     },
+    /// 在 anchor 行之后插入一条新规则。anchor 可以是某条已有规则的行，
+    /// 也可以是 `rules_key_line`（此时新规则成为第一条）。
+    InsertRule {
+        anchor: u64,
+        /// 并发校验：调用方看到 anchor 行当前的原始文本——
+        /// 是某条规则时为它的值，是 rules_key_line 时为该行原样文本
+        /// （`"rules:"` 或 `"rules: []"`）。
+        anchor_expect: String,
+        value: String,
+    },
 }
 
 impl RuleOp {
     fn line(&self) -> u64 {
         match self {
             Self::ReplaceRule { line, .. } | Self::DeleteRule { line, .. } => *line,
+            Self::InsertRule { anchor, .. } => *anchor,
         }
     }
     fn expect(&self) -> &str {
         match self {
             Self::ReplaceRule { expect, .. } | Self::DeleteRule { expect, .. } => expect,
+            Self::InsertRule { anchor_expect, .. } => anchor_expect,
         }
     }
 }
@@ -197,6 +218,16 @@ fn read_view(p: &Path) -> CmdResult<ConfigView> {
     build_view(&text)
 }
 
+/// `rules:` 键本身所在的 1-based 行号。扫的是顶层（零缩进）的 `rules:` 键，
+/// 不认识 `rules:` 出现在别处（比如某个字符串值里恰好含这几个字符）的情况——
+/// 那种输入本就不是合法配置，`load_str` 会先一步拒绝。
+fn find_rules_key_line(text: &str) -> Option<u64> {
+    text.lines()
+        .enumerate()
+        .find(|(_, l)| *l == "rules:" || l.trim_end() == "rules: []" || l.starts_with("rules:"))
+        .map(|(i, _)| i as u64 + 1)
+}
+
 fn build_view(text: &str) -> CmdResult<ConfigView> {
     let cfg = wsieve_config::load_str(text)?;
     // 语义校验也在读的时候跑：文件可能是用户手改坏的。报出来而不是让 UI
@@ -221,7 +252,23 @@ fn build_view(text: &str) -> CmdResult<ConfigView> {
         map.remove("rules");
     }
 
-    Ok(ConfigView { config, rules })
+    let rules_key_line = find_rules_key_line(text).ok_or_else(|| CmdError::ConfigInvalid {
+        message: "配置里找不到顶层的 rules: 键——这不应该发生，Config::default() 与\
+                  DEFAULT_CONFIG_YAML 都会写这个键"
+            .to_string(),
+    })?;
+    let rules_key_text = text
+        .lines()
+        .nth(rules_key_line as usize - 1)
+        .unwrap_or("rules:")
+        .to_string();
+
+    Ok(ConfigView {
+        config,
+        rules,
+        rules_key_line,
+        rules_key_text,
+    })
 }
 
 fn save_text(p: &Path, text: &str) -> CmdResult<()> {
@@ -253,20 +300,29 @@ fn apply_rule_ops(p: &Path, ops: Vec<RuleOp>) -> CmdResult<()> {
     // 不是边核对边改 —— 半途失败会留下一份改了一半的配置。
     let snapshot = wsieve_config::load_str(&text)?;
     for op in &ops {
-        let found = snapshot
-            .rules
-            .iter()
-            .find(|r| r.defined.line() == op.line())
-            .ok_or_else(|| CmdError::ConfigInvalid {
+        let actual = if let Some(r) = snapshot.rules.iter().find(|r| r.defined.line() == op.line()) {
+            r.value.clone()
+        } else if matches!(op, RuleOp::InsertRule { .. }) {
+            // anchor 不是一条已有规则——按 InsertRule 的约定，它应该是
+            // rules_key_line，直接比对那一行的原始文本。
+            text.lines()
+                .nth(op.line() as usize - 1)
+                .map(str::to_string)
+                .ok_or_else(|| CmdError::ConfigInvalid {
+                    message: format!("第 {} 行不存在", op.line()),
+                })?
+        } else {
+            return Err(CmdError::ConfigInvalid {
                 message: format!("第 {} 行不是一条规则（配置已被改动？）", op.line()),
-            })?;
-        if found.value != op.expect() {
+            });
+        };
+        if actual != op.expect() {
             return Err(CmdError::ConfigInvalid {
                 message: format!(
                     "第 {} 行现在是 {:?}，而不是你看到的 {:?}。\
                      配置在此期间被改过，已放弃本次保存 —— 照旧行号改下去会改到别的规则头上",
                     op.line(),
-                    found.value,
+                    actual,
                     op.expect()
                 ),
             });
@@ -275,12 +331,14 @@ fn apply_rule_ops(p: &Path, ops: Vec<RuleOp>) -> CmdResult<()> {
 
     // 语法校验：DeleteRule 不产生新内容，不需要过这一关。
     for op in &ops {
-        if let RuleOp::ReplaceRule { value, .. } = op {
-            if let Err(e) = Rule::parse(value) {
-                return Err(CmdError::ConfigInvalid {
-                    message: format!("{value:?} 不是一条合法规则：{e}"),
-                });
-            }
+        let value = match op {
+            RuleOp::ReplaceRule { value, .. } | RuleOp::InsertRule { value, .. } => value,
+            RuleOp::DeleteRule { .. } => continue,
+        };
+        if let Err(e) = Rule::parse(value) {
+            return Err(CmdError::ConfigInvalid {
+                message: format!("{value:?} 不是一条合法规则：{e}"),
+            });
         }
     }
 
@@ -292,6 +350,9 @@ fn apply_rule_ops(p: &Path, ops: Vec<RuleOp>) -> CmdResult<()> {
             }
             RuleOp::DeleteRule { line, .. } => {
                 wsieve_config::edit::delete_rule_line(&out, *line)?
+            }
+            RuleOp::InsertRule { anchor, value, .. } => {
+                wsieve_config::edit::insert_rule_line(&out, *anchor, value)?
             }
         };
     }
@@ -861,6 +922,97 @@ rules:
 
         let after = std::fs::metadata(&p).unwrap().modified().unwrap();
         assert_eq!(before, after, "空操作不该碰文件");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn insert_rule_appends_after_an_existing_rule() {
+        let d = tmpdir("insert-after");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap();
+
+        let view = read_view(&p).unwrap();
+        let last = view.rules.last().unwrap();
+        apply_rule_ops(
+            &p,
+            vec![RuleOp::InsertRule {
+                anchor: last.line,
+                anchor_expect: last.value.clone(),
+                value: "GEOSITE,private,DIRECT".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let after = read_view(&p).unwrap();
+        assert_eq!(after.rules.last().unwrap().value, "GEOSITE,private,DIRECT");
+        assert_eq!(after.rules.len(), view.rules.len() + 1);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn insert_rule_into_an_empty_rules_list_uses_rules_key_line() {
+        let d = tmpdir("insert-empty");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, "mixed-port: 25500\nproxies: []\nrules: []\n").unwrap();
+
+        let view = read_view(&p).unwrap();
+        assert!(view.rules.is_empty());
+        assert_eq!(view.rules_key_text, "rules: []");
+        apply_rule_ops(
+            &p,
+            vec![RuleOp::InsertRule {
+                anchor: view.rules_key_line,
+                anchor_expect: view.rules_key_text.clone(),
+                value: "MATCH,DIRECT".to_string(),
+            }],
+        )
+        .unwrap();
+
+        let after = read_view(&p).unwrap();
+        assert_eq!(after.rules.len(), 1);
+        assert_eq!(after.rules[0].value, "MATCH,DIRECT");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn insert_rule_rejects_syntactically_invalid_values() {
+        let d = tmpdir("insert-bad-syntax");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap();
+        let view = read_view(&p).unwrap();
+        let last = view.rules.last().unwrap();
+
+        let err = apply_rule_ops(
+            &p,
+            vec![RuleOp::InsertRule {
+                anchor: last.line,
+                anchor_expect: last.value.clone(),
+                value: "不合法".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, CmdError::ConfigInvalid { .. }));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn insert_rule_with_a_stale_anchor_is_refused() {
+        let d = tmpdir("insert-stale");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap();
+        let view = read_view(&p).unwrap();
+        let last = view.rules.last().unwrap();
+
+        let err = apply_rule_ops(
+            &p,
+            vec![RuleOp::InsertRule {
+                anchor: last.line,
+                anchor_expect: "这不是当前的值".to_string(),
+                value: "MATCH,DIRECT".to_string(),
+            }],
+        )
+        .unwrap_err();
+        assert!(matches!(err, CmdError::ConfigInvalid { .. }));
         std::fs::remove_dir_all(&d).unwrap();
     }
 
