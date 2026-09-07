@@ -645,7 +645,12 @@ async fn run_stack(
         );
         manager.stop_all().await;
         // core 死才 reload —— 这是两级生命周期里唯一该 reload 的那一级。
-        for (label, _) in app.webview_windows() {
+        // 但只 reload 承载/传输窗口：control 窗口装着用户正在编辑的
+        // Svelte 状态（当前视图、打开的对话框、未提交的表单），它的页面
+        // 没死，reload 它只会把这些状态原地清空——用户什么都没做，
+        // 出站重连一次首页就白丢一次。
+        let all_labels: Vec<String> = app.webview_windows().keys().cloned().collect();
+        for label in windows_to_reload(&all_labels, control::LABEL) {
             if let Some(w) = app.get_webview_window(&label) {
                 let _ = w.eval("window.location.reload()");
             }
@@ -765,6 +770,18 @@ async fn wait_first_heartbeat(core: &Arc<bridge::TransportCore>, timeout: Durati
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     !core.heartbeat_stale()
+}
+
+/// 承载代循环 reload 时该刷新哪些窗口 —— 除 `control` 外的全部。
+///
+/// control 窗口的页面从未失效（失效的是出站的传输核心），reload 它只会
+/// 白白清空用户正在编辑的 Svelte 状态，见调用处注释。
+fn windows_to_reload(all_labels: &[String], control_label: &str) -> Vec<String> {
+    all_labels
+        .iter()
+        .filter(|l| l.as_str() != control_label)
+        .cloned()
+        .collect()
 }
 
 /// 把 JS 送进**指定的**承载 WebView。
@@ -1000,6 +1017,22 @@ mod tests {
         assert_eq!(server_host("https://srv.example.com/"), vec!["srv.example.com"]);
         assert_eq!(server_host("https://srv.example.com:8443/p"), vec!["srv.example.com"]);
         assert_eq!(server_host("http://srv.example.com"), vec!["srv.example.com"]);
+    }
+
+    /// 承载代循环 reload 时绝不能带上 control —— 它装着用户正在编辑的
+    /// Svelte 状态，其它窗口（承载/传输）该照常刷新。
+    #[test]
+    fn windows_to_reload_excludes_control_but_keeps_others() {
+        let all = vec![
+            "control".to_string(),
+            "wsieve-transport-A".to_string(),
+            "wsieve-transport-B".to_string(),
+        ];
+        let reloaded = windows_to_reload(&all, "control");
+        assert!(!reloaded.iter().any(|l| l == "control"), "control 不该被 reload");
+        assert!(reloaded.iter().any(|l| l == "wsieve-transport-A"));
+        assert!(reloaded.iter().any(|l| l == "wsieve-transport-B"));
+        assert_eq!(reloaded.len(), 2);
     }
 
     /// IP 字面量与畸形 URL 不进 filter，但也不能 panic。
