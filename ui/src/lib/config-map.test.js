@@ -9,6 +9,7 @@ import {
   commentStart,
   setScalar,
   setGroupSelected,
+  setNestedScalar,
   decisionOf,
   probeResultOf,
 } from './config-map.js';
@@ -452,6 +453,60 @@ describe('setGroupSelected', () => {
     expect(out).toBe(crlf.replace('    selected: 日本节点\r\n', '    selected: 香港节点\r\n'));
     expect(out).toContain('    selected: 香港节点\r\n');
     expect(out).toContain('  - name: 自动选优\r\n');
+  });
+});
+
+describe('setNestedScalar —— tun.enable 这类嵌套标量', () => {
+  const src = [
+    '# websieve 配置',
+    'mixed-port: 7890',
+    'system-proxy: false',
+    'tun:',
+    '  enable: false',
+    '  stack: system  # 默认栈',
+    '  auto-route: true',
+    'dns:',
+    '  enable: true',
+    'rules: []',
+    '',
+  ].join('\n');
+
+  it('换掉嵌套字段的值', () => {
+    const out = setNestedScalar(src, 'tun', 'enable', true);
+    expect(out).toMatch(/^ {2}enable: true$/m);
+  });
+
+  it('保留行尾注释', () => {
+    const out = setNestedScalar(src, 'tun', 'stack', 'gvisor');
+    expect(out).toContain('  stack: gvisor  # 默认栈');
+  });
+
+  it('同一 parent 块下的其他兄弟字段不动', () => {
+    const out = setNestedScalar(src, 'tun', 'enable', true);
+    expect(out).toContain('  stack: system  # 默认栈');
+    expect(out).toContain('  auto-route: true');
+  });
+
+  it('其余顶层键（包括另一个同名子键 dns.enable）一字节不变', () => {
+    const out = setNestedScalar(src, 'tun', 'enable', true);
+    expect(out).toContain('mixed-port: 7890');
+    expect(out).toContain('system-proxy: false');
+    expect(out).toContain('dns:\n  enable: true');
+    expect(out).toContain('rules: []');
+  });
+
+  it('parentKey 不存在时如实报错，不静默追加', () => {
+    expect(() => setNestedScalar('rules: []\n', 'tun', 'enable', true)).toThrow(/tun/);
+  });
+
+  it('parentKey 存在但块内没有 childKey 时如实报错', () => {
+    expect(() => setNestedScalar(src, 'tun', 'mtu', 1500)).toThrow(/mtu/);
+  });
+
+  it('CRLF 文件下也能定位并保留 \\r\\n，其余行不动', () => {
+    const crlf = src.replace(/\n/g, '\r\n');
+    const out = setNestedScalar(crlf, 'tun', 'enable', true);
+    expect(out).toBe(crlf.replace('  enable: false\r\n', '  enable: true\r\n'));
   });
 });
 

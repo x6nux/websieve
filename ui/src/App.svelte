@@ -49,6 +49,7 @@
     parseRuleLine,
     probeResultOf,
     setGroupSelected,
+    setNestedScalar,
     setScalar,
     toCmdError,
     whereOf,
@@ -465,9 +466,15 @@
 
   /**
    * 首页系统代理/TUN 快捷开关的保存路径。与 saveSettings/saveRoutingPreset
-   * 同构——取原文 → setScalar 改一行 → config_save_raw 整份写回 → 重新加载。
+   * 同构——取原文 → 改一行 → config_save_raw 整份写回 → 重新加载。
    * 只有一个字段变化时不复用 saveSettings（它一次性收 4 个字段的 draft），
    * 避免首页的一次点击意外把设置覆盖层里可能还没提交的其他草稿也带上。
+   *
+   * `key` 带 `.` 就是嵌套字段（目前只有 `tun.enable`）——`tun` 在 schema 里
+   * 是个块，`enable:` 是它缩进的子键，不在 `tun:` 那一行上，必须走
+   * `setNestedScalar` 定位到块内再改；`system-proxy` 这种真正的顶层标量
+   * 才走 `setScalar`。两条路径都可能抛错（找不到 parentKey / childKey），
+   * 与 saveGroupSelection 同一条纪律：如实报错，不静默 no-op。
    */
   async function saveSystemProxyOrTun(key, value) {
     const raw = await call(configGetRaw);
@@ -475,7 +482,17 @@
       pushAlert(`切换失败（读不到配置原文）${whereOf(raw.error)}：${raw.error.message}`);
       return;
     }
-    const text = setScalar(raw.value, key, value);
+    let text;
+    try {
+      const dot = key.indexOf('.');
+      text =
+        dot < 0
+          ? setScalar(raw.value, key, value)
+          : setNestedScalar(raw.value, key.slice(0, dot), key.slice(dot + 1), value);
+    } catch (e) {
+      pushAlert(`切换失败：${e.message}`);
+      return;
+    }
     const w = await call(configSaveRaw, text);
     if (!w.ok) {
       pushAlert(`切换失败${whereOf(w.error)}：${w.error.message}`);

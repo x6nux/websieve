@@ -39,6 +39,7 @@ const CONFIG_VIEW = {
     'mixed-port': 7890,
     'allow-lan': false,
     'system-proxy': false,
+    tun: { enable: false },
     carrier: 'shared',
     'carrier-host': '',
     mode: 'rule',
@@ -118,6 +119,10 @@ const RAW_YAML = [
   '# 我手写的注释',
   'mixed-port: 7890  # 混合入口',
   'allow-lan: false',
+  'system-proxy: false',
+  'tun:',
+  '  enable: false',
+  '  stack: system  # 默认栈',
   'proxies:',
   '  - name: 日本节点',
   '    type: websieve',
@@ -735,6 +740,47 @@ describe('组装：设置保存走 config_save_raw 且不毁注释', () => {
     await u.click(within(d).getByRole('button', { name: '保存' }));
     await vi.waitFor(() => expect(screen.getByText(/读不到配置原文/)).toBeInTheDocument());
     expect(calls.some(([c]) => c === 'config_save_raw')).toBe(false);
+  });
+});
+
+describe('组装：首页系统代理/TUN 开关的保存路径', () => {
+  it('系统代理开关走顶层标量 setScalar，改到 system-proxy: true', async () => {
+    const u = userEvent.setup();
+    render(App);
+    await settled();
+    await u.click(screen.getByRole('switch', { name: '系统代理' }));
+    await vi.waitFor(() => expect(calls.some(([c]) => c === 'config_save_raw')).toBe(true));
+    const [, args] = calls.find(([c]) => c === 'config_save_raw');
+    expect(args.text).toMatch(/^system-proxy: true$/m);
+  });
+
+  it('TUN 开关走 setNestedScalar，改到 tun 块里的 enable: true，不是编造的顶层 tun.enable', async () => {
+    // 这是本次要修的 bug：旧实现用 setScalar(text, 'tun.enable', v) 去改一个
+    // schema 里不存在的顶层键，找不到就追加到文件末尾，写出一行
+    // `tun.enable: true`——Config 的 deny_unknown_fields 会把它整份拒收。
+    const u = userEvent.setup();
+    render(App);
+    await settled();
+    await u.click(screen.getByRole('switch', { name: '虚拟网卡（TUN）' }));
+    await vi.waitFor(() => expect(calls.some(([c]) => c === 'config_save_raw')).toBe(true));
+    const [, args] = calls.find(([c]) => c === 'config_save_raw');
+    expect(args.text).toMatch(/^ {2}enable: true$/m);
+    expect(args.text).not.toContain('tun.enable');
+    // tun 块里的兄弟字段与它的行尾注释不受影响
+    expect(args.text).toContain('  stack: system  # 默认栈');
+  });
+
+  it('TUN 开关保存失败（比如后端拒收）时如实报错，不假装成功', async () => {
+    installTauri({
+      config_save_raw: async () => {
+        throw { kind: 'config-syntax', message: '解析失败', line: 5, column: 3 };
+      },
+    });
+    const u = userEvent.setup();
+    render(App);
+    await settled();
+    await u.click(screen.getByRole('switch', { name: '虚拟网卡（TUN）' }));
+    await vi.waitFor(() => expect(screen.getByText(/切换失败/)).toBeInTheDocument());
   });
 });
 

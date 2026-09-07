@@ -311,6 +311,73 @@ export function setGroupSelected(text, groupName, member) {
 }
 
 /**
+ * 改写**嵌套**标量 `parentKey.childKey` 的值——比如 `tun.enable`。
+ *
+ * ## 为什么不能用 `setScalar`
+ *
+ * `setScalar` 明确只认「行首无缩进的 `key:`」这一种形状。`tun` 这样的字段
+ * 在 schema 里是个块（`tun:` 后面跟着缩进的 `enable:` / `stack:` / …），
+ * 它的值不在 `tun:` 那一行上，文件里也**不存在**字面意义上的 `tun.enable:`
+ * 这一行。所以 `setScalar(text, 'tun.enable', v)` 必然走到「键不存在→
+ * 追加到文件末尾」那条分支，写出一个 schema 里根本没有的顶层字段
+ * `tun.enable`——`Config` 上的 `#[serde(deny_unknown_fields)]` 会在下一次
+ * `config_save_raw` 时把整份写入拒收，界面上就是一个「切换失败」。
+ *
+ * ## 定位方式
+ *
+ * 与 `setGroupSelected` 同一套纪律：先精确匹配顶层、零缩进的 `parentKey:`
+ * 这一行（不是 `startsWith`，因为这里的值不在同一行上，不存在「后面还跟着
+ * 别的字符」的情况，与 `setGroupSelected` 找 `proxy-groups:` 同理）；
+ * 再把搜索范围限制在它的块内——下一个零缩进行（或 EOF）之前；
+ * 只在这个范围内找 `childKey:`，缩进宽度照抄那一行实际写的缩进，
+ * 不假设固定的 2 空格。
+ *
+ * 找不到 `parentKey:`，或者块内没有 `childKey:`，一律抛错，不静默 no-op——
+ * 无声失败比报错更危险，用户会以为开关已经生效。
+ */
+export function setNestedScalar(text, parentKey, childKey, value) {
+  const out = String(value);
+  const lines = String(text).split('\n');
+  const parentHead = `${parentKey}:`;
+  const keyIdx = lines.findIndex((l) => l.replace(/\r$/, '') === parentHead);
+  if (keyIdx < 0) {
+    throw new Error(`配置里没有 ${parentKey} 键，找不到 ${parentKey}.${childKey}`);
+  }
+
+  // 块边界：下一个零缩进行（或 EOF）之前，都算 parentKey 自己的内容。
+  let end = lines.length;
+  for (let i = keyIdx + 1; i < lines.length; i++) {
+    const line = lines[i].replace(/\r$/, '');
+    if (line.trim() === '') continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      end = i;
+      break;
+    }
+  }
+
+  const head = `${childKey}:`;
+  for (let i = keyIdx + 1; i < end; i++) {
+    const raw = lines[i];
+    const cr = raw.endsWith('\r') ? '\r' : '';
+    const line = cr ? raw.slice(0, -1) : raw;
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith(head)) continue;
+    const indentStr = line.slice(0, line.length - trimmed.length);
+    let rest = trimmed.slice(head.length);
+    const c = commentStart(rest);
+    if (c < 0) {
+      lines[i] = `${indentStr}${head} ${out}${cr}`;
+    } else {
+      const gap = /\s*$/.exec(rest.slice(0, c))[0];
+      lines[i] = `${indentStr}${head} ${out}${gap}${rest.slice(c)}${cr}`;
+    }
+    return lines.join('\n');
+  }
+  throw new Error(`${parentKey} 块里没有 ${childKey} 字段`);
+}
+
+/**
  * `RuleTestResult.decision`（"DIRECT" | "REJECT" | 出站名）→ Probe 认的三个词。
  * 分开是因为 Probe 要给 DIRECT / REJECT 上固定的状态色，给出站上色码。
  */
