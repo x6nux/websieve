@@ -11,6 +11,8 @@
     "allow-config-save",
     "allow-config-get-raw",
     "allow-config-save-raw",
+    "allow-config-insert-proxy",
+    "allow-config-delete-proxy",
     "allow-connect",
     "allow-disconnect",
     "allow-set-mode",

@@ -374,6 +374,86 @@ fn apply_rule_ops(p: &Path, ops: Vec<RuleOp>) -> CmdResult<()> {
     write_0600(p, &out)
 }
 
+/// 新增一个出站服务器块。`lines` 由调用方（`config_insert_proxy` 命令）
+/// 按固定格式拼好——见该命令的文档注释。
+///
+/// 名字冲突（与已有出站名或已有组名重复）在这里挡，而不是等
+/// `Config::validate()` 去挡：`validate()` 的报错信息是给「文件已经写完」
+/// 之后的场景设计的，这里能在写之前就说清楚是哪个名字冲突，用户体验更直接，
+/// 也避免了「先写坏、再报错、再要求用户手动改回去」这种更差的路径。
+fn insert_proxy_block(p: &Path, lines: Vec<String>) -> CmdResult<()> {
+    let name = extract_name_field(&lines).ok_or_else(|| CmdError::ConfigInvalid {
+        message: "新节点的第一行必须是 `- name: \"...\"`".to_string(),
+    })?;
+
+    let text = read_text(p)?;
+    let snapshot = wsieve_config::load_str(&text)?;
+    if snapshot.outbound_names().contains(name.as_str())
+        || snapshot.proxy_groups.iter().any(|g| g.name == name)
+    {
+        return Err(CmdError::ConfigInvalid {
+            message: format!("名字 {name:?} 已经被一个出站或代理组占用，换一个名字"),
+        });
+    }
+
+    let out = wsieve_config::edit::append_proxy_block(&text, &lines)?;
+    wsieve_config::load_str(&out)?.validate()?;
+    write_0600(p, &out)
+}
+
+/// 从新节点的行数组里取出 `name` 字段的值（认引号也认不带引号）。
+fn extract_name_field(lines: &[String]) -> Option<String> {
+    let first = lines.first()?;
+    let rest = first.trim_start().strip_prefix("- name:")?;
+    Some(rest.trim().trim_matches('"').to_string())
+}
+
+/// 按名字删除一个出站服务器块。
+///
+/// `wsieve_config::edit::delete_proxy_block` 找不到这个名字时返回的是
+/// `EditError::NotASequenceItem`——那是给「定点改写认不出目标行」这类
+/// **写入侧**故障设计的变体，经 `CmdError` 的 blanket `From` 会落到
+/// `ConfigNotWritable`（见 `commands/mod.rs`）。但「删除一个不存在的出站」
+/// 不是写坏了什么，是调用方传了个语义上不成立的名字——与 `ConfigInvalid`
+/// 的定义（"语法是对的，含义不对"）完全对应，因此这里显式接住并改判，
+/// 而不是让 `?` 顺着 blanket 转换走到方向错误的变体上。
+fn delete_proxy_block_cmd(p: &Path, name: &str) -> CmdResult<()> {
+    let text = read_text(p)?;
+    let out = wsieve_config::edit::delete_proxy_block(&text, name).map_err(|e| {
+        CmdError::ConfigInvalid {
+            message: format!("删除出站 {name:?} 失败：{e}"),
+        }
+    })?;
+    wsieve_config::load_str(&out)?.validate()?;
+    write_0600(p, &out)
+}
+
+/// 新增一个出站服务器（结构化，UI 表单驱动）。
+///
+/// `lines` 由前端按固定顺序拼好：`- name: "..."` / `type: websieve` /
+/// `url: ...` / `server-pub: "..."` / `client-priv: "..."`，可选再加
+/// `extra-sessions: N` / `mux-prefs: [...]`。**不接受任意文本**——本命令
+/// 只负责把这几行原样插进 `proxies:` 列表，不解释、不校验字段语义之外的
+/// 格式（那是 `Config::validate()` 与 YAML 解析本身的职责）。
+///
+/// 私钥经过这条 IPC 边界是真实存在的事——`client-priv` 出现在 `lines`
+/// 里，随命令参数一起序列化。这与 `config_save_raw` 已经承担的风险同类，
+/// UI 侧的处置义务见设计文档 §6.2。
+#[tauri::command]
+pub async fn config_insert_proxy(app: tauri::AppHandle, lines: Vec<String>) -> CmdResult<()> {
+    insert_proxy_block(&config_path(&app)?, lines)
+}
+
+#[tauri::command]
+pub async fn config_delete_proxy(app: tauri::AppHandle, name: String) -> CmdResult<()> {
+    if name.trim().is_empty() {
+        return Err(CmdError::ConfigInvalid {
+            message: "出站名不能为空".to_string(),
+        });
+    }
+    delete_proxy_block_cmd(&config_path(&app)?, &name)
+}
+
 /// 以 0600 创建并原子替换。
 ///
 /// **必须以 0600 创建**，而不是先创建再 chmod —— 后者有一个竞态窗口，期间
@@ -1071,5 +1151,77 @@ rules:
             other => panic!("应被拒，实为 {other:?}"),
         }
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    // ── 写：新增/删除出站服务器块 ───────────────────────────
+
+    #[test]
+    fn insert_proxy_appends_a_new_server_block() {
+        let d = tmpdir("insert-proxy");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, "mixed-port: 25500\nproxies: []\nrules: []\n").unwrap();
+
+        insert_proxy_block(
+            &p,
+            vec![
+                "- name: \"日本节点\"".to_string(),
+                "  type: websieve".to_string(),
+                "  url: https://example.com/".to_string(),
+                "  server-pub: \"aa\"".to_string(),
+                "  client-priv: \"bb\"".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let view = read_view(&p).unwrap();
+        let names: Vec<_> = view.config["proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["日本节点"]);
+    }
+
+    #[test]
+    fn insert_proxy_rejects_a_name_that_already_exists() {
+        let d = tmpdir("insert-proxy-dup");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap(); // SAMPLE 已含 "日本节点"
+
+        let err = insert_proxy_block(
+            &p,
+            vec![
+                "- name: \"日本节点\"".to_string(),
+                "  type: websieve".to_string(),
+                "  url: https://example.com/".to_string(),
+                "  server-pub: \"cc\"".to_string(),
+                "  client-priv: \"dd\"".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, CmdError::ConfigInvalid { .. }));
+    }
+
+    #[test]
+    fn delete_proxy_by_name_removes_it() {
+        let d = tmpdir("delete-proxy");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap();
+
+        delete_proxy_block_cmd(&p, "日本节点").unwrap();
+
+        let view = read_view(&p).unwrap();
+        assert_eq!(view.config["proxies"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn delete_proxy_unknown_name_is_named_in_the_error() {
+        let d = tmpdir("delete-proxy-unknown");
+        let p = d.join("config.yaml");
+        save_text(&p, SAMPLE).unwrap();
+
+        let err = delete_proxy_block_cmd(&p, "幽灵节点").unwrap_err();
+        assert!(matches!(err, CmdError::ConfigInvalid { .. }));
     }
 }

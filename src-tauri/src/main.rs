@@ -334,6 +334,8 @@ fn main() {
             commands::config::config_get_raw,
             commands::config::config_save,
             commands::config::config_save_raw,
+            commands::config::config_insert_proxy,
+            commands::config::config_delete_proxy,
             commands::control::connect,
             commands::control::disconnect,
             commands::control::set_mode,
