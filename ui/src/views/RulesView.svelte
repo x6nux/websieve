@@ -186,6 +186,20 @@
   /** 待二次确认删除的规则 id；null 表示没有任何一行处在确认态 */
   let confirmingDelete = $state(null);
 
+  /**
+   * `rules` 换新数组（reload/增删改/排序落盘，见 App.svelte 的
+   * `loadConfig()`）就清空确认态。`confirmingDelete` 记的是 id，而 id
+   * 是位置索引（`parseRuleLine(r0, i, ...)`），reload 后同一个 id 可能
+   * 落到另一条规则头上。不清的话：对 A 行点「删除」进入确认态，中途去
+   * 编辑了别的规则触发 reload，回来发现 A 行原来的位置换了条新规则，
+   * 却顶着「确认删除/取消」的按钮——用户以为还是在确认 A，再点一下删的
+   * 却是他没打算删的那条。
+   */
+  $effect(() => {
+    void rules;
+    confirmingDelete = null;
+  });
+
   function askDelete(id) {
     confirmingDelete = id;
   }

@@ -516,13 +516,13 @@
    * 不按字段内容重新在 `rules` 里查找，因为改了值之后内容本身就对不上了。
    */
   async function submitRuleForm({ value }) {
-    const op =
-      ruleFormMode === 'add'
-        ? (() => {
-            const a = defaultInsertAnchor(rules, rulesKeyLine, rulesKeyText);
-            return { op: 'insert-rule', anchor: a.anchor, 'anchor-expect': a.anchorExpect, value };
-          })()
-        : { op: 'replace-rule', line: editingRuleLine, expect: editingRuleRaw, value };
+    let op;
+    if (ruleFormMode === 'add') {
+      const a = defaultInsertAnchor(rules, rulesKeyLine, rulesKeyText);
+      op = { op: 'insert-rule', anchor: a.anchor, 'anchor-expect': a.anchorExpect, value };
+    } else {
+      op = { op: 'replace-rule', line: editingRuleLine, expect: editingRuleRaw, value };
+    }
 
     const r = await call(configSave, [op]);
     if (!r.ok) {

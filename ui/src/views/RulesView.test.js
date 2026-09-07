@@ -441,6 +441,32 @@ describe('规则的新增/编辑/删除入口', () => {
     render(RulesView, { rules: [], colorOf: () => '#fff', preset: 'china', globalOutbound: '日本节点' });
     expect(screen.queryByRole('button', { name: /添加规则/ })).not.toBeInTheDocument();
   });
+
+  it('config reload 换了新数组后，二次确认态不跟着挪到新占位的规则头上', async () => {
+    // id 是位置索引，reload 后同一个 id 可能落到另一条规则上。
+    // 对第 0 条点「删除」进入确认态，之后 loadConfig() 换了一份新数组——
+    // 哪怕新数组里 id=0 的位置换了条完全不同的规则，也不该顶着
+    // 「确认删除/取消」，得先回到普通的「编辑/删除」。
+    const u = userEvent.setup();
+    const twoRules = [
+      { id: 0, line: 10, raw: 'DOMAIN,a.com,日本节点', type: 'domain', value: 'a.com', target: '日本节点', hits: 0, enabled: true },
+      { id: 1, line: 20, raw: 'DOMAIN,b.com,日本节点', type: 'domain', value: 'b.com', target: '日本节点', hits: 0, enabled: true },
+    ];
+    const { rerender } = render(RulesView, { rules: twoRules, colorOf: () => '#fff', preset: 'custom' });
+
+    await u.click(screen.getByRole('button', { name: /删除.*a\.com/ }));
+    expect(screen.getByRole('button', { name: /确认删除/ })).toBeInTheDocument();
+
+    // 模拟 loadConfig() 重新 map 出的新数组：id=0 现在是条完全不同的规则
+    const reloaded = [
+      { id: 0, line: 10, raw: 'DOMAIN,c.com,日本节点', type: 'domain', value: 'c.com', target: '日本节点', hits: 0, enabled: true },
+      { id: 1, line: 20, raw: 'DOMAIN,b.com,日本节点', type: 'domain', value: 'b.com', target: '日本节点', hits: 0, enabled: true },
+    ];
+    await rerender({ rules: reloaded, colorOf: () => '#fff', preset: 'custom' });
+
+    expect(screen.queryByRole('button', { name: /确认删除/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /删除.*c\.com/ })).toBeInTheDocument();
+  });
 });
 
 describe('内置分流预设选择器', () => {
