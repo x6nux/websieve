@@ -236,6 +236,69 @@ export function setScalar(text, key, value) {
 }
 
 /**
+ * 改写某个代理组的 `selected:` 字段——与 `setScalar` 的区别是 `selected:`
+ * 这个键名可能在好几个组块里各出现一次，纯字符串匹配会串到别的组头上，
+ * 必须先按 `groupName` 定位到具体是哪个组块，再只在那个范围内查找替换。
+ *
+ * 逐行文本操作，不重新序列化整份 YAML，其余组的内容与全部注释原样保留——
+ * 与 `setScalar` 同一条纪律。
+ */
+export function setGroupSelected(text, groupName, member) {
+  const lines = String(text).split('\n');
+  const keyIdx = lines.findIndex((l) => l.replace(/\r$/, '') === 'proxy-groups:');
+  if (keyIdx < 0) {
+    throw new Error(`配置里没有 proxy-groups 键，找不到组 ${groupName}`);
+  }
+
+  let start = -1;
+  let end = lines.length;
+  for (let i = keyIdx + 1; i < lines.length; i++) {
+    const line = lines[i].replace(/\r$/, '');
+    if (line.trim() === '') continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      end = i;
+      break;
+    }
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith('- ')) {
+      if (start >= 0) {
+        end = i;
+        break;
+      }
+      const rest = trimmed.slice(2);
+      if (rest.startsWith('name:')) {
+        const name = rest.slice('name:'.length).trim().replace(/^"|"$/g, '');
+        if (name === groupName) start = i;
+      }
+    }
+  }
+  if (start < 0) {
+    throw new Error(`找不到名为 ${groupName} 的代理组`);
+  }
+
+  const head = 'selected:';
+  for (let i = start; i < end; i++) {
+    const raw = lines[i];
+    const cr = raw.endsWith('\r') ? '\r' : '';
+    const line = cr ? raw.slice(0, -1) : raw;
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith(head)) continue;
+    const indentStr = line.slice(0, line.length - trimmed.length);
+    let rest = trimmed.slice(head.length);
+    const c = commentStart(rest);
+    if (c < 0) {
+      lines[i] = `${indentStr}${head} ${member}${cr}`;
+    } else {
+      const gap = /\s*$/.exec(rest.slice(0, c))[0];
+      lines[i] = `${indentStr}${head} ${member}${gap}${rest.slice(c)}${cr}`;
+    }
+    return lines.join('\n');
+  }
+  throw new Error(`代理组 ${groupName} 没有 selected 字段（不是 select 类型？）`);
+}
+
+/**
  * `RuleTestResult.decision`（"DIRECT" | "REJECT" | 出站名）→ Probe 认的三个词。
  * 分开是因为 Probe 要给 DIRECT / REJECT 上固定的状态色，给出站上色码。
  */

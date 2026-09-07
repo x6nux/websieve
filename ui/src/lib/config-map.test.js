@@ -8,6 +8,7 @@ import {
   mergeConfigProxies,
   commentStart,
   setScalar,
+  setGroupSelected,
   decisionOf,
   probeResultOf,
 } from './config-map.js';
@@ -367,6 +368,57 @@ describe('setScalar —— 逐行改，其余字节原样不动', () => {
   it('CRLF 下的行尾注释同样完整保留', () => {
     const out = setScalar('mixed-port: 7890  # 入口\r\n', 'mixed-port', 1080);
     expect(out).toBe('mixed-port: 1080  # 入口\r\n');
+  });
+});
+
+describe('setGroupSelected', () => {
+  const src = [
+    'proxy-groups:',
+    '  - name: 节点选择',
+    '    kind: select',
+    '    proxies: [日本节点, 香港节点]',
+    '    selected: 日本节点',
+    '  - name: 自动选优',
+    '    kind: auto',
+    '    proxies: [日本节点, 香港节点]',
+    'rules: []',
+    '',
+  ].join('\n');
+
+  it('只改目标组的 selected，不动别的组', () => {
+    const out = setGroupSelected(src, '节点选择', '香港节点');
+    expect(out).toContain('    selected: 香港节点');
+    expect(out).toContain('  - name: 自动选优');
+    const autoBlockLines = out
+      .split('\n')
+      .slice(out.split('\n').indexOf('  - name: 自动选优'));
+    expect(autoBlockLines.some((l) => l.includes('selected:'))).toBe(false);
+  });
+
+  it('保留行尾注释', () => {
+    const withComment = src.replace(
+      '    selected: 日本节点',
+      '    selected: 日本节点  # 默认走这个',
+    );
+    const out = setGroupSelected(withComment, '节点选择', '香港节点');
+    expect(out).toContain('    selected: 香港节点  # 默认走这个');
+  });
+
+  it('其余组与其余内容一字节不变', () => {
+    const out = setGroupSelected(src, '节点选择', '香港节点');
+    expect(out).toContain('  - name: 自动选优\n    kind: auto\n    proxies: [日本节点, 香港节点]\nrules: []');
+  });
+
+  it('找不到匹配的组名时如实报错', () => {
+    expect(() => setGroupSelected(src, '不存在的组', '日本节点')).toThrow(/不存在的组/);
+  });
+
+  it('组存在但没有 selected 行（比如 auto 类型）时如实报错，不静默无操作', () => {
+    expect(() => setGroupSelected(src, '自动选优', '日本节点')).toThrow(/selected/);
+  });
+
+  it('没有 proxy-groups 键时如实报错', () => {
+    expect(() => setGroupSelected('rules: []\n', '节点选择', '日本节点')).toThrow(/proxy-groups/);
   });
 });
 
