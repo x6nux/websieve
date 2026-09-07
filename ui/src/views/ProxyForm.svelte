@@ -13,7 +13,7 @@
    * 提交成功或取消**立刻清空**；不打进任何 `console`/`pushAlert`/错误上报。
    * 与 `SettingsOverlay` 导出配置时的既有警告同源，提交前展示同一句忠告。
    */
-  import { tick, onDestroy, untrack } from 'svelte';
+  import { tick, onDestroy } from 'svelte';
 
   let {
     open = false,
@@ -95,7 +95,7 @@
     const name = draft.name.trim();
     const url = draft.url.trim();
     const serverPub = draft.serverPub.trim();
-    const clientPriv = draft.clientPriv;
+    const clientPriv = draft.clientPriv.trim();
     if (!name || !url || !serverPub || !clientPriv) {
       localError = '名称、地址、server-pub、client-priv 都是必填项。';
       return;
@@ -147,7 +147,7 @@
       </div>
       <div class="field">
         <label for="pf-priv">client-priv</label>
-        <input id="pf-priv" type="password" class="mono" bind:value={draft.clientPriv} />
+        <input id="pf-priv" type="password" class="mono" autocomplete="new-password" bind:value={draft.clientPriv} />
       </div>
 
       <p class="hint warn">

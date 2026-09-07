@@ -16,6 +16,11 @@ describe('节点新增表单', () => {
     expect(screen.getByLabelText('client-priv')).toHaveAttribute('type', 'password');
   });
 
+  it('私钥输入框禁止浏览器/WebView2 自动填充与保存密码提示', () => {
+    render(ProxyForm, base());
+    expect(screen.getByLabelText('client-priv')).toHaveAttribute('autocomplete', 'new-password');
+  });
+
   it('展示与 SettingsOverlay 导出提示同源的安全提示语', () => {
     render(ProxyForm, base());
     expect(screen.getByText(/私钥仅受文件系统权限保护/)).toBeInTheDocument();
@@ -28,6 +33,33 @@ describe('节点新增表单', () => {
     await u.click(screen.getByRole('button', { name: '保存' }));
     expect(p.onsubmit).not.toHaveBeenCalled();
     expect(screen.getByRole('alert')).toBeInTheDocument();
+  });
+
+  it('client-priv 仅含空白时视为未填，不提交', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(ProxyForm, p);
+    await u.type(screen.getByLabelText('名称'), '日本节点');
+    await u.type(screen.getByLabelText('地址（url）'), 'https://example.com/');
+    await u.type(screen.getByLabelText('server-pub'), 'aa==');
+    await u.type(screen.getByLabelText('client-priv'), '   ');
+    await u.click(screen.getByRole('button', { name: '保存' }));
+    expect(p.onsubmit).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toBeInTheDocument();
+  });
+
+  it('client-priv 前后空白在提交时被裁剪', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(ProxyForm, p);
+    await u.type(screen.getByLabelText('名称'), '日本节点');
+    await u.type(screen.getByLabelText('地址（url）'), 'https://example.com/');
+    await u.type(screen.getByLabelText('server-pub'), 'aa==');
+    await u.type(screen.getByLabelText('client-priv'), '  bb==  ');
+    await u.click(screen.getByRole('button', { name: '保存' }));
+    expect(p.onsubmit).toHaveBeenCalledWith(
+      expect.arrayContaining(['  client-priv: "bb=="']),
+    );
   });
 
   it('填完必填字段提交时拼出固定格式的行数组', async () => {
