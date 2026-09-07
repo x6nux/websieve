@@ -497,12 +497,30 @@ describe('setNestedScalar —— tun.enable 这类嵌套标量', () => {
     expect(out).toContain('rules: []');
   });
 
-  it('parentKey 不存在时如实报错，不静默追加', () => {
-    expect(() => setNestedScalar('rules: []\n', 'tun', 'enable', true)).toThrow(/tun/);
+  it('parentKey 不存在时追加一个新块 —— 新配置默认没有 tun: 键，报错会让开关彻底不能用', () => {
+    const out = setNestedScalar('mixed-port: 25500\nproxies: []\n', 'tun', 'enable', true);
+    expect(out).toContain('mixed-port: 25500\n');
+    expect(out).toContain('proxies: []\n');
+    expect(out).toMatch(/tun:\n {2}enable: true\n$/);
   });
 
-  it('parentKey 存在但块内没有 childKey 时如实报错', () => {
-    expect(() => setNestedScalar(src, 'tun', 'mtu', 1500)).toThrow(/mtu/);
+  it('parentKey 不存在时，追加前先确保有换行分隔 —— 与 setScalar 同一条纪律', () => {
+    const out = setNestedScalar('mode: rule', 'tun', 'enable', true);
+    expect(out).toBe('mode: rule\ntun:\n  enable: true\n');
+  });
+
+  it('parentKey 存在但块内没有 childKey 时插入新行，保留块内已有字段', () => {
+    const withoutEnable = ['tun:', '  stack: gvisor', 'rules: []', ''].join('\n');
+    const out = setNestedScalar(withoutEnable, 'tun', 'enable', true);
+    expect(out).toContain('  stack: gvisor');
+    expect(out).toMatch(/tun:\n(?:.*\n)*? {2}enable: true\n/);
+    expect(out).toContain('rules: []');
+  });
+
+  it('parentKey 存在但块是空的（后面紧接下一个顶层键）时也能插入 childKey', () => {
+    const empty = ['tun:', 'rules: []', ''].join('\n');
+    const out = setNestedScalar(empty, 'tun', 'enable', true);
+    expect(out).toContain('tun:\n  enable: true\nrules: []');
   });
 
   it('CRLF 文件下也能定位并保留 \\r\\n，其余行不动', () => {

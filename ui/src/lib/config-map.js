@@ -332,16 +332,31 @@ export function setGroupSelected(text, groupName, member) {
  * 只在这个范围内找 `childKey:`，缩进宽度照抄那一行实际写的缩进，
  * 不假设固定的 2 空格。
  *
- * 找不到 `parentKey:`，或者块内没有 `childKey:`，一律抛错，不静默 no-op——
- * 无声失败比报错更危险，用户会以为开关已经生效。
+ * 找不到 `parentKey:`，或者块内没有 `childKey:`，与 `setScalar` 同一条纪律——
+ * 補上它而不是抛错。`Tun`（以及其余块状字段）在 Rust 侧同样是
+ * `#[serde(default)]`：全新配置压根不会写出 `tun:` 这个键，这不是异常输入，
+ * 是每个新用户的起点。首次运行时刚生成的配置就没有 `tun:` 块，此时切一下
+ * 首页的 TUN 开关，落到这个函数上就该是「补出这个块」而不是报错——
+ * 抛错在这个场景下就是把「开关能用」直接判了死刑，比 `setScalar` 曾经的
+ * 同名问题更糟：那边好歹键都是顶层标量，加一行就行；这里连块的容身之处
+ * 都没有，用户没有任何手动编辑就能修好的路。
+ *
+ * 两种缺失分别处理：
+ * - `parentKey:` 整个不存在——在文件末尾新起一块（2 空格缩进，与
+ *   `DEFAULT_CONFIG_YAML` 及本文件其余嵌套块一致），追加前的换行处理与
+ *   `setScalar` 同一份规矩。
+ * - `parentKey:` 存在但块内没有 `childKey:`——插到块尾（下一个零缩进行或
+ *   EOF 之前），缩进跟块内其他行走；块里一行都没有时退到 2 空格。
  */
 export function setNestedScalar(text, parentKey, childKey, value) {
   const out = String(value);
-  const lines = String(text).split('\n');
+  const s = String(text);
+  const lines = s.split('\n');
   const parentHead = `${parentKey}:`;
   const keyIdx = lines.findIndex((l) => l.replace(/\r$/, '') === parentHead);
   if (keyIdx < 0) {
-    throw new Error(`配置里没有 ${parentKey} 键，找不到 ${parentKey}.${childKey}`);
+    const sep = s === '' || s.endsWith('\n') ? '' : '\n';
+    return `${s}${sep}${parentHead}\n  ${childKey}: ${out}\n`;
   }
 
   // 块边界：下一个零缩进行（或 EOF）之前，都算 parentKey 自己的内容。
@@ -357,13 +372,16 @@ export function setNestedScalar(text, parentKey, childKey, value) {
   }
 
   const head = `${childKey}:`;
+  let indentStr = '  ';
   for (let i = keyIdx + 1; i < end; i++) {
     const raw = lines[i];
     const cr = raw.endsWith('\r') ? '\r' : '';
     const line = cr ? raw.slice(0, -1) : raw;
     const trimmed = line.trimStart();
+    if (trimmed !== '') {
+      indentStr = line.slice(0, line.length - trimmed.length);
+    }
     if (!trimmed.startsWith(head)) continue;
-    const indentStr = line.slice(0, line.length - trimmed.length);
     let rest = trimmed.slice(head.length);
     const c = commentStart(rest);
     if (c < 0) {
@@ -374,7 +392,9 @@ export function setNestedScalar(text, parentKey, childKey, value) {
     }
     return lines.join('\n');
   }
-  throw new Error(`${parentKey} 块里没有 ${childKey} 字段`);
+  // 块内没有 childKey：插到块尾（end 之前），缩进沿用块内其他行的写法。
+  lines.splice(end, 0, `${indentStr}${head} ${out}`);
+  return lines.join('\n');
 }
 
 /**
