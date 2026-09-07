@@ -673,6 +673,28 @@ rules:
     }
 
     #[test]
+    fn structured_save_rejects_a_value_with_the_right_shape_but_an_unknown_type() {
+        // 上一条测试的值连逗号都没有，只够证明「字段数不对」这一最浅的一层
+        // 被挡住了；这条换一个字段数正确、但 TYPE 段不认识的值，确认校验
+        // 真的走到了 Rule::parse 的语义层，而不是只在数逗号。
+        let d = tmpdir("bad-rule-type");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, SAMPLE).unwrap();
+
+        let ops = vec![RuleOp::ReplaceRule {
+            line: 12,
+            expect: "GEOSITE,cn,DIRECT".to_string(),
+            value: "FOO,cn,DIRECT".to_string(),
+        }];
+        let err = apply_rule_ops(&p, ops).unwrap_err();
+        assert!(
+            matches!(err, CmdError::ConfigInvalid { .. }),
+            "未知规则类型应被拒绝，实为 {err:?}"
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
     fn structured_save_still_accepts_a_syntactically_valid_rule_value() {
         // 补校验不能误伤合法值——这条守住「加固」没有变成「更严格到拒绝正常输入」。
         let d = tmpdir("good-rule-syntax");
