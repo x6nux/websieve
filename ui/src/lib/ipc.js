@@ -52,6 +52,17 @@ export function configSaveRaw(text) {
   return invoke('config_save_raw', { text });
 }
 
+// 新增一个出站服务器。lines 是 proxies 段要插入的原文行数组
+// （见 ProxyForm.svelte），定位与写入都在 Rust 侧完成。
+export function configInsertProxy(lines) {
+  return invoke('config_insert_proxy', { lines });
+}
+
+// 删除一个出站服务器，按 name 定位。
+export function configDeleteProxy(name) {
+  return invoke('config_delete_proxy', { name });
+}
+
 // ── 连接控制（设计文档 §11.2）────────────────────────────────────
 //
 // connect / disconnect / setMode / outboundEnable 目前会以

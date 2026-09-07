@@ -55,7 +55,21 @@
     ontoggle = () => {},
     onprobe = () => {},
     onadd = () => {},
+    ondelete = () => {},
   } = $props();
+
+  /** 待二次确认删除的出站 id；null 表示没有任何一行处在确认态 */
+  let confirmingDelete = $state(null);
+  function askDelete(id) {
+    confirmingDelete = id;
+  }
+  function confirmDelete(name) {
+    confirmingDelete = null;
+    ondelete(name);
+  }
+  function cancelDelete() {
+    confirmingDelete = null;
+  }
 
   /**
    * 状态文案与色。
@@ -137,6 +151,10 @@
       action="添加第一个服务器"
       onaction={onadd} />
   {:else}
+    <div class="toolbar">
+      <button type="button" class="ghost" onclick={onadd}>+ 添加服务器</button>
+    </div>
+
     <table>
       <caption class="sr-only">
         出站服务器共 {outbounds.length} 个。每行显示名称、状态、延迟、会话数与启用开关。
@@ -149,6 +167,7 @@
           <th scope="col" class="r">延迟</th>
           <th scope="col" class="r">会话</th>
           <th scope="col"><span class="sr-only">操作</span></th>
+          <th scope="col"><span class="sr-only">删除</span></th>
           <th scope="col"><span class="sr-only">启用</span></th>
         </tr>
       </thead>
@@ -180,6 +199,15 @@
                 aria-label={`测试延迟：${o.name}`}
                 disabled={o.state !== 'live'}
                 onclick={() => onprobe(o.id)}>测速</button>
+            </td>
+
+            <td class="c">
+              {#if confirmingDelete === o.id}
+                <button type="button" class="mini danger" onclick={() => confirmDelete(o.name)}>确认删除</button>
+                <button type="button" class="mini" aria-label="取消删除" onclick={cancelDelete}>取消</button>
+              {:else}
+                <button type="button" class="mini danger" aria-label={`删除节点 ${o.name}`} onclick={() => askDelete(o.id)}>删除</button>
+              {/if}
             </td>
 
             <td class="c">
@@ -262,6 +290,10 @@
   }
   th:nth-child(6),
   td:nth-child(6) {
+    width: 76px;
+  }
+  th:nth-child(7),
+  td:nth-child(7) {
     width: 46px;
   }
 
@@ -358,6 +390,39 @@
     opacity: 0.35;
     cursor: not-allowed;
   }
+
+  .toolbar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-0);
+  }
+  .ghost {
+    background: transparent;
+    color: var(--text-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 6px 14px;
+    font-size: var(--fs-12);
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .ghost:hover { color: var(--text-1); }
+
+  .mini {
+    background: transparent;
+    color: var(--text-3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 7px;
+    font-size: var(--fs-11);
+    font-family: inherit;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .mini:hover { color: var(--text-1); border-color: var(--border-strong); }
+  .mini.danger { color: var(--state-fail); border-color: rgba(255, 90, 90, .35); }
 
   .foot {
     margin: 0;

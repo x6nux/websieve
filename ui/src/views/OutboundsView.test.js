@@ -81,6 +81,20 @@ describe('出站列表', () => {
   });
 });
 
+describe('节点的删除入口', () => {
+  const outbounds = [{ id: '日本节点', name: '日本节点', state: 'live', latency: 40, sessions: 2, enabled: true }];
+
+  it('每行有删除按钮，点击先要求二次确认', async () => {
+    const u = userEvent.setup();
+    const ondelete = vi.fn();
+    render(OutboundsView, { outbounds, colorOf: () => '#fff', ondelete });
+    await u.click(screen.getByRole('button', { name: /删除.*日本节点/ }));
+    expect(ondelete).not.toHaveBeenCalled();
+    await u.click(screen.getByRole('button', { name: /确认删除/ }));
+    expect(ondelete).toHaveBeenCalledWith('日本节点');
+  });
+});
+
 /**
  * 未就绪的两条命令。
  *

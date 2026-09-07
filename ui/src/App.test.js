@@ -577,6 +577,33 @@ describe('组装：规则表单接线', () => {
   });
 });
 
+describe('组装：出站表单接线', () => {
+  it('出站「添加」打开新增表单，提交后调用 config_insert_proxy 并重新加载配置', async () => {
+    installTauri({ config_insert_proxy: async () => null });
+    const u = userEvent.setup();
+    render(App);
+    await waitFor(() => screen.getByRole('radiogroup', { name: /视图/ }));
+    await u.click(screen.getByRole('radio', { name: '出站' }));
+    // 用 /添加/ 而非 /添加服务器/：默认 mock 配置里出站非空，命中的是工具栏的
+    // 「+ 添加服务器」；若配置为空则命中空状态的「添加第一个服务器」——两种
+    // 文案都含「添加」，测试不该绑定某一种具体状态（同 Task 12 的规则表单接线）。
+    await u.click(await screen.findByRole('button', { name: /添加/ }));
+    await u.type(screen.getByLabelText('名称'), '测试节点');
+    await u.type(screen.getByLabelText('地址（url）'), 'https://example.com/');
+    await u.type(screen.getByLabelText('server-pub'), 'aa');
+    await u.type(screen.getByLabelText('client-priv'), 'bb');
+    await u.click(screen.getByRole('button', { name: '保存' }));
+    await vi.waitFor(() => expect(calls.some(([c]) => c === 'config_insert_proxy')).toBe(true));
+    const [, args] = calls.find(([c]) => c === 'config_insert_proxy');
+    expect(Array.isArray(args.lines)).toBe(true);
+    expect(args.lines[0]).toMatch(/测试节点/);
+    // 提交成功后重新加载配置
+    await vi.waitFor(() =>
+      expect(calls.filter(([c]) => c === 'config_get').length).toBeGreaterThan(1),
+    );
+  });
+});
+
 describe('组装：设置覆盖层的焦点往返（Task 15 遗留的那一条）', () => {
   it('齿轮按钮有可访问名字，不是一个光秃秃的图标', async () => {
     render(App);

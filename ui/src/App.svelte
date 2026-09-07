@@ -39,6 +39,7 @@
   import RulesView from './views/RulesView.svelte';
   import RuleForm from './views/RuleForm.svelte';
   import OutboundsView from './views/OutboundsView.svelte';
+  import ProxyForm from './views/ProxyForm.svelte';
   import SettingsOverlay from './views/SettingsOverlay.svelte';
   import { FlowStore } from './lib/flows.js';
   import { makePalette } from './lib/palette.js';
@@ -58,8 +59,10 @@
     whereOf,
   } from './lib/config-map.js';
   import {
+    configDeleteProxy,
     configGet,
     configGetRaw,
+    configInsertProxy,
     configSave,
     configSaveRaw,
     listen,
@@ -83,6 +86,9 @@
   /** `rules:` 键本身的行号与原样文本，供新增规则时算默认插入锚点用 */
   let rulesKeyLine = $state(0);
   let rulesKeyText = $state('');
+
+  let proxyFormOpen = $state(false);
+  let proxyFormError = $state(null);
 
   let status = $state({ active: 0, downRate: 0, upRate: 0 });
   let spark = $state([]);
@@ -543,6 +549,34 @@
     await loadConfig();
   }
 
+  function openAddProxy() {
+    proxyFormError = null;
+    proxyFormOpen = true;
+  }
+  function closeProxyForm() {
+    proxyFormOpen = false;
+  }
+
+  async function submitProxyForm(lines) {
+    const r = await call(configInsertProxy, lines);
+    if (!r.ok) {
+      proxyFormError = r.error.message;
+      return;
+    }
+    proxyFormOpen = false;
+    await loadConfig();
+  }
+
+  async function deleteProxy(name) {
+    const r = await call(configDeleteProxy, name);
+    if (!r.ok) {
+      toggleError = r.error;
+      return;
+    }
+    toggleError = null;
+    await loadConfig();
+  }
+
   /**
    * 首页系统代理/TUN 快捷开关的保存路径。与 saveSettings/saveRoutingPreset
    * 同构——取原文 → 改一行 → config_save_raw 整份写回 → 重新加载。
@@ -759,7 +793,13 @@
         probeError={latencyError}
         ontoggle={toggleOutbound}
         onprobe={probeLatency}
-        onadd={() => (settingsOpen = true)} />
+        onadd={openAddProxy}
+        ondelete={deleteProxy} />
+      <ProxyForm
+        open={proxyFormOpen}
+        serverError={proxyFormError}
+        onsubmit={submitProxyForm}
+        onclose={closeProxyForm} />
     {/if}
   </main>
 
