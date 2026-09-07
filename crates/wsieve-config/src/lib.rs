@@ -36,6 +36,14 @@ pub enum ConfigError {
     UnsupportedProxyType { name: String, kind: String },
     #[error("出站名重复：{0}。规则用名字引用出站，重名会产生歧义")]
     DuplicateProxyName(String),
+    #[error("代理组名 {0:?} 重复——组名必须唯一，UI 靠它定位该改写哪个组块")]
+    DuplicateProxyGroupName(String),
+    #[error("代理组名 {0:?} 与一个出站名重复——组名与出站名共享同一个命名空间，规则引用时才不会混淆")]
+    GroupNameCollidesWithOutbound(String),
+    #[error("代理组 {group:?} 的成员 {member:?} 不是一个已存在的出站名（也不允许引用另一个组）")]
+    UnknownGroupMember { group: String, member: String },
+    #[error("代理组 {group:?} 的 selected 是 {selected:?}，但它不在自己的 proxies 成员列表里")]
+    SelectedNotAMember { group: String, selected: String },
     #[error("{field} 的值 {value:?} 不合法，应为 {legal} 之一")]
     BadEnumField {
         field: &'static str,
@@ -128,6 +136,49 @@ impl Config {
             &["custom", "china"],
             "custom / china",
         )?;
+        {
+            let mut seen_groups: HashSet<&str> = HashSet::new();
+            let outbound_names = self.outbound_names();
+            for g in &self.proxy_groups {
+                if !seen_groups.insert(g.name.as_str()) {
+                    return Err(ConfigError::DuplicateProxyGroupName(g.name.clone()));
+                }
+                if outbound_names.contains(g.name.as_str()) {
+                    return Err(ConfigError::GroupNameCollidesWithOutbound(g.name.clone()));
+                }
+                check_enum(
+                    "proxy-groups[].kind",
+                    &g.kind,
+                    &["select", "auto", "load-balance"],
+                    "select / auto / load-balance",
+                )?;
+                for m in &g.proxies {
+                    if !outbound_names.contains(m.as_str()) {
+                        return Err(ConfigError::UnknownGroupMember {
+                            group: g.name.clone(),
+                            member: m.clone(),
+                        });
+                    }
+                }
+                if g.kind == "select" && !g.proxies.iter().any(|m| m == &g.selected) {
+                    return Err(ConfigError::SelectedNotAMember {
+                        group: g.name.clone(),
+                        selected: g.selected.clone(),
+                    });
+                }
+                if g.kind == "load-balance" {
+                    check_enum(
+                        "proxy-groups[].strategy",
+                        &g.strategy,
+                        &["consistent-hash", "round-robin"],
+                        "consistent-hash / round-robin",
+                    )?;
+                }
+            }
+            // 组名互相之间也不能重复（第二个组名与第一个组名相同的场景已被
+            // seen_groups 挡住；这里再补一条组名之间不能与任一其他组名相同——
+            // 与上面的 seen_groups 是同一次遍历完成的，无需额外循环）。
+        }
         check_enum("carrier", &self.carrier, &["shared", "isolated"], "shared / isolated")?;
         check_enum(
             "log-level",
@@ -398,6 +449,215 @@ rules:
             }
             assert!(e.to_string().contains(legal_hint), "要列出合法取值：{e}");
         }
+    }
+
+    #[test]
+    fn validate_rejects_a_duplicate_group_name() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 节点选择
+    kind: select
+    proxies: [日本节点]
+    selected: 日本节点
+  - name: 节点选择
+    kind: select
+    proxies: [日本节点]
+    selected: 日本节点
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::DuplicateProxyGroupName(ref n) if n == "节点选择"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_group_name_that_collides_with_an_outbound() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 日本节点
+    kind: select
+    proxies: [日本节点]
+    selected: 日本节点
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::GroupNameCollidesWithOutbound(ref n) if n == "日本节点"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_unknown_group_kind() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 我的组
+    kind: bogus
+    proxies: [日本节点]
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadEnumField { field: "proxy-groups[].kind", .. }),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_group_member_that_is_not_a_known_outbound() {
+        let cfg = "\
+proxy-groups:
+  - name: 我的组
+    kind: select
+    proxies: [幽灵节点]
+    selected: 幽灵节点
+rules:
+  - MATCH,DIRECT
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::UnknownGroupMember { group: ref g, member: ref m }
+                if g == "我的组" && m == "幽灵节点"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_group_member_that_is_itself_a_group() {
+        // 禁止嵌套：成员必须是出站名，不能是另一个组的名字，避免解析时出现环。
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 内层组
+    kind: select
+    proxies: [日本节点]
+    selected: 日本节点
+  - name: 外层组
+    kind: select
+    proxies: [内层组]
+    selected: 内层组
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::UnknownGroupMember { group: ref g, member: ref m }
+                if g == "外层组" && m == "内层组"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_select_group_whose_selected_is_not_a_member() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+  - name: \"香港节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 我的组
+    kind: select
+    proxies: [日本节点]
+    selected: 香港节点
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::SelectedNotAMember { group: ref g, .. } if g == "我的组"),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_load_balance_group_with_a_bogus_strategy() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 我的组
+    kind: load-balance
+    proxies: [日本节点]
+    strategy: bogus
+rules:
+  - MATCH,日本节点
+";
+        let e = load_str(cfg).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadEnumField { field: "proxy-groups[].strategy", .. }),
+            "{e:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_select_group() {
+        let cfg = "\
+proxies:
+  - name: \"日本节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+  - name: \"香港节点\"
+    type: websieve
+    url: https://example.com/
+    server-pub: \"aa\"
+    client-priv: \"bb\"
+proxy-groups:
+  - name: 节点选择
+    kind: select
+    proxies: [日本节点, 香港节点]
+    selected: 日本节点
+  - name: 自动选优
+    kind: auto
+    proxies: [日本节点, 香港节点]
+  - name: 均衡负载
+    kind: load-balance
+    proxies: [日本节点, 香港节点]
+    strategy: consistent-hash
+rules:
+  - MATCH,日本节点
+";
+        load_str(cfg).unwrap().validate().unwrap();
     }
 
     #[test]
