@@ -378,6 +378,55 @@ export function setNestedScalar(text, parentKey, childKey, value) {
 }
 
 /**
+ * 新增规则时默认的插入锚点——插在最后一条 MATCH 之前（若存在），否则接在
+ * 末尾。理由：路由引擎的 `RuleSet::build` 要求 MATCH 必须是最后一条
+ * （`RuleAfterMatch` 校验），插在它之后会被直接拒绝；`insert_rule_line`
+ * 语义是「插在 anchor 行之后」，所以要选 MATCH **前一条**规则的行号当锚点，
+ * 而不是 MATCH 自己的行号。
+ *
+ * 用户随后仍可以用既有的拖拽/Alt+↑↓ 把新规则挪到别的位置——这只是一个
+ * 省得每次都要手动拖到底的默认值，不是强制位置。
+ */
+export function defaultInsertAnchor(rules, rulesKeyLine, rulesKeyText) {
+  if (!rules.length) {
+    return { anchor: rulesKeyLine, anchorExpect: rulesKeyText };
+  }
+  const lastIdx = rules.length - 1;
+  const last = rules[lastIdx];
+  if (last.type !== 'match') {
+    return { anchor: last.line, anchorExpect: last.raw };
+  }
+  if (lastIdx === 0) {
+    return { anchor: rulesKeyLine, anchorExpect: rulesKeyText };
+  }
+  const prev = rules[lastIdx - 1];
+  return { anchor: prev.line, anchorExpect: prev.raw };
+}
+
+/**
+ * `parseRuleLine` 产出的展示用短写（`domain` / `suffix` / `keyword` /
+ * `ip-cidr` / `geosite` / `geoip` / `match` / `final` / `?`）→
+ * `RuleForm` 的类型下拉认的大写规则类型。编辑一条已有规则时用来把
+ * `rules[].type` 转回表单的初值。
+ *
+ * `?`（解析失败）没有对应的表单类型——保守落到 `DOMAIN`，让用户能打开
+ * 表单把这条改成合法值，而不是抛异常拦住整个编辑入口。
+ */
+export function ruleTypeToFormType(t) {
+  const MAP = {
+    domain: 'DOMAIN',
+    suffix: 'DOMAIN-SUFFIX',
+    keyword: 'DOMAIN-KEYWORD',
+    'ip-cidr': 'IP-CIDR',
+    geosite: 'GEOSITE',
+    geoip: 'GEOIP',
+    match: 'MATCH',
+    final: 'MATCH',
+  };
+  return MAP[t] ?? 'DOMAIN';
+}
+
+/**
  * `RuleTestResult.decision`（"DIRECT" | "REJECT" | 出站名）→ Probe 认的三个词。
  * 分开是因为 Probe 要给 DIRECT / REJECT 上固定的状态色，给出站上色码。
  */

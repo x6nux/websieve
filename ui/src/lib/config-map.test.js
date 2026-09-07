@@ -10,6 +10,8 @@ import {
   setScalar,
   setGroupSelected,
   setNestedScalar,
+  defaultInsertAnchor,
+  ruleTypeToFormType,
   decisionOf,
   probeResultOf,
 } from './config-map.js';
@@ -545,5 +547,53 @@ describe('decisionOf / probeResultOf —— 探针结果的翻译', () => {
   it('没有结果时返回 null 而非一个空壳判决', () => {
     expect(probeResultOf(null)).toBeNull();
     expect(probeResultOf(undefined)).toBeNull();
+  });
+});
+
+describe('defaultInsertAnchor', () => {
+  it('规则列表为空时，锚点是 rules 键本身', () => {
+    const a = defaultInsertAnchor([], 9, 'rules: []');
+    expect(a).toEqual({ anchor: 9, anchorExpect: 'rules: []' });
+  });
+
+  it('末条不是 MATCH 时，新规则接在最后一条规则之后', () => {
+    const rules = [
+      { line: 10, raw: 'DOMAIN,a.com,proxyA' },
+      { line: 11, raw: 'DOMAIN,b.com,proxyB', type: 'domain' },
+    ];
+    const a = defaultInsertAnchor(rules, 9, 'rules:');
+    expect(a).toEqual({ anchor: 11, anchorExpect: 'DOMAIN,b.com,proxyB' });
+  });
+
+  it('末条是 MATCH 且前面还有别的规则时，新规则接在 MATCH 前一条之后', () => {
+    const rules = [
+      { line: 10, raw: 'DOMAIN,a.com,proxyA', type: 'domain' },
+      { line: 11, raw: 'MATCH,proxyB', type: 'match' },
+    ];
+    const a = defaultInsertAnchor(rules, 9, 'rules:');
+    expect(a).toEqual({ anchor: 10, anchorExpect: 'DOMAIN,a.com,proxyA' });
+  });
+
+  it('只有一条 MATCH 兜底时，新规则的锚点回退到 rules 键（成为新的第一条）', () => {
+    const rules = [{ line: 10, raw: 'MATCH,proxyB', type: 'match' }];
+    const a = defaultInsertAnchor(rules, 9, 'rules:');
+    expect(a).toEqual({ anchor: 9, anchorExpect: 'rules:' });
+  });
+});
+
+describe('ruleTypeToFormType', () => {
+  it('把 parseRuleLine 产出的展示用短写映射回 RuleForm 认的规则类型', () => {
+    expect(ruleTypeToFormType('domain')).toBe('DOMAIN');
+    expect(ruleTypeToFormType('suffix')).toBe('DOMAIN-SUFFIX');
+    expect(ruleTypeToFormType('keyword')).toBe('DOMAIN-KEYWORD');
+    expect(ruleTypeToFormType('ip-cidr')).toBe('IP-CIDR');
+    expect(ruleTypeToFormType('geosite')).toBe('GEOSITE');
+    expect(ruleTypeToFormType('geoip')).toBe('GEOIP');
+    expect(ruleTypeToFormType('match')).toBe('MATCH');
+    expect(ruleTypeToFormType('final')).toBe('MATCH');
+  });
+
+  it('认不出的短写（解析失败的 "?"）保守地落到 DOMAIN，而不是抛异常打断编辑', () => {
+    expect(ruleTypeToFormType('?')).toBe('DOMAIN');
   });
 });
