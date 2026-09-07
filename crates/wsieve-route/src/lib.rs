@@ -13,4 +13,4 @@ pub mod engine;
 pub mod rule;
 
 pub use engine::{BuildError, Decision, Explained, GeoWarning, RuleHit, RuleSet, Verdict};
-pub use rule::{Mode, Rule, RuleError, RuleKind, Target};
+pub use rule::{Mode, Rule, RuleError, RuleKind, Target, CHINA_PRESET_RULES};

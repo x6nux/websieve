@@ -21,13 +21,35 @@
    */
   import Probe from './Probe.svelte';
   import EmptyState from './EmptyState.svelte';
+  import Segmented from '../lib/Segmented.svelte';
   import { heatColor } from '../lib/heat.js';
   import { keyboardMove, positionAnnouncement } from '../lib/reorder.js';
   import { count } from '../lib/format.js';
 
+  /**
+   * 内置分流预设的可选项。`custom` 是「规则」——用户在 config.yaml 里手写
+   * 的那份，其余三个是产品内置、完全无视文件 `rules:` 数组的预设。
+   *
+   * `direct`/`global` 对应路由引擎自己的 `mode` 三态之二
+   * （`wsieve_route::Mode::Direct`/`Global`，见 engine.rs 的短路逻辑：
+   * 两者从不咨询任何规则）。`china` 对应 `mode: rule` + 内置的
+   * `wsieve_route::CHINA_PRESET_RULES`，与 `custom`（同样是 `mode: rule`，
+   * 但规则来自文件）的区别只在于规则来源，靠正交的 `rule-preset` 字段区分。
+   */
+  const PRESET_OPTIONS = [
+    { value: 'direct', label: '全局直连' },
+    { value: 'global', label: '全局代理' },
+    { value: 'china', label: '中国大陆' },
+    { value: 'custom', label: '规则' },
+  ];
+
   let {
     rules = [],
     colorOf,
+    /** 当前生效的分流预设：direct / global / china / custom */
+    preset = 'custom',
+    /** 已脱敏 config 里的 global-outbound，供 direct/global/china 的说明文案引用 */
+    globalOutbound = '',
     /** 探针结果，见 Probe.svelte */
     probe = null,
     /** 探针命令的 CmdError（`rule_test` 目前恒为 not-ready） */
@@ -45,6 +67,7 @@
     onreorder = () => {},
     ontoggle = () => {},
     onadd = () => {},
+    onpresetchange = () => {},
   } = $props();
 
   const maxHits = $derived(rules.reduce((m, r) => Math.max(m, r.hits ?? 0), 0));
@@ -160,9 +183,26 @@
     pendingFocus = rules[i].id;
     commitMove(i, r.index);
   }
+
+  /**
+   * 「中国大陆」预设的展示用规则行——只读，镜像
+   * `wsieve_route::CHINA_PRESET_RULES`（rule.rs）的前两条，第三条 MATCH
+   * 收尾行的目标依赖 `global-outbound`，运行时数据，因此在这里现算而不是
+   * 写死。这些行**没有 `line` 号**，写不回 `config_save` 的定点改写，
+   * 所以不渲染拖拽把手/启用开关——它们不是可编辑的真实配置行。
+   */
+  const chinaPresetRows = $derived([
+    { type: 'geosite', value: 'cn', target: 'DIRECT' },
+    { type: 'geoip', value: 'CN', target: 'DIRECT' },
+    { type: 'match', value: '*', target: globalOutbound || '（尚未设置）' },
+  ]);
 </script>
 
 <section class="view" aria-label="分流规则">
+  <div class="preset-bar">
+    <Segmented label="分流预设" options={PRESET_OPTIONS} value={preset} onchange={onpresetchange} />
+  </div>
+
   <Probe {colorOf} result={probe} error={probeError} {ontest} />
 
   {#if saveError}
@@ -184,7 +224,46 @@
     </p>
   {/if}
 
-  {#if !rules.length}
+  {#if preset === 'direct'}
+    <p class="preset-note">
+      当前处于<b>全局直连</b>模式：所有流量直接连接，不经过任何出站，也不咨询下面的规则。
+    </p>
+  {:else if preset === 'global'}
+    <p class="preset-note">
+      当前处于<b>全局代理</b>模式：所有流量都走
+      {#if globalOutbound}
+        <b>{globalOutbound}</b>
+      {:else}
+        <span class="warn">尚未在设置里指定全局出站，需要先配置它</span>
+      {/if}
+      ，不咨询下面的规则。
+    </p>
+  {:else if preset === 'china'}
+    <p class="preset-note">
+      当前处于<b>中国大陆</b>预设：完全无视配置文件里自带的规则，只用下面这三条内置规则。
+    </p>
+    <table class="china-table">
+      <caption class="sr-only">中国大陆内置预设，共 3 条只读规则，不可编辑。</caption>
+      <thead>
+        <tr>
+          <th scope="col">类型</th>
+          <th scope="col">匹配值</th>
+          <th scope="col">出站</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each chinaPresetRows as r (r.type + r.value)}
+          <tr class="builtin">
+            <td class="type mono">{r.type}</td>
+            <td class="val mono">{r.value}</td>
+            <td class="out">
+              <span class="chip" style:background={chip(r.target)} aria-hidden="true"></span>{r.target}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {:else if !rules.length}
     <EmptyState
       title="还没有规则。"
       hint="规则决定流量往哪走，顺序即优先级 —— 首命中即返回。至少需要一条 MATCH 兜底，否则未命中的流量无处可去。"
@@ -194,7 +273,7 @@
     <!-- 排序结果的播报区。视觉上不可见，但对键盘路径是唯一的反馈通道。 -->
     <p class="sr-only" aria-live="polite" role="status">{announcement}</p>
 
-    <table>
+    <table class="rules-table">
       <caption class="sr-only">
         分流规则共 {rules.length} 条，按顺序匹配、首命中即返回。
         使用拖拽把手或 Alt 加上下方向键调整顺序。
@@ -289,12 +368,13 @@
 
   table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 
-  /* 列宽取自 mockup：标记 / 类型 / 匹配值 / 出站 / 命中 / 开关 */
-  th:nth-child(1), td:nth-child(1) { width: 30px; }
-  th:nth-child(2), td:nth-child(2) { width: 74px; }
-  th:nth-child(4), td:nth-child(4) { width: 150px; }
-  th:nth-child(5), td:nth-child(5) { width: 66px; }
-  th:nth-child(6), td:nth-child(6) { width: 44px; }
+  /* 列宽取自 mockup：标记 / 类型 / 匹配值 / 出站 / 命中 / 开关。
+     只对可排序主表生效——只读的 china-table 只有三列，语义完全不同。 */
+  .rules-table th:nth-child(1), .rules-table td:nth-child(1) { width: 30px; }
+  .rules-table th:nth-child(2), .rules-table td:nth-child(2) { width: 74px; }
+  .rules-table th:nth-child(4), .rules-table td:nth-child(4) { width: 150px; }
+  .rules-table th:nth-child(5), .rules-table td:nth-child(5) { width: 66px; }
+  .rules-table th:nth-child(6), .rules-table td:nth-child(6) { width: 44px; }
 
   th {
     height: 28px;
@@ -397,4 +477,25 @@
   .sw.off { background: rgba(255, 255, 255, .13); }
   .sw.off::after { right: auto; left: 2px; background: var(--text-3); }
   .sw:focus-visible { outline: 2px solid var(--outbound-1); outline-offset: 2px; }
+
+  .preset-bar {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-0);
+  }
+
+  /* 内置预设（direct/global/china）的说明文案与只读表 —— 与可编辑的
+     .rules-table 视觉上刻意不同：没有拖拽把手、没有开关，读者不该以为
+     这里能编辑。 */
+  .preset-note {
+    margin: 0;
+    padding: 12px 16px;
+    font-size: var(--fs-12);
+    color: var(--text-2);
+    line-height: 1.7;
+  }
+  .preset-note b { color: var(--text-1); font-weight: var(--fw-medium); }
+  .preset-note .warn { color: var(--state-warn); }
+
+  .china-table tbody tr.builtin { color: var(--text-2); }
 </style>

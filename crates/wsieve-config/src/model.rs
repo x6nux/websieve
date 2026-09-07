@@ -15,7 +15,7 @@ use serde_saphyr::Spanned;
 /// 顶层配置。
 ///
 /// `deny_unknown_fields` 是刻意的：没有它，把 `mixed-port` 手误写成
-/// `mixed_port` 会**静默**退回默认值 7890 —— 文件上白纸黑字写着 9999，
+/// `mixed_port` 会**静默**退回默认值 25500 —— 文件上白纸黑字写着 9999，
 /// 端口却没变，而全程没有任何一条诊断。手写 YAML 最常见的错误恰恰是
 /// 键名拼错，若连它都不报，本 crate 花力气做行号诊断就失去了意义。
 ///
@@ -29,6 +29,13 @@ pub struct Config {
     pub bind_address: String,
     pub allow_lan: bool,
     pub mode: String,
+    /// `mode == "rule"` 时具体用哪份规则：`"custom"` 用下面 `rules` 里
+    /// 用户手写的那份，`"china"` 用内置的中国大陆预设（见
+    /// `wsieve_route::CHINA_PRESET_RULES`），**完全无视 `rules` 数组**。
+    /// 与 `mode` 正交：`mode` 是路由引擎自己理解的三态语义
+    /// （`wsieve_route::Mode`），这个字段只决定 `Mode::Rule` 时的规则来源，
+    /// 引擎本身不需要知道它的存在。
+    pub rule_preset: String,
     pub global_outbound: String,
     pub log_level: String,
     pub system_proxy: bool,
@@ -56,10 +63,11 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mixed_port: 7890,
+            mixed_port: 25500,
             bind_address: "127.0.0.1".into(),
             allow_lan: false,
             mode: "rule".into(),
+            rule_preset: "custom".into(),
             global_outbound: String::new(),
             log_level: "info".into(),
             system_proxy: false,

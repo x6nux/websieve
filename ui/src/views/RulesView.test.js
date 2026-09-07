@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/svelte';
+import { render, screen, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import RulesView from './RulesView.svelte';
 import { move } from '../lib/reorder.js';
@@ -399,5 +399,73 @@ describe('键盘排序的端到端 —— 列表真的重排之后还得能继�
     await v.sync();
     expect(live()).toMatch(/第 3 条/);
     expect(live()).toMatch(/最后/);
+  });
+});
+
+describe('内置分流预设选择器', () => {
+  const withPreset = (preset, extra = {}) => ({ ...base(), preset, onpresetchange: vi.fn(), ...extra });
+
+  it('渲染四个预设选项，且当前值被选中', () => {
+    render(RulesView, withPreset('custom'));
+    const group = screen.getByRole('radiogroup', { name: /分流预设/ });
+    const options = within(group).getAllByRole('radio');
+    expect(options.map((o) => o.textContent)).toEqual(['全局直连', '全局代理', '中国大陆', '规则']);
+    expect(within(group).getByRole('radio', { name: '规则' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('点选另一个预设触发 onpresetchange，带上目标值', async () => {
+    const u = userEvent.setup();
+    const p = withPreset('custom');
+    render(RulesView, p);
+    await u.click(screen.getByRole('radio', { name: '中国大陆' }));
+    expect(p.onpresetchange).toHaveBeenCalledWith('china');
+  });
+
+  it('全局直连：不渲染规则表，给出静态说明', () => {
+    const { container } = render(RulesView, withPreset('direct'));
+    expect(screen.queryByRole('table')).toBeNull();
+    const note = container.querySelector('.preset-note');
+    expect(note.textContent).toMatch(/全局直连/);
+    expect(note.textContent).toMatch(/不咨询下面的规则/);
+  });
+
+  it('全局代理：未设置全局出站时如实提示，而不是假装有一个', () => {
+    render(RulesView, withPreset('global', { globalOutbound: '' }));
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.getByText(/尚未在设置里指定全局出站/)).toBeInTheDocument();
+  });
+
+  it('全局代理：已设置全局出站时点名是哪一个', () => {
+    render(RulesView, withPreset('global', { globalOutbound: '日本节点' }));
+    expect(screen.getByText('日本节点')).toBeInTheDocument();
+  });
+
+  it('中国大陆：渲染三行内置只读规则，不是文件自带的那份', () => {
+    const { container } = render(RulesView, withPreset('china'));
+    const rows = container.querySelectorAll('tbody tr');
+    expect(rows).toHaveLength(3);
+    expect(container.textContent).toMatch(/geosite/);
+    expect(container.textContent).toMatch(/geoip/);
+    expect(container.textContent).toMatch(/cn/);
+    // 完全无视 rules prop 里的内容——那是「规则」预设专属的数据源
+    expect(container.textContent).not.toMatch(/category-ads/);
+  });
+
+  it('中国大陆：只读，没有拖拽把手也没有启用开关', () => {
+    render(RulesView, withPreset('china'));
+    expect(screen.queryAllByRole('button', { name: /移动|拖拽/ })).toHaveLength(0);
+    expect(screen.queryAllByRole('switch')).toHaveLength(0);
+  });
+
+  it('中国大陆：MATCH 行的目标出站取自 global-outbound', () => {
+    render(RulesView, withPreset('china', { globalOutbound: '香港节点' }));
+    expect(screen.getByText('香港节点')).toBeInTheDocument();
+  });
+
+  it('规则（默认预设）：行为与不传 preset 时完全一致', () => {
+    // custom 是默认值，这条只是显式核对一遍，不重复上面已经覆盖过的全部断言
+    render(RulesView, withPreset('custom'));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getAllByRole('switch')).toHaveLength(rules.length);
   });
 });

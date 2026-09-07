@@ -122,6 +122,12 @@ impl Config {
         // log-level 的五档与 `tracing::Level::from_str` 一致（它同样忽略大小写），
         // 故这里放行的值到了 §5.2 那条 EnvFilter 上都收得下。
         check_enum("mode", &self.mode, &["rule", "global", "direct"], "rule / global / direct")?;
+        check_enum(
+            "rule-preset",
+            &self.rule_preset,
+            &["custom", "china"],
+            "custom / china",
+        )?;
         check_enum("carrier", &self.carrier, &["shared", "isolated"], "shared / isolated")?;
         check_enum(
             "log-level",
@@ -176,6 +182,7 @@ rules:
     fn omitted_fields_get_defaults() {
         let c = load_str(MINIMAL).unwrap();
         assert_eq!(c.mode, "rule");
+        assert_eq!(c.rule_preset, "custom");
         assert_eq!(c.shard_base_port, 18443);
         assert_eq!(c.dns.timeout_ms, 2000);
         assert_eq!(c.carrier, "shared");
@@ -306,7 +313,7 @@ rules:
     #[test]
     fn a_misspelled_key_is_an_error_not_a_silent_default() {
         // 手写 YAML 最常见的错误就是键名拼错。没有 deny_unknown_fields 时，
-        // `mixed_port`（下划线）会静默退回默认值 7890 —— 文件上白纸黑字写着
+        // `mixed_port`（下划线）会静默退回默认值 25500 —— 文件上白纸黑字写着
         // 9999，端口却没变，全程没有一条诊断。本 crate 花力气做行号诊断，
         // 结果对最高频的那个错误一言不发，那才是最坏的结果。
         let bad = "mixed_port: 9999\nrules:\n  - MATCH,DIRECT\n";
@@ -338,7 +345,7 @@ rules:
     #[test]
     fn unknown_keys_in_nested_mappings_are_caught_too() {
         // 拼错的键藏在 dns / proxies 下面时同样要报。`timeout_ms` 静默退回
-        // 2000 与 `mixed_port` 静默退回 7890 是同一个病，杀伤力也一样。
+        // 2000 与 `mixed_port` 静默退回 25500 是同一个病，杀伤力也一样。
         for (src, key, line_no, col_no) in [
             ("dns:\n  enable: true\n  timeout_ms: 500\n", "timeout_ms", 3u64, 3u64),
             (
@@ -374,10 +381,11 @@ rules:
     }
 
     #[test]
-    fn validate_rejects_bogus_carrier_and_log_level() {
+    fn validate_rejects_bogus_carrier_log_level_and_rule_preset() {
         for (cfg, field, bad, legal_hint) in [
             ("carrier: nope\n", "carrier", "nope", "isolated"),
             ("log-level: shout\n", "log-level", "shout", "debug"),
+            ("rule-preset: nope\n", "rule-preset", "nope", "china"),
         ] {
             let e = load_str(cfg).unwrap().validate().unwrap_err();
             match &e {
@@ -403,6 +411,9 @@ rules:
         }
         for l in ["trace", "debug", "info", "warn", "error"] {
             load_str(&format!("log-level: {l}\n")).unwrap().validate().unwrap();
+        }
+        for r in ["custom", "china"] {
+            load_str(&format!("rule-preset: {r}\n")).unwrap().validate().unwrap();
         }
     }
 

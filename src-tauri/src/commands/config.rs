@@ -34,6 +34,27 @@ use super::{CmdError, CmdResult};
 /// 但我手上没有它」—— 与直接删掉字段不同，后者会让 UI 以为没配私钥。
 pub const REDACTED: &str = "***";
 
+/// 首次启动时自动写出的默认配置。
+///
+/// 空 `proxies` / 空 `rules` 是完全合法的状态 —— `Config::validate()` 对此
+/// 不报错，UI 也早就为它准备好了「还没有配置任何出站」「还没有规则」这类
+/// 引导文案（见 `TrafficView.svelte` / `RulesView.svelte` 的空状态）。
+/// 因此默认配置**刻意不写任何规则**（比如不写 `MATCH,DIRECT` 兜底）——
+/// 加一条默认放行规则会在用户还没添加任何服务器时就悄悄把流量放出去，
+/// 与「没有出站可去，代理会拒绝连接而不是偷偷直连」这条产品前提正相反。
+/// 其余字段全部省略，交给 `Config` 的 `#[serde(default)]` 补 ——
+/// 单一事实源在 `model.rs` 的 `Default for Config`，这里不重复一份。
+const DEFAULT_CONFIG_YAML: &str = "\
+# websieve 首次运行时自动生成的配置文件。
+# 目前还没有任何出站服务器和规则 —— 代理会拒绝连接而不是偷偷直连。
+# 可以在控制窗口的「出站」页添加服务器、「规则」页添加规则，
+# 也可以直接编辑这个文件：它支持注释，UI 保存时只改动被改动的那几行。
+
+mixed-port: 25500
+proxies: []
+rules: []
+";
+
 /// 结构化读的返回。
 ///
 /// 为什么规则单独一列而不是留在 `config` 里：`Spanned<String>` 序列化时
@@ -111,7 +132,9 @@ pub fn config_path(app: &tauri::AppHandle) -> CmdResult<PathBuf> {
 /// 结构化读。`client-priv` 被替换为 [`REDACTED`]。
 #[tauri::command]
 pub async fn config_get(app: tauri::AppHandle) -> CmdResult<ConfigView> {
-    read_view(&config_path(&app)?)
+    let p = config_path(&app)?;
+    ensure_config_exists(&p)?;
+    read_view(&p)
 }
 
 /// 原文读 —— **含明文私钥**。
@@ -119,7 +142,9 @@ pub async fn config_get(app: tauri::AppHandle) -> CmdResult<ConfigView> {
 /// UI 侧必须在展示处给出 §5.4 要求的警告，且这个返回值不得进日志。
 #[tauri::command]
 pub async fn config_get_raw(app: tauri::AppHandle) -> CmdResult<String> {
-    read_text(&config_path(&app)?)
+    let p = config_path(&app)?;
+    ensure_config_exists(&p)?;
+    read_text(&p)
 }
 
 /// 结构化写：按行号定点改写规则，**保留全部注释**。
@@ -147,6 +172,22 @@ fn read_text(p: &Path) -> CmdResult<String> {
     std::fs::read_to_string(p).map_err(|e| CmdError::Io {
         message: format!("读取 {} 失败：{e}", p.display()),
     })
+}
+
+/// 若配置文件不存在就地创建一份默认配置；若已存在（或检查本身失败）则
+/// 原样放行，绝不覆盖用户已有的文件。
+///
+/// 只在错误种类确凿是 `NotFound` 时才动手创建 —— 权限不足、路径被占用之类
+/// 的其他 I/O 错误如实上抛，不能把「这条路径读不了」误判成「这条路径该建
+/// 默认文件」，那会在真正的故障上掩盖诊断信息。
+fn ensure_config_exists(p: &Path) -> CmdResult<()> {
+    match std::fs::metadata(p) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_0600(p, DEFAULT_CONFIG_YAML),
+        Err(e) => Err(CmdError::Io {
+            message: format!("检查 {} 是否存在失败：{e}", p.display()),
+        }),
+    }
 }
 
 /// 读 + 解析 + 脱敏。
@@ -367,6 +408,58 @@ rules:
         let mut v = serde_json::json!({ "client-priv": "x" });
         redact_private_keys(&mut v);
         assert_eq!(v["client-priv"], REDACTED, "不能直接删字段 —— UI 需要知道它存在");
+    }
+
+    // ── 首次启动：缺配置文件时自动补一份默认的 ──────────────
+
+    #[test]
+    fn missing_config_gets_a_usable_default_written() {
+        let d = tmpdir("first-run");
+        let p = d.join("config.yaml");
+        assert!(!p.exists(), "前提：文件本不存在");
+
+        ensure_config_exists(&p).unwrap();
+
+        assert!(p.exists(), "该被创建出来了");
+        let cfg = wsieve_config::load_str(&read_text(&p).unwrap()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.mixed_port, 25500);
+        assert!(cfg.proxies.is_empty(), "首次生成不该凭空造一个服务器");
+        assert!(cfg.rules.is_empty(), "首次生成不该凭空造一条规则");
+
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn an_existing_config_is_never_overwritten() {
+        let d = tmpdir("first-run-existing");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, SAMPLE).unwrap();
+
+        ensure_config_exists(&p).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            SAMPLE,
+            "文件已存在时绝不能被默认配置覆盖 —— 那会丢掉用户的真实配置"
+        );
+
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_auto_created_default_is_also_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tmpdir("first-run-perms");
+        let p = d.join("config.yaml");
+        ensure_config_exists(&p).unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "自动生成的配置迟早会被写入私钥，权限位不能例外");
+
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     // ── config_get 的边界语义 ───────────────────────────────

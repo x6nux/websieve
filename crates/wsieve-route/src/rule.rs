@@ -270,12 +270,40 @@ impl Rule {
     }
 }
 
+/// 「中国大陆」内置分流预设的前两条规则（产品级预设，非用户可编辑）。
+///
+/// 存在的理由：规则视图（阶段 5 UI）需要给用户一个「无视配置文件自带规则，
+/// 直接用内置规则」的一键预设。这两行本身与配置文件无关——调用方在此基础上
+/// 自己拼一条 `MATCH,<全局出站>` 收尾（目标出站是运行时数据，不适合定死
+/// 在这个常量里）。
+///
+/// 本 crate 目前没有任何调用点消费它：把配置文件里的这个预设选项接进真实
+/// 运行时（替换 main.rs 硬编码的单出站 RuleSet）是一块尚未开工的独立工程。
+/// 这个常量先把「这两行规则语法是对的、真的解析得过」钉死——不然预设写错了
+/// 字都不会有人发现，等真去接线时才炸。
+pub const CHINA_PRESET_RULES: [&str; 2] = ["GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn p(s: &str) -> Rule {
         Rule::parse(s).unwrap_or_else(|e| panic!("解析 {s:?} 失败：{e}"))
+    }
+
+    #[test]
+    fn china_preset_rules_actually_parse() {
+        // 唯一守住这份内置数据没打错字的地方——main.rs 还没有调用点会在
+        // 启动时替我们发现。
+        for line in CHINA_PRESET_RULES {
+            let r = Rule::parse(line).unwrap_or_else(|e| panic!("内置规则 {line:?} 解析失败：{e}"));
+            assert!(
+                matches!(r.kind, RuleKind::GeoSite | RuleKind::GeoIp),
+                "{line:?} 应该是 GEOSITE 或 GEOIP 规则，实为 {:?}",
+                r.kind
+            );
+            assert!(matches!(r.target, Target::Direct), "{line:?} 应该直连");
+        }
     }
 
     #[test]

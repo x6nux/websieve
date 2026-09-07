@@ -118,10 +118,26 @@
    * 是因为落盘时要翻回去（见 saveSettings），两次翻译挨着写才不会漂移。
    */
   const settingsDraft = $derived({
-    mixedPort: config?.['mixed-port'] ?? 7890,
+    mixedPort: config?.['mixed-port'] ?? 25500,
     allowLan: config?.['allow-lan'] ?? false,
     systemProxy: config?.['system-proxy'] ?? false,
     carrier: config?.carrier ?? 'shared',
+  });
+
+  /** `RulesView` 的分流预设选择器直接读全局出站名做说明文案用 */
+  const globalOutbound = $derived(config?.['global-outbound'] ?? '');
+
+  /**
+   * 当前生效的分流预设，由两个正交字段组合推导（见
+   * `crates/wsieve-config/src/model.rs` 里 `rule_preset` 字段的注释）：
+   * `mode` 是路由引擎自己的三态语义，`rule-preset` 只在 `mode === 'rule'`
+   * 时决定规则来源是文件自带的（custom）还是内置中国大陆预设（china）。
+   */
+  const routingPreset = $derived.by(() => {
+    const mode = config?.mode ?? 'rule';
+    if (mode === 'direct') return 'direct';
+    if (mode === 'global') return 'global';
+    return config?.['rule-preset'] === 'china' ? 'china' : 'custom';
   });
 
   /** 全局故障只留最近 5 条，且同一条消息不重复堆积 */
@@ -408,6 +424,44 @@
   }
 
   /**
+   * 分流预设选择器（RulesView 顶部的 segmented control）的保存路径。
+   *
+   * 与 `saveSettings` 完全同构——取原文 → `setScalar` 改动过的那几行 →
+   * `config_save_raw` 整份写回 → 重新加载。**不调用** `set_mode` IPC：
+   * 那条命令今天必然返回 `not-ready`（路由引擎的 RuleSet 还没做成
+   * 可热替换的，见 `src-tauri/src/commands/control.rs`），调用它只会
+   * 白打一次注定失败的往返，还会在界面上弹出一条无意义的错误。
+   * 落盘是今天唯一真实生效的部分，如实做到这一步，不假装更多。
+   */
+  async function saveRoutingPreset(next) {
+    const byPreset = {
+      direct: ['direct', undefined],
+      global: ['global', undefined],
+      china: ['rule', 'china'],
+      custom: ['rule', 'custom'],
+    };
+    const pair = byPreset[next];
+    if (!pair) return; // 未知值只可能是前端 bug，静默忽略好过写坏配置
+    const [mode, rulePreset] = pair;
+
+    const raw = await call(configGetRaw);
+    if (!raw.ok) {
+      pushAlert(`切换分流预设失败（读不到配置原文）${whereOf(raw.error)}：${raw.error.message}`);
+      return;
+    }
+    let text = raw.value;
+    text = setScalar(text, 'mode', mode);
+    if (rulePreset) text = setScalar(text, 'rule-preset', rulePreset);
+
+    const w = await call(configSaveRaw, text);
+    if (!w.ok) {
+      pushAlert(`切换分流预设失败${whereOf(w.error)}：${w.error.message}`);
+      return;
+    }
+    await loadConfig();
+  }
+
+  /**
    * 导出配置。
    *
    * ⚠️ `config_get_raw` 的返回值**含明文私钥**。它在这里只做一件事：交给
@@ -518,13 +572,16 @@
       <RulesView
         {rules}
         {colorOf}
+        preset={routingPreset}
+        {globalOutbound}
         {probe}
         {probeError}
         {saveError}
         ontest={runProbe}
         onreorder={reorder}
         ontoggle={toggleRule}
-        onadd={() => (settingsOpen = true)} />
+        onadd={() => (settingsOpen = true)}
+        onpresetchange={saveRoutingPreset} />
     {:else}
       <OutboundsView
         {outbounds}
