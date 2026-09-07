@@ -350,6 +350,10 @@ pub fn delete_proxy_block(src: &str, name: &str) -> Result<String, EditError> {
     }
 
     let mut start: Option<usize> = None;
+    // 目标项自己的缩进宽度——只有在这个宽度的 `- ` 才是「下一个同级项」，
+    // 缩进更深的 `- `（如 `mux-prefs:` 这类嵌套列表字段的元素）是目标块
+    // 自己的内容，不是兄弟项的边界。
+    let mut start_indent = 0usize;
     let mut end = all.len();
     let mut i = key_idx + 1;
     while i < all.len() {
@@ -364,12 +368,17 @@ pub fn delete_proxy_block(src: &str, name: &str) -> Result<String, EditError> {
         }
         let trimmed = body.trim_start();
         if let Some(rest) = trimmed.strip_prefix("- ") {
+            let this_indent = indent_width(body);
             if start.is_some() {
-                end = i;
-                break;
-            }
-            if item_name_matches(rest, name) {
+                if this_indent == start_indent {
+                    end = i;
+                    break;
+                }
+                // 缩进比目标项更深——是目标块内部嵌套列表的元素，
+                // 不是同级兄弟项，继续往下扫，一并纳入待删范围。
+            } else if item_name_matches(rest, name) {
                 start = Some(i);
+                start_indent = this_indent;
             }
         }
         i += 1;
@@ -1168,6 +1177,22 @@ rules:
         let src = "proxies:\n  - name: 日本节点\n    type: websieve\nrules: []\n";
         let out = delete_proxy_block(src, "日本节点").unwrap();
         assert_eq!(out, "proxies:\nrules: []\n");
+    }
+
+    #[test]
+    fn delete_proxy_skips_over_a_nested_list_field_without_being_fooled_by_it() {
+        // `mux-prefs: Vec<u8>` 写成块式列表时，其元素 `- 0` / `- 1` 缩进
+        // 比 `- name:` 更深，但同样以 `- ` 开头。删除逻辑必须按缩进宽度
+        // 区分「同级兄弟项」与「目标块自己的嵌套内容」，否则会把
+        // `mux-prefs` 的元素误判成下一个节点的边界，导致它们被孤儿化地
+        // 留在 `proxies:` 下、缩进错乱，而真正的下一个节点却没被真正处理。
+        let src = "proxies:\n  - name: \"日本节点\"\n    type: websieve\n    mux-prefs:\n      - 0\n      - 1\n  - name: \"香港节点\"\n    type: websieve\nrules: []\n";
+        let out = delete_proxy_block(src, "日本节点").unwrap();
+        assert_eq!(
+            out,
+            "proxies:\n  - name: \"香港节点\"\n    type: websieve\nrules: []\n",
+            "嵌套列表字段的元素不该被当成同级兄弟项，整个目标块（含其嵌套内容）应一并删除：\n{out}"
+        );
     }
 
     #[test]
