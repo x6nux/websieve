@@ -9,8 +9,9 @@
 Clash Verge 的「当前节点」卡片背后是 Clash 的**代理组**（proxy-group）机制：
 规则不直接点名一个物理节点，而是点名一个组（例如「节点选择」），组内部再决定
 实际走哪个成员。用户在讨论过程中明确要求把这个机制本身也做出来，并给了三种
-组类型：手动选择（select）、自动选优（auto）、负载均衡（load-balance），
-且要求组用 `id` 区分身份、`name` 仅做展示。
+组类型：手动选择（select）、自动选优（auto）、负载均衡（load-balance）。
+一开始设计成组用 `id` 区分身份、`name` 仅做展示，后来简化掉了——见 §1
+「只用 `name`」的说明。
 
 讨论中一度扩展到「识别流量行为（下载/浏览）动态选策略」与「自动探测出口 IP
 分组」——这两项已经在讨论中达成一致**不在本次范围内**：前者在当前的 SOCKS5/
@@ -31,17 +32,14 @@ CONNECT 隧道层面看不到 HTTP 语义，只能靠不可靠的连接数量启
 
 ```yaml
 proxy-groups:
-  - id: grp-1
-    name: 节点选择
+  - name: 节点选择
     kind: select
     proxies: [日本节点, 香港节点]
     selected: 日本节点
-  - id: grp-2
-    name: 自动选优
+  - name: 自动选优
     kind: auto
     proxies: [日本节点, 香港节点, 新加坡节点]
-  - id: grp-3
-    name: 均衡负载
+  - name: 均衡负载
     kind: load-balance
     proxies: [日本节点, 香港节点]
     strategy: consistent-hash
@@ -51,8 +49,7 @@ proxy-groups:
 
 | 字段 | 含义 | 校验 |
 |---|---|---|
-| `id` | 稳定机器键。UI 用它定位「当前选中成员」该写回哪个组块，改名不影响它 | 组间唯一 |
-| `name` | 展示名，**同时也是规则可以引用的名字**（与出站名共享同一命名空间） | 不得与任何出站名或其他组名重复 |
+| `name` | 组的唯一标识，**同时是展示名，也是规则可以引用的名字**（与出站名共享同一命名空间） | 不得与任何出站名或其他组名重复 |
 | `kind` | `select` / `auto` / `load-balance` | 枚举校验 |
 | `proxies` | 成员列表，元素必须是已存在的**出站名**（不允许引用另一个组——禁止嵌套，避免解析时出现环） | 每个成员都在 `known_outbounds` 里 |
 | `selected` | 仅 `select` 类型使用：当前选中的成员 | 必须是 `proxies` 里的一个 |
@@ -65,13 +62,16 @@ proxy-groups:
 `Mode`/`Rule`/`engine.rs` **不需要改一个字节**——组的存在对路由引擎而言只是
 「多了几个合法的出站名」，组到物理节点的展开是另一层，见下节。
 
-**这是一个刻意的取舍，值得写清楚**：规则引用组时写的是 `name` 而不是
-`id`——与出站的引用方式（也是按 `name`）保持一致，`MATCH,节点选择` 才可读，
-`MATCH,grp-1` 不可读。代价是**改组名会让引用它的规则失效**（规则里的旧名字
-找不到对应的组了），这与今天改一个出站的名字会让引用它的规则失效是同一个
-既有取舍，不是本设计新引入的脆弱点。`id` 只服务于 UI 内部——「当前选中成员」
-按 `id` 定位组块，这样改名不会打断 §4 的写回逻辑；`id` 本身从不出现在规则
-文本里。
+**只用 `name`，不单独设 `id`。** 最初设计里 `id` 是稳定机器键、`name` 只做
+展示，理由是「改名不该打断内部引用」——但审视一遍后发现这个担心找错了对象：
+`selected` 是**写在组自己的 YAML 块里**的字段，不是外部某处按键索引的一份
+独立状态，UI 定位「该改哪个组块」时读的就是当下最新的配置，不存在「组改名后
+某处还攥着旧名字」的场景。`id` 唯一的实际用途只是给 `{#each}` 一个稳定 key，
+而 `name` 本来就唯一（已校验），拿它当 key 完全够用。去掉 `id` 少一个字段、
+少一条校验、UI 与 config.yaml 里说的是同一个词——净收益，不是权衡。
+**代价与出站今天的既有行为一致**：改组名会让引用它的规则跟着失效（旧名字
+在文件里找不到对应的组了），这与今天改一个出站的名字会让引用它的规则失效
+是同一件事，不是本设计新引入的脆弱点。
 
 ## 2. 组解析的纯逻辑 — 新模块 `wsieve-route/src/group.rs`
 
@@ -103,11 +103,11 @@ pub fn load_balance_pick(
 ```rust
 /// auto 用的延迟表、load-balance 用的目标 host 与 round-robin 计数器，
 /// 全部集中到一个结构体里传递，避免 resolve_group 的参数表随组类型增多
-/// 而不断变长。latencies/rr_counters 都按组 id 索引。
+/// 而不断变长。latencies/rr_counters 都按组名索引（组名唯一，见 §1）。
 pub struct ResolveCtx<'a> {
-    pub latencies: &'a HashMap<String, HashMap<String, Option<u64>>>, // group_id -> member -> latency
+    pub latencies: &'a HashMap<String, HashMap<String, Option<u64>>>, // group_name -> member -> latency
     pub target_host: &'a str,                                        // load-balance 的 consistent-hash key
-    pub rr_counters: &'a mut HashMap<String, usize>,                  // group_id -> round-robin 计数器
+    pub rr_counters: &'a mut HashMap<String, usize>,                  // group_name -> round-robin 计数器
 }
 
 /// name 若匹配某个组的 name，按组的 kind 展开成具体出站名；
@@ -148,15 +148,15 @@ pub fn resolve_group(name: &str, groups: &[ProxyGroup], ctx: &mut ResolveCtx) ->
 嵌套在某个 `proxy-groups` 列表项里的 `selected:`——同名字段可能在好几个组块
 里各出现一次，纯字符串匹配会串到别的组头上。
 
-新增 `setGroupSelected(text, groupId, member)`：
+新增 `setGroupSelected(text, groupName, member)`：
 
 1. 定位 `proxy-groups:` 顶层键所在行
-2. 在其后按缩进层级识别每个列表项的起止行（`- id: xxx` 开始，下一个同缩进
-   的 `- id:` 或缩进回退到 `proxy-groups:` 同级为止）
-3. 找到 `id` 字段等于 `groupId` 的那一项，只在**该项的行范围内**查找并替换
-   `selected:` 那一行
-4. 找不到匹配的 `id`，或该项没有 `selected:` 行（比如误传了一个 `auto` 类型
-   组的 id），**如实报错**，不静默无操作、也不误伤到别的组
+2. 在其后按缩进层级识别每个列表项的起止行（`- name: xxx` 开始，下一个同缩进
+   的 `- name:` 或缩进回退到 `proxy-groups:` 同级为止）
+3. 找到 `name` 字段等于 `groupName` 的那一项，只在**该项的行范围内**查找并
+   替换 `selected:` 那一行
+4. 找不到匹配的 `name`，或该项没有 `selected:` 行（比如误传了一个 `auto`
+   类型组的名字），**如实报错**，不静默无操作、也不误伤到别的组
 
 逐行文本操作，不重新序列化整份 YAML，注释照旧保留——延续 `setScalar` /
 `config_save_raw` 已有的纪律（§5.6：非规则区手写注释会丢，这里额外保证「精确
@@ -164,10 +164,10 @@ pub fn resolve_group(name: &str, groups: &[ProxyGroup], ctx: &mut ResolveCtx) ->
 
 ## 5. 测试计划
 
-- **`wsieve-config`**：`proxy-groups` 的 schema 校验——重复 `id`、非法 `kind`、
-  `selected` 不在自己的 `proxies` 里、`load-balance` 缺失或非法 `strategy`、
-  组名与出站名/其他组名撞车、成员引用不存在的出站名、成员引用另一个组
-  （应拒绝，不允许嵌套）。
+- **`wsieve-config`**：`proxy-groups` 的 schema 校验——重复 `name`、非法
+  `kind`、`selected` 不在自己的 `proxies` 里、`load-balance` 缺失或非法
+  `strategy`、组名与出站名/其他组名撞车、成员引用不存在的出站名、成员引用
+  另一个组（应拒绝，不允许嵌套）。
 - **`wsieve-route/group.rs`**：`select_pick` 直接返回值；`auto_pick` 覆盖
   全 `None`、部分 `None`、并列最小值三种情况；`load_balance_pick` 的
   `consistent-hash` 覆盖同 key 多次调用结果一致、不同 key 分布到不同成员，
@@ -175,7 +175,7 @@ pub fn resolve_group(name: &str, groups: &[ProxyGroup], ctx: &mut ResolveCtx) ->
   覆盖组名/普通出站名两条路径。
 - **`config-map.js`**：`setGroupSelected` 的往返测试——多个同名字段（不同组
   都有 `selected:`）不串行、目标组的注释保留、其余组的内容一字节不变、
-  找不到 `id` 时如实报错而不是静默无操作。
+  找不到 `name` 时如实报错而不是静默无操作。
 - **`HomeView.svelte`**：四张卡片渲染；零个 select 组时的空状态与引导文案；
   多个 select 组时的两层下拉；切换成员触发正确的保存调用；系统代理/TUN 开关
   的即时反馈；分流模式卡片与 `RulesView` 顶部的状态保持一致（同一份
