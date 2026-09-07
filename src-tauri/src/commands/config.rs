@@ -76,11 +76,20 @@ pub struct ConfigView {
     /// `rules:` 键本身所在的 1-based 行号。规则列表为空时，UI 没有任何
     /// 已有规则的行号可以当插入锚点，只能靠这个字段——见 `RuleOp::InsertRule`。
     pub rules_key_line: u64,
-    /// `rules_key_line` 那一行的原样文本（`"rules:"` 或 `"rules: []"`）。
+    /// `rules_key_line` 那一行的原样文本。`rules:` 键在文件里可以有好几种
+    /// 写法——最常见的两种「空」写法是块形式的 `"rules:"` 和空流式的
+    /// `"rules: []"`，这两种情况下这个字段就精确等于其中一个；但只要那一行
+    /// 是别的写法（比如非空的流式序列 `"rules: [MATCH,DIRECT]"`），这里存的
+    /// 就是那一行**实际**的文本，不会被强行归一化成上面两种形式之一。
+    ///
     /// `RuleOp::InsertRule` 拿 `rules_key_line` 当 anchor 时，`anchor_expect`
     /// 必须填这一行**当前实际的**文本——前端拿不到这份文本就只能猜，
     /// 猜错了并发校验会拒绝一次本该成功的插入。单独给一个字段，
     /// 不指望前端凭空知道空列表在文件里到底写的是哪一种空写法。
+    ///
+    /// 注意：`insert_rule_line` 目前只认「块形式」和「空流式」这两种锚点，
+    /// 拿非空流式序列的 `rules:` 行当 anchor 会被它自己的 `NotASequenceItem`
+    /// 校验拒绝——这是一次正常的、明确的插入失败，不是静默写坏配置。
     pub rules_key_text: String,
 }
 
@@ -119,7 +128,8 @@ pub enum RuleOp {
         anchor: u64,
         /// 并发校验：调用方看到 anchor 行当前的原始文本——
         /// 是某条规则时为它的值，是 rules_key_line 时为该行原样文本
-        /// （`"rules:"` 或 `"rules: []"`）。
+        /// （即 `ConfigView::rules_key_text`；通常是 `"rules:"` 或
+        /// `"rules: []"`，但也可能是别的写法，见该字段的文档）。
         anchor_expect: String,
         value: String,
     },
@@ -224,7 +234,7 @@ fn read_view(p: &Path) -> CmdResult<ConfigView> {
 fn find_rules_key_line(text: &str) -> Option<u64> {
     text.lines()
         .enumerate()
-        .find(|(_, l)| *l == "rules:" || l.trim_end() == "rules: []" || l.starts_with("rules:"))
+        .find(|(_, l)| l.starts_with("rules:"))
         .map(|(i, _)| i as u64 + 1)
 }
 
@@ -971,6 +981,30 @@ rules:
         let after = read_view(&p).unwrap();
         assert_eq!(after.rules.len(), 1);
         assert_eq!(after.rules[0].value, "MATCH,DIRECT");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_non_empty_flow_form_rules_key_line_is_still_readable() {
+        // find_rules_key_line 认的是「顶层行以 rules: 开头」，不只是块形式和
+        // 空流式两种写法——一份写成非空流式序列的、原本就合法的配置，
+        // config_get 该照常读出来，不能因为 rules: 的写法不是那两种「空」
+        // 形式之一就报「找不到 rules: 键」。
+        let d = tmpdir("rules-key-non-empty-flow");
+        let p = d.join("config.yaml");
+        // 注意：YAML 流式序列里的逗号是元素分隔符，`[MATCH,DIRECT]` 不加引号
+        // 会被拆成两个元素（"MATCH"、"DIRECT"）。要让整个 "MATCH,DIRECT" 落进
+        // 同一个规则值里，必须整体加引号。
+        std::fs::write(
+            &p,
+            "mixed-port: 25500\nproxies: []\nrules: [\"MATCH,DIRECT\"]\n",
+        )
+        .unwrap();
+
+        let view = read_view(&p).unwrap();
+        assert_eq!(view.rules_key_text, "rules: [\"MATCH,DIRECT\"]");
+        assert_eq!(view.rules.len(), 1);
+        assert_eq!(view.rules[0].value, "MATCH,DIRECT");
         std::fs::remove_dir_all(&d).unwrap();
     }
 
