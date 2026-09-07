@@ -290,7 +290,7 @@
   }
   th:nth-child(6),
   td:nth-child(6) {
-    width: 76px;
+    width: 118px;
   }
   th:nth-child(7),
   td:nth-child(7) {
