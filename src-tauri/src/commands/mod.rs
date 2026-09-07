@@ -103,9 +103,13 @@ impl From<wsieve_config::ConfigError> for CmdError {
             wsieve_config::ConfigError::Io { .. } => Self::Io {
                 message: e.to_string(),
             },
-            // 语义错：类型不支持 / 出站重名 / 枚举字段非法
+            // 语义错：类型不支持 / 出站重名 / 枚举字段非法 / 代理组相关校验
             wsieve_config::ConfigError::UnsupportedProxyType { .. }
             | wsieve_config::ConfigError::DuplicateProxyName(_)
+            | wsieve_config::ConfigError::DuplicateProxyGroupName(_)
+            | wsieve_config::ConfigError::GroupNameCollidesWithOutbound(_)
+            | wsieve_config::ConfigError::UnknownGroupMember { .. }
+            | wsieve_config::ConfigError::SelectedNotAMember { .. }
             | wsieve_config::ConfigError::BadEnumField { .. } => Self::ConfigInvalid {
                 message: e.to_string(),
             },
