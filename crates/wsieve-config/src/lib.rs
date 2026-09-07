@@ -183,6 +183,7 @@ rules:
         let c = load_str(MINIMAL).unwrap();
         assert_eq!(c.mode, "rule");
         assert_eq!(c.rule_preset, "custom");
+        assert!(c.proxy_groups.is_empty(), "省略 proxy-groups 时应为空数组");
         assert_eq!(c.shard_base_port, 18443);
         assert_eq!(c.dns.timeout_ms, 2000);
         assert_eq!(c.carrier, "shared");

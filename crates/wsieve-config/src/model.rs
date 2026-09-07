@@ -42,6 +42,7 @@ pub struct Config {
 
     // ── 出站 ──
     pub proxies: Vec<Proxy>,
+    pub proxy_groups: Vec<ProxyGroup>,
 
     // ── 规则 ──
     /// 带行号：定点改写靠它定位。业务侧读值用 `.value`。
@@ -72,6 +73,7 @@ impl Default for Config {
             log_level: "info".into(),
             system_proxy: false,
             proxies: Vec::new(),
+            proxy_groups: Vec::new(),
             rules: Vec::new(),
             dns: Dns::default(),
             tun: Tun::default(),
@@ -108,6 +110,25 @@ fn default_extra_sessions() -> usize {
 
 fn default_mux_prefs() -> Vec<u8> {
     vec![0, 1, 2, 3, 4]
+}
+
+/// 代理组（设计文档「代理组与首页视图」§1）。
+///
+/// 只用 `name` 做唯一标识，不单独设 `id`——`selected` 字段写在组自己的
+/// YAML 块里，不是外部按键索引的状态，改名不会打断任何引用（见设计文档
+/// §1「只用 name」一节的完整论证）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ProxyGroup {
+    pub name: String,
+    pub kind: String,
+    pub proxies: Vec<String>,
+    /// 仅 `select` 类型使用；其余类型省略时为空字符串。
+    #[serde(default)]
+    pub selected: String,
+    /// 仅 `load-balance` 类型使用；其余类型省略时为空字符串。
+    #[serde(default)]
+    pub strategy: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
