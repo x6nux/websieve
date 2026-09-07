@@ -579,6 +579,18 @@ describe('defaultInsertAnchor', () => {
     const a = defaultInsertAnchor(rules, 9, 'rules:');
     expect(a).toEqual({ anchor: 9, anchorExpect: 'rules:' });
   });
+
+  it('末条是 FINAL（MATCH 的别名）且前面还有别的规则时，新规则同样接在它前一条之后 —— 不是插到 FINAL 之后', () => {
+    // FINAL 是 MATCH 的别名（Rule::parse 同构），parseRuleLine 给它的展示
+    // 类型是 'final' 而非 'match'。插到 FINAL 之后是 RuleAfterMatch 明确
+    // 拒绝的非法状态，这条锁定该情形不会被漏判。
+    const rules = [
+      { line: 10, raw: 'DOMAIN,a.com,proxyA', type: 'domain' },
+      { line: 11, raw: 'FINAL,DIRECT', type: 'final' },
+    ];
+    const a = defaultInsertAnchor(rules, 9, 'rules:');
+    expect(a).toEqual({ anchor: 10, anchorExpect: 'DOMAIN,a.com,proxyA' });
+  });
 });
 
 describe('ruleTypeToFormType', () => {

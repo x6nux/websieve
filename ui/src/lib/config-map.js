@@ -393,7 +393,13 @@ export function defaultInsertAnchor(rules, rulesKeyLine, rulesKeyText) {
   }
   const lastIdx = rules.length - 1;
   const last = rules[lastIdx];
-  if (last.type !== 'match') {
+  // FINAL 是 MATCH 的别名（parseRuleLine 给它的展示类型是 'final' 而非
+  // 'match'）——这里必须把两者都当终结的兜底规则看待，否则 `FINAL,DIRECT`
+  // 结尾的规则列表会被误判成「末条不是终结规则」，把新规则插到 FINAL 之后，
+  // 那是路由引擎 `RuleAfterMatch` 明确拒绝的非法状态，且没有别的地方会兜底：
+  // `Config::validate()` 不查规则顺序，唯一的校验点 `RuleSet::build` 要到
+  // 下次启动才跑，届时保存已经"成功"过了。
+  if (last.type !== 'match' && last.type !== 'final') {
     return { anchor: last.line, anchorExpect: last.raw };
   }
   if (lastIdx === 0) {

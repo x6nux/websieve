@@ -28,9 +28,11 @@
     open = false,
     /** 'add' | 'edit' */
     mode = 'add',
-    /** 编辑时的初值：{ type, value, target, noResolve }。type 大小写、连字符不敏感——
-     * 调用方可能传 parseRuleLine 的短写（'domain-suffix'）或表单自己的大写形式，
-     * 这里统一转成表单认的大写形式，不要求调用方先转好。 */
+    /** 编辑时的初值：{ type, value, target, noResolve }。type 只做大小写/空白
+     * 归一化（见 draftFrom），不做词形翻译——调用方必须先把 `parseRuleLine`
+     * 产出的短写（'suffix'、'keyword'、'final' 等，注意不是 'domain-suffix'
+     * 这种拼出来的形式）用 config-map.js 的 `ruleTypeToFormType` 转成表单
+     * 认的大写类型，再传进来：`initial = { type: ruleTypeToFormType(row.type), ... }`。 */
     initial = null,
     outboundNames = [],
     groupNames = [],
@@ -44,7 +46,18 @@
     return { type: 'DOMAIN', value: '', target: '', noResolve: false };
   }
 
-  /** initial → 草稿。type 统一大写化，兼容调用方传入的各种大小写/连字符写法。 */
+  /**
+   * initial → 草稿。**只做大小写归一化**（防御性的：手写/拼接的 `initial`
+   * 大小写可能不一致），不做词形翻译。
+   *
+   * 它不认识、也不会去猜 `parseRuleLine` 的展示短写（'suffix'、'keyword'、
+   * 'final' 等）——那一步翻译必须在调用方发生，靠 config-map.js 的
+   * `ruleTypeToFormType` 完成（`final` → `MATCH`、`suffix` → `DOMAIN-SUFFIX`
+   * 等）。谁接下来要把「编辑」模式接上，传入的 `initial.type` 必须已经是
+   * `ruleTypeToFormType` 的输出，而不是 `rules[].type` 原样传入——原样传入
+   * 在这里只会被大写化成一个 TYPES 里不存在的值（比如 'SUFFIX'），
+   * 下拉框选不中任何选项，且这里不会报错提醒你。
+   */
   function draftFrom(v) {
     if (!v) return blank();
     return {
@@ -82,6 +95,9 @@
     restoreFocus = document.activeElement;
 
     tick().then(() => {
+      // 故意不把 button 加进这个选择器（与 SettingsOverlay 的等价查询不同）：
+      // 这个面板 DOM 里第一个可聚焦元素是 header 里的 × 关闭按钮，
+      // 选上 button 就会把初始焦点抢给它，而不是第一个真正的表单字段。
       dialog?.querySelector('select, input')?.focus();
     });
   });
