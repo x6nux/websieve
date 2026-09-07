@@ -637,8 +637,10 @@ describe('组装后的整体审计', () => {
     const u = userEvent.setup();
     const { container } = render(App);
     await vi.waitFor(() => expect(screen.getByRole('button', { name: '打开设置' })).toBeTruthy());
-    // 规则视图的探针输入框 + 设置层的几个字段同时在场
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    // 规则视图的探针输入框 + 设置层的几个字段同时在场。
+    // 首页（默认视图）的分流预设卡片里也有一个叫「规则」的选项（custom 预设），
+    // 与顶部导航撞名，故用 within 限定在「视图」这个 radiogroup 里
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
     await u.click(screen.getByRole('button', { name: '打开设置' }));
     await screen.findByRole('dialog');
 

@@ -9,7 +9,7 @@
    *   │   当前视图                                                    │
    *   └──────────────────────────────────────────────────────────────┘
    *
-   * 流量是默认视图（打开即见走向）；设置走覆盖层而非第四个标签。
+   * 首页是默认视图（打开即见节点/开关/分流/流量的总览）；设置走覆盖层而非第五个标签。
    *
    * ## 这一层的职责：所有 IPC 都在这里，视图一个都不发
    *
@@ -34,6 +34,7 @@
    * **绝不显示一个比事实更乐观的状态。**
    */
   import Segmented from './lib/Segmented.svelte';
+  import HomeView from './views/HomeView.svelte';
   import TrafficView from './views/TrafficView.svelte';
   import RulesView from './views/RulesView.svelte';
   import OutboundsView from './views/OutboundsView.svelte';
@@ -47,6 +48,7 @@
     mergeOutbound,
     parseRuleLine,
     probeResultOf,
+    setGroupSelected,
     setScalar,
     toCmdError,
     whereOf,
@@ -63,7 +65,7 @@
     trafficSnapshot,
   } from './lib/ipc.js';
 
-  let view = $state('traffic');
+  let view = $state('home');
   let settingsOpen = $state(false);
   let win = $state('1h');
 
@@ -462,6 +464,52 @@
   }
 
   /**
+   * 首页系统代理/TUN 快捷开关的保存路径。与 saveSettings/saveRoutingPreset
+   * 同构——取原文 → setScalar 改一行 → config_save_raw 整份写回 → 重新加载。
+   * 只有一个字段变化时不复用 saveSettings（它一次性收 4 个字段的 draft），
+   * 避免首页的一次点击意外把设置覆盖层里可能还没提交的其他草稿也带上。
+   */
+  async function saveSystemProxyOrTun(key, value) {
+    const raw = await call(configGetRaw);
+    if (!raw.ok) {
+      pushAlert(`切换失败（读不到配置原文）${whereOf(raw.error)}：${raw.error.message}`);
+      return;
+    }
+    const text = setScalar(raw.value, key, value);
+    const w = await call(configSaveRaw, text);
+    if (!w.ok) {
+      pushAlert(`切换失败${whereOf(w.error)}：${w.error.message}`);
+      return;
+    }
+    await loadConfig();
+  }
+
+  /**
+   * 首页「节点选择」卡片切换成员——走 setGroupSelected 而非 setScalar，
+   * 见该函数存在的理由（同名 selected: 字段在好几个组块里各出现一次）。
+   */
+  async function saveGroupSelection(groupName, member) {
+    const raw = await call(configGetRaw);
+    if (!raw.ok) {
+      pushAlert(`切换节点失败（读不到配置原文）${whereOf(raw.error)}：${raw.error.message}`);
+      return;
+    }
+    let text;
+    try {
+      text = setGroupSelected(raw.value, groupName, member);
+    } catch (e) {
+      pushAlert(`切换节点失败：${e.message}`);
+      return;
+    }
+    const w = await call(configSaveRaw, text);
+    if (!w.ok) {
+      pushAlert(`切换节点失败${whereOf(w.error)}：${w.error.message}`);
+      return;
+    }
+    await loadConfig();
+  }
+
+  /**
    * 导出配置。
    *
    * ⚠️ `config_get_raw` 的返回值**含明文私钥**。它在这里只做一件事：交给
@@ -528,6 +576,7 @@
     <Segmented
       label="视图"
       options={[
+        { value: 'home', label: '首页' },
         { value: 'traffic', label: '流量' },
         { value: 'rules', label: '规则' },
         { value: 'outbounds', label: '出站' },
@@ -557,7 +606,20 @@
   {/if}
 
   <main>
-    {#if view === 'traffic'}
+    {#if view === 'home'}
+      <HomeView
+        groups={config?.['proxy-groups'] ?? []}
+        systemProxy={config?.['system-proxy'] ?? false}
+        tunEnabled={config?.tun?.enable ?? false}
+        preset={routingPreset}
+        {spark}
+        downRate={status.downRate}
+        upRate={status.upRate}
+        onselectmember={saveGroupSelection}
+        onsystemproxychange={(v) => saveSystemProxyOrTun('system-proxy', v)}
+        ontunchange={(v) => saveSystemProxyOrTun('tun.enable', v)}
+        onpresetchange={saveRoutingPreset} />
+    {:else if view === 'traffic'}
       <TrafficView
         {flows}
         {colorOf}

@@ -20,7 +20,7 @@
  * 都在注释里指到了它的出处。
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, within } from '@testing-library/svelte';
+import { render, screen, within, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import App from './App.svelte';
 
@@ -155,9 +155,20 @@ afterEach(() => {
 });
 
 describe('组装：默认视图与状态条', () => {
-  it('打开就是流量视图 —— 默认不显示日志（§11.3）', async () => {
+  it('默认打开首页而不是流量视图', async () => {
+    render(App);
+    await waitFor(() => {
+      expect(screen.getByRole('radiogroup', { name: /视图/ })).toBeInTheDocument();
+    });
+    const nav = screen.getByRole('radiogroup', { name: /视图/ });
+    expect(within(nav).getByRole('radio', { name: '首页' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('切到流量视图后不显示日志（§11.3）', async () => {
+    const u = userEvent.setup();
     render(App);
     await settled();
+    await u.click(screen.getByRole('radio', { name: '流量' }));
     expect(screen.getByRole('region', { name: '流量走向' })).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: '分流规则' })).toBeNull();
   });
@@ -215,9 +226,11 @@ describe('组装：默认视图与状态条', () => {
     const { container } = render(App);
     await settled();
     await emit('traffic', { up_bytes: 1, down_bytes: 2, up_rate: 100, down_rate: 2048, active: 7 });
-    expect(screen.getByText(/2\.00 KB\/s/)).toBeInTheDocument();
+    // 首页现在是默认视图，它的「流量统计」卡片放大复用同一份 spark/rate，
+    // 所以下面两条都按状态条（.status）范围取，避免与首页卡片撞名
+    expect(within(container.querySelector('.status')).getByText(/2\.00 KB\/s/)).toBeInTheDocument();
     expect(screen.getByText(/7 活跃连接/)).toBeInTheDocument();
-    expect(container.querySelectorAll('.spark i')).toHaveLength(1);
+    expect(container.querySelectorAll('.status .spark i')).toHaveLength(1);
   });
 
   it('sparkline 对屏幕阅读器隐藏 —— 真实数值在旁边', async () => {
@@ -232,7 +245,7 @@ describe('组装：未就绪的命令不该让界面垮掉', () => {
     const u = userEvent.setup();
     render(App);
     await settled();
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
 
     await u.type(screen.getByLabelText(/试算/), 'x.com');
     await vi.waitFor(() => expect(screen.getByText(/试算不可用/)).toBeInTheDocument());
@@ -245,7 +258,7 @@ describe('组装：未就绪的命令不该让界面垮掉', () => {
     const u = userEvent.setup();
     render(App);
     await settled();
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
     await u.type(screen.getByLabelText(/试算/), 'x.com');
     await vi.waitFor(() => expect(screen.getByText(/试算不可用/)).toBeInTheDocument());
   });
@@ -313,9 +326,16 @@ describe('组装：诚实的计量口径', () => {
     { id: 3, target: 'c.com:443', outbound: 'DIRECT', state: 'open' },
   ];
 
-  it('没有逐流字节时，合计带的量词是「条连接」而非字节单位', async () => {
-    const { container } = render(App);
+  /** 首页现在是默认视图，这一组测的是流量视图本身，故先切过去 */
+  const goTraffic = async (u) => {
     await settled();
+    await u.click(screen.getByRole('radio', { name: '流量' }));
+  };
+
+  it('没有逐流字节时，合计带的量词是「条连接」而非字节单位', async () => {
+    const u = userEvent.setup();
+    const { container } = render(App);
+    await goTraffic(u);
     await emit('connection', { items: deltas, dropped: false });
     // 工具条上的合计。桑基图的文字摘要里也有同一个数（那是等价视图的一部分），
     // 所以这里按位置取，不用 getByText —— 否则会撞上两处
@@ -323,23 +343,26 @@ describe('组装：诚实的计量口径', () => {
   });
 
   it('绝不拿连接数假装成字节 —— 图上不出现 KB / MB / GB', async () => {
+    const u = userEvent.setup();
     const { container } = render(App);
-    await settled();
+    await goTraffic(u);
     await emit('connection', { items: deltas, dropped: false });
     const view = container.querySelector('[aria-label="流量走向"]');
     expect(view.textContent).not.toMatch(/\d\s*(KB|MB|GB|TB)\b/);
   });
 
   it('流带粗细的图例明说「不是吞吐量」', async () => {
+    const u = userEvent.setup();
     render(App);
-    await settled();
+    await goTraffic(u);
     await emit('connection', { items: deltas, dropped: false });
     expect(screen.getByText(/不是吞吐量/)).toBeInTheDocument();
   });
 
   it('后端补上 bytes 之后自动改口说字节，前端一个字不用改', async () => {
+    const u = userEvent.setup();
     const { container } = render(App);
-    await settled();
+    await goTraffic(u);
     await emit('connection', {
       items: deltas.map((d, i) => ({ ...d, bytes: (i + 1) * 1024 * 1024 })),
       dropped: false,
@@ -355,7 +378,7 @@ describe('组装：诚实的计量口径', () => {
 describe('组装：规则视图与热度', () => {
   const goRules = async (u) => {
     await settled();
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
   };
 
   it('规则从 config_get 的 rules 列读，不从 config.rules', async () => {
@@ -429,7 +452,7 @@ describe('组装：规则视图与热度', () => {
 describe('组装：排序翻译成 config_save 的定点改写', () => {
   const goRules = async (u) => {
     await settled();
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
   };
 
   it('Alt+↓ 发出的是 replace-rule ops，不是整份规则数组', async () => {
@@ -716,30 +739,41 @@ describe('组装：设置保存走 config_save_raw 且不毁注释', () => {
 });
 
 describe('组装：空状态按真实状态分支', () => {
+  /** 首页现在是默认视图，这些空状态文案在流量视图里，故先切过去 */
+  const goTraffic = async (u) => u.click(screen.getByRole('radio', { name: '流量' }));
+
   it('一个出站都没有时，先让用户去加服务器', async () => {
     installTauri({
       config_get: async () => ({ config: { ...CONFIG_VIEW.config, proxies: [] }, rules: [] }),
     });
+    const u = userEvent.setup();
     render(App);
+    await goTraffic(u);
     await vi.waitFor(() => expect(screen.getByText(/还没有配置任何出站/)).toBeInTheDocument());
   });
 
   it('有出站但没连上时，说的是「代理未运行」', async () => {
+    const u = userEvent.setup();
     render(App);
+    await goTraffic(u);
     await vi.waitFor(() => expect(screen.getByText(/代理未运行/)).toBeInTheDocument());
   });
 
   it('连上了还没有连接时，把混合端口原样给出去', async () => {
+    const u = userEvent.setup();
     render(App);
     await settled();
+    await goTraffic(u);
     await emit('outbound-state', { name: '日本节点', state: 'live', latency_ms: 38 });
     expect(screen.getByText(/代理已在运行/)).toBeInTheDocument();
     expect(screen.getByText('127.0.0.1:7890')).toBeInTheDocument();
   });
 
   it('空状态不画空的坐标骨架（§11.6）', async () => {
+    const u = userEvent.setup();
     const { container } = render(App);
     await settled();
+    await goTraffic(u);
     expect(container.querySelector('svg')).toBeNull();
   });
 });
@@ -750,7 +784,7 @@ describe('组装：出站色码全局一致', () => {
     const { container } = render(App);
     await settled();
 
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
     // 「MATCH,日本节点」那一行的色块
     const inRules = [...container.querySelectorAll('tbody tr')]
       .find((tr) => tr.textContent.includes('日本节点'))
@@ -770,7 +804,7 @@ describe('组装：出站色码全局一致', () => {
     const u = userEvent.setup();
     const { container } = render(App);
     await settled();
-    await u.click(screen.getByRole('radio', { name: '规则' }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
     const direct = [...container.querySelectorAll('tbody tr')]
       .find((tr) => tr.textContent.includes('DIRECT'))
       .querySelector('.chip')
