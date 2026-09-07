@@ -32,7 +32,11 @@ pub fn auto_pick(members: &[(String, Option<u64>)]) -> &str {
 
 /// load-balance：
 ///   `ConsistentHash` 对 `key`（目标 host）取哈希取模，同一 host 稳定落在
-///   同一个成员上，不消耗 `rr_counter`。
+///   同一个成员上，不消耗 `rr_counter`。**「稳定」只在单次进程运行内成立**——
+///   底层用的 `DefaultHasher` 不保证跨编译器版本、跨重启的哈希值一致，
+///   应用重启或升级后同一个 host 可能会被重新分到另一个成员。真正需要
+///   跨重启会话保持的场景届时要换一个固定算法（如 FNV/SipHash 定种子），
+///   现在没有调用点，先如实记下这个边界，不在无人使用时抢先优化。
 ///   `RoundRobin` 用调用方传入的可变计数器递增取模，`rr_counter` 的初值
 ///   由调用方决定（可以是每次从 0 开始，也可以是上一次留下的状态）。
 pub fn load_balance_pick(
