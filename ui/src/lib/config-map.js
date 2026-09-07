@@ -251,6 +251,10 @@ export function setGroupSelected(text, groupName, member) {
   }
 
   let start = -1;
+  // 目标项自己的缩进宽度——只有在这个宽度上的 `- ` 才是「下一个同级组」，
+  // 缩进更深的 `- `（比如块式写法的 `proxies:` 列表元素）是目标块自己的
+  // 内容，不是兄弟项的边界，与 `edit.rs` 的 `delete_proxy_block` 同一条纪律。
+  let startIndent = 0;
   let end = lines.length;
   for (let i = keyIdx + 1; i < lines.length; i++) {
     const line = lines[i].replace(/\r$/, '');
@@ -263,13 +267,21 @@ export function setGroupSelected(text, groupName, member) {
     const trimmed = line.trimStart();
     if (trimmed.startsWith('- ')) {
       if (start >= 0) {
-        end = i;
-        break;
-      }
-      const rest = trimmed.slice(2);
-      if (rest.startsWith('name:')) {
-        const name = rest.slice('name:'.length).trim().replace(/^"|"$/g, '');
-        if (name === groupName) start = i;
+        if (indent === startIndent) {
+          end = i;
+          break;
+        }
+        // 缩进比目标项更深——是目标块内部嵌套列表（如块式 proxies）的元素，
+        // 不是同级兄弟项，继续往下扫，一并纳入待查找范围。
+      } else {
+        const rest = trimmed.slice(2);
+        if (rest.startsWith('name:')) {
+          const name = rest.slice('name:'.length).trim().replace(/^"|"$/g, '');
+          if (name === groupName) {
+            start = i;
+            startIndent = indent;
+          }
+        }
       }
     }
   }

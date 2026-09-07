@@ -420,6 +420,39 @@ describe('setGroupSelected', () => {
   it('没有 proxy-groups 键时如实报错', () => {
     expect(() => setGroupSelected('rules: []\n', '节点选择', '日本节点')).toThrow(/proxy-groups/);
   });
+
+  it('proxies 写成块式列表也能正确找到 selected', () => {
+    // proxies 的嵌套 `- ` 行缩进比组项本身（2）更深（6），不该被当成
+    // 下一个同级组的边界，否则扫描会在碰到它时提前截断，永远走不到 selected。
+    const blockStyle = [
+      'proxy-groups:',
+      '  - name: 节点选择',
+      '    kind: select',
+      '    proxies:',
+      '      - 日本节点',
+      '      - 香港节点',
+      '    selected: 日本节点',
+      '  - name: 自动选优',
+      '    kind: auto',
+      '    proxies:',
+      '      - 日本节点',
+      '      - 香港节点',
+      'rules: []',
+      '',
+    ].join('\n');
+    const out = setGroupSelected(blockStyle, '节点选择', '香港节点');
+    expect(out).toContain('    selected: 香港节点');
+    expect(out).toContain('      - 日本节点');
+    expect(out).toContain('  - name: 自动选优');
+  });
+
+  it('CRLF 文件下也能定位到目标组并保留 \\r\\n，其余行不动', () => {
+    const crlf = src.replace(/\n/g, '\r\n');
+    const out = setGroupSelected(crlf, '节点选择', '香港节点');
+    expect(out).toBe(crlf.replace('    selected: 日本节点\r\n', '    selected: 香港节点\r\n'));
+    expect(out).toContain('    selected: 香港节点\r\n');
+    expect(out).toContain('  - name: 自动选优\r\n');
+  });
 });
 
 describe('decisionOf / probeResultOf —— 探针结果的翻译', () => {
