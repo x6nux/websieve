@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
 use super::{CmdError, CmdResult};
+use wsieve_route::Rule;
 
 /// 私钥在结构化读取里的占位。UI 看到这个值就知道「这里有一把私钥，
 /// 但我手上没有它」—— 与直接删掉字段不同，后者会让 UI 以为没配私钥。
@@ -269,6 +270,17 @@ fn apply_rule_ops(p: &Path, ops: Vec<RuleOp>) -> CmdResult<()> {
                     op.expect()
                 ),
             });
+        }
+    }
+
+    // 语法校验：DeleteRule 不产生新内容，不需要过这一关。
+    for op in &ops {
+        if let RuleOp::ReplaceRule { value, .. } = op {
+            if let Err(e) = Rule::parse(value) {
+                return Err(CmdError::ConfigInvalid {
+                    message: format!("{value:?} 不是一条合法规则：{e}"),
+                });
+            }
         }
     }
 
@@ -635,6 +647,44 @@ rules:
         assert!(after.contains("GEOSITE,cn,日本节点"), "改写没生效：\n{after}");
         assert!(!after.contains("GEOSITE,cn,DIRECT"), "旧值还在：\n{after}");
 
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn structured_save_rejects_a_syntactically_invalid_rule_value() {
+        let d = tmpdir("bad-rule-syntax");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, SAMPLE).unwrap();
+
+        let before = std::fs::read_to_string(&p).unwrap();
+        let ops = vec![RuleOp::ReplaceRule {
+            line: 12, // SAMPLE 里 "GEOSITE,cn,DIRECT" 那一行
+            expect: "GEOSITE,cn,DIRECT".to_string(),
+            value: "这不是一条合法规则".to_string(),
+        }];
+        let err = apply_rule_ops(&p, ops).unwrap_err();
+        assert!(
+            matches!(err, CmdError::ConfigInvalid { .. }),
+            "语法错误的规则值应被拒绝，实为 {err:?}"
+        );
+        // 拒绝就不该有任何字节落盘——validate 失败必须在写文件之前发生
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn structured_save_still_accepts_a_syntactically_valid_rule_value() {
+        // 补校验不能误伤合法值——这条守住「加固」没有变成「更严格到拒绝正常输入」。
+        let d = tmpdir("good-rule-syntax");
+        let p = d.join("config.yaml");
+        std::fs::write(&p, SAMPLE).unwrap();
+
+        let ops = vec![RuleOp::ReplaceRule {
+            line: 12,
+            expect: "GEOSITE,cn,DIRECT".to_string(),
+            value: "GEOSITE,private,DIRECT".to_string(),
+        }];
+        apply_rule_ops(&p, ops).unwrap();
         std::fs::remove_dir_all(&d).unwrap();
     }
 
