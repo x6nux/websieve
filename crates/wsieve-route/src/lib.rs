@@ -10,7 +10,9 @@
 //! 解析后再调一轮。
 
 pub mod engine;
+pub mod group;
 pub mod rule;
 
 pub use engine::{BuildError, Decision, Explained, GeoWarning, RuleHit, RuleSet, Verdict};
+pub use group::LbStrategy;
 pub use rule::{Mode, Rule, RuleError, RuleKind, Target, CHINA_PRESET_RULES};
