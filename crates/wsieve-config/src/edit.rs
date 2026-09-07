@@ -195,6 +195,80 @@ pub fn delete_rule_line(src: &str, line: u64) -> Result<String, EditError> {
     Ok(out)
 }
 
+/// 在 `anchor_line` 之后插入一条新规则。`anchor_line` 可以是：
+///   - 某条已有规则所在行——新规则插在它之后，缩进与它一致
+///   - `rules:` 键本身所在行（块式，键后即换行）——新规则成为第一条
+///   - `rules: []`（空流式序列）所在行——就地展开成块式，新规则成为第一条
+/// 除此之外一律报 `NotASequenceItem`，包括非空流式序列（`rules: [A, B]`）——
+/// 与 `replace_rule_line` 对这类文件的已知限制一致，不猜测怎么改。
+///
+/// 与 `replace_rule_line` 同一套「验不过就整体回滚」的纪律：改完立刻读回，
+/// 确认新插入的那一行确实是一条值为 `value` 的规则，不是就整体报错。
+pub fn insert_rule_line(src: &str, anchor_line: u64, value: &str) -> Result<String, EditError> {
+    check_new_value(value)?;
+
+    let lines: Vec<&str> = split_keep_ends(src);
+    let idx = check_index(anchor_line, lines.len())?;
+    let (body, orig_eol) = split_eol(lines[idx]);
+    // 新行自己的换行符：锚点行若有换行符就沿用，没有（文件不以换行结尾）就补一个。
+    let sep = if orig_eol.is_empty() { "\n" } else { orig_eol };
+
+    // 情形一：锚点是一条已有规则——插在它之后，缩进与它一致。
+    if split_item(body, anchor_line).is_ok() {
+        let indent = &body[..indent_width(body)];
+        let new_line = format!("{indent}- {value}{sep}");
+        let out = splice_after(&lines, idx, orig_eol, &new_line);
+        verify_written(src, &out, anchor_line + 1, value)?;
+        return Ok(out);
+    }
+
+    let trimmed = body.trim_end();
+
+    // 情形二：块式 rules: 键——新规则成为第一条。
+    if trimmed == "rules:" {
+        let new_line = format!("  - {value}{sep}");
+        let out = splice_after(&lines, idx, orig_eol, &new_line);
+        verify_written(src, &out, anchor_line + 1, value)?;
+        return Ok(out);
+    }
+
+    // 情形三：空流式序列——就地展开成块式。
+    if trimmed == "rules: []" {
+        let replacement = format!("rules:{sep}  - {value}{sep}");
+        let mut out = String::with_capacity(src.len() + replacement.len());
+        for (i, l) in lines.iter().enumerate() {
+            if i == idx {
+                out.push_str(&replacement);
+            } else {
+                out.push_str(l);
+            }
+        }
+        verify_written(src, &out, anchor_line + 1, value)?;
+        return Ok(out);
+    }
+
+    // 非空流式序列、或压根不是 rules 相关的行——都不猜测，直接拒绝。
+    Err(EditError::NotASequenceItem(anchor_line))
+}
+
+/// 在第 `at`（0-based）行之后插入 `new_line`；若该行原本没有换行符
+/// （文件不以换行结尾），先补一个，避免原内容与新行糊成一行。
+fn splice_after(lines: &[&str], at: usize, orig_eol: &str, new_line: &str) -> String {
+    let mut out = String::with_capacity(
+        lines.iter().map(|l| l.len()).sum::<usize>() + new_line.len() + 1,
+    );
+    for (i, l) in lines.iter().enumerate() {
+        out.push_str(l);
+        if i == at {
+            if orig_eol.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(new_line);
+        }
+    }
+    out
+}
+
 /// 一行序列项拆成三段：`- ` 及其之前的原样前缀、值、行尾注释。
 /// 三段首尾相接即原行正文，这是「同值替换是恒等操作」的依据。
 struct Item<'a> {
@@ -790,5 +864,81 @@ rules:
         let e = replace_rule_line(SRC, 2, "MATCH,DIRECT").unwrap_err();
         let text = e.to_string();
         assert!(text.contains('2'), "错误要点名是哪一行：{text}");
+    }
+
+    #[test]
+    fn insert_after_an_existing_rule() {
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        let out = insert_rule_line(src, 2, "GEOSITE,cn,DIRECT").unwrap();
+        assert_eq!(out, "rules:\n  - MATCH,DIRECT\n  - GEOSITE,cn,DIRECT\n");
+    }
+
+    #[test]
+    fn insert_as_the_first_item_of_a_block_form_list() {
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        let out = insert_rule_line(src, 1, "GEOSITE,cn,DIRECT").unwrap();
+        assert_eq!(out, "rules:\n  - GEOSITE,cn,DIRECT\n  - MATCH,DIRECT\n");
+    }
+
+    #[test]
+    fn insert_expands_an_empty_flow_sequence() {
+        let src = "mixed-port: 7890\nrules: []\n";
+        let out = insert_rule_line(src, 2, "MATCH,DIRECT").unwrap();
+        assert_eq!(out, "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n");
+    }
+
+    #[test]
+    fn insert_preserves_untouched_lines_and_comments() {
+        let src = "rules:\n  # 兜底\n  - MATCH,DIRECT\n";
+        let out = insert_rule_line(src, 3, "GEOSITE,cn,日本节点").unwrap();
+        assert_eq!(
+            out,
+            "rules:\n  # 兜底\n  - MATCH,DIRECT\n  - GEOSITE,cn,日本节点\n"
+        );
+    }
+
+    #[test]
+    fn insert_refuses_a_non_empty_flow_sequence() {
+        // 与 replace_rule_line 对这类文件的已知限制一致：不猜测怎么改。
+        let src = "rules: [MATCH,DIRECT]\n";
+        assert!(matches!(
+            insert_rule_line(src, 1, "GEOSITE,cn,DIRECT"),
+            Err(EditError::NotASequenceItem(1))
+        ));
+    }
+
+    #[test]
+    fn insert_refuses_an_anchor_that_is_neither_a_rule_nor_the_rules_key() {
+        let src = "mixed-port: 7890\nrules:\n  - MATCH,DIRECT\n";
+        assert!(matches!(
+            insert_rule_line(src, 1, "GEOSITE,cn,DIRECT"),
+            Err(EditError::NotASequenceItem(1))
+        ));
+    }
+
+    #[test]
+    fn insert_rejects_an_empty_value() {
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        assert!(matches!(
+            insert_rule_line(src, 1, "   "),
+            Err(EditError::EmptyValue)
+        ));
+    }
+
+    #[test]
+    fn insert_handles_a_file_with_no_trailing_newline() {
+        // 锚点行若恰好是文件最后一行且没有换行符，插入后原行与新行不能糊在一起。
+        let src = "rules:\n  - MATCH,DIRECT";
+        let out = insert_rule_line(src, 2, "GEOSITE,cn,DIRECT").unwrap();
+        assert_eq!(out, "rules:\n  - MATCH,DIRECT\n  - GEOSITE,cn,DIRECT\n");
+    }
+
+    #[test]
+    fn insert_out_of_range_anchor_is_an_error_not_a_panic() {
+        let src = "rules:\n  - MATCH,DIRECT\n";
+        assert!(matches!(
+            insert_rule_line(src, 99, "GEOSITE,cn,DIRECT"),
+            Err(EditError::LineOutOfRange(99, 2))
+        ));
     }
 }
