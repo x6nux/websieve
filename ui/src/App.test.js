@@ -552,6 +552,31 @@ describe('组装：排序翻译成 config_save 的定点改写', () => {
   });
 });
 
+describe('组装：规则表单接线', () => {
+  it('规则「添加」打开新增表单，提交后调用 config_save 的 insert-rule 并重新加载配置', async () => {
+    const u = userEvent.setup();
+    render(App);
+    await waitFor(() => screen.getByRole('radiogroup', { name: /视图/ }));
+    await u.click(within(screen.getByRole('radiogroup', { name: '视图' })).getByRole('radio', { name: '规则' }));
+    // 用 /添加/ 而非 /添加规则/：默认 mock 配置里规则是否为空未知，命中的可能是
+    // 工具栏的「+ 添加规则」，也可能是空状态的「添加第一条规则」——两种文案都含
+    // 「添加」，测试不该绑定某一种具体状态。
+    await u.click(await screen.findByRole('button', { name: /添加/ }));
+    await u.selectOptions(screen.getByLabelText('类型'), 'MATCH');
+    await u.selectOptions(screen.getByLabelText('出站'), 'DIRECT');
+    await u.click(screen.getByRole('button', { name: '保存' }));
+    await vi.waitFor(() => expect(calls.some(([c]) => c === 'config_save')).toBe(true));
+    const [, args] = calls.find(([c]) => c === 'config_save');
+    expect(args.ops).toEqual([
+      expect.objectContaining({ op: 'insert-rule', value: 'MATCH,DIRECT' }),
+    ]);
+    // 提交成功后重新加载配置
+    await vi.waitFor(() =>
+      expect(calls.filter(([c]) => c === 'config_get').length).toBeGreaterThan(1),
+    );
+  });
+});
+
 describe('组装：设置覆盖层的焦点往返（Task 15 遗留的那一条）', () => {
   it('齿轮按钮有可访问名字，不是一个光秃秃的图标', async () => {
     render(App);

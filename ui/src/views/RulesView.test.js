@@ -402,6 +402,47 @@ describe('键盘排序的端到端 —— 列表真的重排之后还得能继�
   });
 });
 
+describe('规则的新增/编辑/删除入口', () => {
+  const rules = [
+    { id: 0, line: 10, raw: 'DOMAIN,a.com,日本节点', type: 'domain', value: 'a.com', target: '日本节点', hits: 0, enabled: true },
+  ];
+
+  it('非空列表时工具栏也有添加按钮，不是只有空状态才有', () => {
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', onadd: vi.fn() });
+    expect(screen.getByRole('button', { name: /添加规则/ })).toBeInTheDocument();
+  });
+
+  it('每行都有编辑与删除按钮', () => {
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom' });
+    expect(screen.getByRole('button', { name: /编辑.*a\.com/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /删除.*a\.com/ })).toBeInTheDocument();
+  });
+
+  it('点编辑调用 onedit 并带上这条规则', async () => {
+    const u = userEvent.setup();
+    const onedit = vi.fn();
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', onedit });
+    await u.click(screen.getByRole('button', { name: /编辑.*a\.com/ }));
+    expect(onedit).toHaveBeenCalledWith(rules[0]);
+  });
+
+  it('点删除先要求二次确认，第二次点击才真的调用 ondelete', async () => {
+    const u = userEvent.setup();
+    const ondelete = vi.fn();
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', ondelete });
+    const del = screen.getByRole('button', { name: /删除.*a\.com/ });
+    await u.click(del);
+    expect(ondelete).not.toHaveBeenCalled();
+    await u.click(screen.getByRole('button', { name: /确认删除/ }));
+    expect(ondelete).toHaveBeenCalledWith(rules[0]);
+  });
+
+  it('china/direct/global 预设下不显示添加按钮——那三条不是可编辑内容', () => {
+    render(RulesView, { rules: [], colorOf: () => '#fff', preset: 'china', globalOutbound: '日本节点' });
+    expect(screen.queryByRole('button', { name: /添加规则/ })).not.toBeInTheDocument();
+  });
+});
+
 describe('内置分流预设选择器', () => {
   const withPreset = (preset, extra = {}) => ({ ...base(), preset, onpresetchange: vi.fn(), ...extra });
 

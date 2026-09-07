@@ -37,6 +37,7 @@
   import HomeView from './views/HomeView.svelte';
   import TrafficView from './views/TrafficView.svelte';
   import RulesView from './views/RulesView.svelte';
+  import RuleForm from './views/RuleForm.svelte';
   import OutboundsView from './views/OutboundsView.svelte';
   import SettingsOverlay from './views/SettingsOverlay.svelte';
   import { FlowStore } from './lib/flows.js';
@@ -44,10 +45,12 @@
   import { bytes, count } from './lib/format.js';
   import { reorderOps } from './lib/reorder.js';
   import {
+    defaultInsertAnchor,
     mergeConfigProxies,
     mergeOutbound,
     parseRuleLine,
     probeResultOf,
+    ruleTypeToFormType,
     setGroupSelected,
     setNestedScalar,
     setScalar,
@@ -69,6 +72,17 @@
   let view = $state('home');
   let settingsOpen = $state(false);
   let win = $state('1h');
+
+  let ruleFormOpen = $state(false);
+  let ruleFormMode = $state('add');
+  let ruleFormInitial = $state(null);
+  let ruleFormError = $state(null);
+  /** 正在编辑的规则的行号/原文——ruleFormInitial 只有表单字段，不带这两样 */
+  let editingRuleLine = $state(0);
+  let editingRuleRaw = $state('');
+  /** `rules:` 键本身的行号与原样文本，供新增规则时算默认插入锚点用 */
+  let rulesKeyLine = $state(0);
+  let rulesKeyText = $state('');
 
   let status = $state({ active: 0, downRate: 0, upRate: 0 });
   let spark = $state([]);
@@ -274,6 +288,8 @@
     config = v.config ?? {};
     const names = new Set((config.proxies ?? []).map((p) => p.name));
     rules = (v.rules ?? []).map((r0, i) => parseRuleLine(r0, i, names));
+    rulesKeyLine = v.rules_key_line ?? 0;
+    rulesKeyText = v.rules_key_text ?? '';
     // 配置里的出站先摆上，等 outbound-state 事件把状态填进来。
     // 不摆的话「一个出站都没有」的空状态会在配置明明写了出站时误报。
     outbounds = mergeConfigProxies(config.proxies ?? [], outbounds, config['carrier-host'] ?? '');
@@ -461,6 +477,69 @@
       pushAlert(`切换分流预设失败${whereOf(w.error)}：${w.error.message}`);
       return;
     }
+    await loadConfig();
+  }
+
+  const outboundNames = $derived(outbounds.map((o) => o.name));
+  const groupNames = $derived((config?.['proxy-groups'] ?? []).map((g) => g.name));
+
+  function openAddRule() {
+    ruleFormMode = 'add';
+    ruleFormInitial = null;
+    ruleFormError = null;
+    ruleFormOpen = true;
+  }
+
+  function openEditRule(r) {
+    ruleFormMode = 'edit';
+    editingRuleLine = r.line;
+    editingRuleRaw = r.raw;
+    ruleFormInitial = {
+      type: ruleTypeToFormType(r.type),
+      value: r.value === '*' ? '' : r.value,
+      target: r.target,
+      noResolve: /,\s*no-resolve\s*$/i.test(r.raw ?? ''),
+    };
+    ruleFormError = null;
+    ruleFormOpen = true;
+  }
+
+  function closeRuleForm() {
+    ruleFormOpen = false;
+  }
+
+  /**
+   * 规则表单提交——新增走 InsertRule，编辑走既有的 ReplaceRule。
+   * 两者都是 `config_save` 的 ops，插入锚点由 `defaultInsertAnchor` 算，
+   * 依据见该函数的文档注释：接在最后一条 MATCH 之前。编辑锚定的是
+   * `openEditRule` 打开表单那一刻记下的 `editingRuleLine`/`editingRuleRaw`——
+   * 不按字段内容重新在 `rules` 里查找，因为改了值之后内容本身就对不上了。
+   */
+  async function submitRuleForm({ value }) {
+    const op =
+      ruleFormMode === 'add'
+        ? (() => {
+            const a = defaultInsertAnchor(rules, rulesKeyLine, rulesKeyText);
+            return { op: 'insert-rule', anchor: a.anchor, 'anchor-expect': a.anchorExpect, value };
+          })()
+        : { op: 'replace-rule', line: editingRuleLine, expect: editingRuleRaw, value };
+
+    const r = await call(configSave, [op]);
+    if (!r.ok) {
+      ruleFormError = r.error.message;
+      return;
+    }
+    ruleFormOpen = false;
+    await loadConfig();
+  }
+
+  async function deleteRule(r) {
+    const res = await call(configSave, [{ op: 'delete-rule', line: r.line, expect: r.raw }]);
+    if (!res.ok) {
+      saveError = res.error;
+      return;
+    }
+    saveError = null;
     await loadConfig();
   }
 
@@ -659,8 +738,19 @@
         ontest={runProbe}
         onreorder={reorder}
         ontoggle={toggleRule}
-        onadd={() => (settingsOpen = true)}
+        onadd={openAddRule}
+        onedit={openEditRule}
+        ondelete={deleteRule}
         onpresetchange={saveRoutingPreset} />
+      <RuleForm
+        open={ruleFormOpen}
+        mode={ruleFormMode}
+        initial={ruleFormInitial}
+        {outboundNames}
+        {groupNames}
+        serverError={ruleFormError}
+        onsubmit={submitRuleForm}
+        onclose={closeRuleForm} />
     {:else}
       <OutboundsView
         {outbounds}

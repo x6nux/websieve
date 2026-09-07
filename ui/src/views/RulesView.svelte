@@ -51,6 +51,8 @@
     onreorder = () => {},
     ontoggle = () => {},
     onadd = () => {},
+    onedit = () => {},
+    ondelete = () => {},
     onpresetchange = () => {},
   } = $props();
 
@@ -180,6 +182,20 @@
     { type: 'geoip', value: 'CN', target: 'DIRECT' },
     { type: 'match', value: '*', target: globalOutbound || '（尚未设置）' },
   ]);
+
+  /** 待二次确认删除的规则 id；null 表示没有任何一行处在确认态 */
+  let confirmingDelete = $state(null);
+
+  function askDelete(id) {
+    confirmingDelete = id;
+  }
+  function confirmDelete(r) {
+    confirmingDelete = null;
+    ondelete(r);
+  }
+  function cancelDelete() {
+    confirmingDelete = null;
+  }
 </script>
 
 <section class="view" aria-label="分流规则">
@@ -254,6 +270,10 @@
       action="添加第一条规则"
       onaction={onadd} />
   {:else}
+    <div class="toolbar">
+      <button type="button" class="ghost" onclick={onadd}>+ 添加规则</button>
+    </div>
+
     <!-- 排序结果的播报区。视觉上不可见，但对键盘路径是唯一的反馈通道。 -->
     <p class="sr-only" aria-live="polite" role="status">{announcement}</p>
 
@@ -269,6 +289,7 @@
           <th scope="col">匹配值</th>
           <th scope="col">出站</th>
           <th scope="col" class="r">命中</th>
+          <th scope="col"><span class="sr-only">操作</span></th>
           <th scope="col"><span class="sr-only">启用</span></th>
         </tr>
       </thead>
@@ -310,6 +331,16 @@
             </td>
 
             <td class="hits mono r">{count(r.hits)}</td>
+
+            <td class="ops">
+              {#if confirmingDelete === r.id}
+                <button type="button" class="mini danger" onclick={() => confirmDelete(r)}>确认删除</button>
+                <button type="button" class="mini" aria-label="取消删除" onclick={cancelDelete}>取消</button>
+              {:else}
+                <button type="button" class="mini" aria-label={`编辑规则 ${ruleLabel(r)}`} onclick={() => onedit(r)}>编辑</button>
+                <button type="button" class="mini danger" aria-label={`删除规则 ${ruleLabel(r)}`} onclick={() => askDelete(r.id)}>删除</button>
+              {/if}
+            </td>
 
             <td class="sw-cell">
               <button type="button" role="switch" class="sw"
@@ -358,7 +389,8 @@
   .rules-table th:nth-child(2), .rules-table td:nth-child(2) { width: 74px; }
   .rules-table th:nth-child(4), .rules-table td:nth-child(4) { width: 150px; }
   .rules-table th:nth-child(5), .rules-table td:nth-child(5) { width: 66px; }
-  .rules-table th:nth-child(6), .rules-table td:nth-child(6) { width: 44px; }
+  .rules-table th:nth-child(6), .rules-table td:nth-child(6) { width: 118px; }
+  .rules-table th:nth-child(7), .rules-table td:nth-child(7) { width: 44px; }
 
   th {
     height: 28px;
@@ -482,4 +514,38 @@
   .preset-note .warn { color: var(--state-warn); }
 
   .china-table tbody tr.builtin { color: var(--text-2); }
+
+  .toolbar {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-0);
+  }
+  .ghost {
+    background: transparent;
+    color: var(--text-2);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    padding: 6px 14px;
+    font-size: var(--fs-12);
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .ghost:hover { color: var(--text-1); }
+
+  .mini {
+    background: transparent;
+    color: var(--text-3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 7px;
+    font-size: var(--fs-11);
+    font-family: inherit;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .mini:hover { color: var(--text-1); border-color: var(--border-strong); }
+  .mini.danger { color: var(--state-fail); border-color: rgba(255, 90, 90, .35); }
+  .ops { text-align: right; white-space: nowrap; }
 </style>
