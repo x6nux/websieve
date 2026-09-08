@@ -120,8 +120,13 @@ pub struct OutboundCfg {
     pub session_bases: Vec<Option<String>>,
 }
 
-/// 把 JS 送进承载 WebView 的闭包。
-pub type EvalFn = Arc<dyn Fn(String) + Send + Sync>;
+/// 把 JS 送进承载 WebView 的闭包：`(出站名, JS)`。
+///
+/// **出站名不是可选的诊断信息，是路由依据**：`isolated` 承载下每个出站有
+/// 自己的窗口，闭包必须知道这条 JS 属于谁才能送对地方。少了它就只能写死
+/// 一个窗口标签，于是全部出站的 JS 都挤进第一个窗口 —— 所有出站共用一个
+/// origin，故障隔离与多 TCP 双双落空，而且全程没有一条报错。
+pub type EvalFn = Arc<dyn Fn(&str, String) + Send + Sync>;
 /// 状态变化回调：(出站名, 新状态)。
 pub type StatusFn = Arc<dyn Fn(&str, &Status) + Send + Sync>;
 
@@ -134,9 +139,12 @@ pub struct SessionEnv {
 }
 
 impl SessionEnv {
-    fn eval_box(&self) -> Box<dyn Fn(String) + Send + Sync> {
+    /// 把本出站的名字绑进 eval 闭包，交给 `WebViewTransport`（它只认
+    /// `Fn(String)`，不认识出站的存在 —— §4.2 纪律③：承载方式对传输层透明）。
+    fn eval_box(&self, outbound: &str) -> Box<dyn Fn(String) + Send + Sync> {
         let f = self.eval.clone();
-        Box::new(move |js| f(js))
+        let name = outbound.to_string();
+        Box::new(move |js| f(&name, js))
     }
 }
 
@@ -393,7 +401,7 @@ impl OutboundInstance {
         let liveness = SessionLiveness::new();
 
         let primary_base = self.cfg.session_bases[0].clone().unwrap_or_default();
-        let t0 = WebViewTransport::with_base(env.eval_box(), primary_base);
+        let t0 = WebViewTransport::with_base(env.eval_box(&self.cfg.name), primary_base);
         t0.set_core(core.clone());
         let (conn, neg) = XhttpConn::connect(
             t0,
@@ -458,7 +466,7 @@ impl OutboundInstance {
         mux_id: MuxId,
         liveness: &Arc<SessionLiveness>,
     ) -> anyhow::Result<Arc<dyn Mux>> {
-        let t = WebViewTransport::with_base(env.eval_box(), base.to_string());
+        let t = WebViewTransport::with_base(env.eval_box(&self.cfg.name), base.to_string());
         t.set_core(core.clone());
         let (conn, neg) = XhttpConn::connect(
             t,
@@ -688,7 +696,7 @@ mod tests {
         let inst = OutboundInstance::new(cfg);
         let core = Arc::new(TransportCore::new());
         let env = SessionEnv {
-            eval: Arc::new(|_| {}),
+            eval: Arc::new(|_, _| {}),
             on_status: Arc::new(|_, _| {}),
         };
         let e = match inst.handshake(&core, &env).await {
@@ -696,6 +704,31 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(e.contains("空基址"), "{e}");
+    }
+
+    /// **eval 必须知道这条 JS 属于哪个出站。**
+    ///
+    /// `isolated` 承载下每出站一个窗口，调用方靠这个名字决定送进哪一个。
+    /// 丢了它就只能写死一个标签，于是全部出站的 JS 都挤进第一个窗口 ——
+    /// 所有出站共用一个 origin，故障隔离与多 TCP 双双落空，而且零报错。
+    #[tokio::test]
+    async fn eval_is_told_which_outbound_the_js_belongs_to() {
+        let inst = OutboundInstance::new(test_cfg("命名的节点"));
+        let core = Arc::new(TransportCore::new());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let env = SessionEnv {
+            eval: Arc::new(move |name: &str, _js| s.lock().unwrap().push(name.to_string())),
+            on_status: Arc::new(|_, _| {}),
+        };
+        // 握手不会成功（没人回填应答），但它在等应答之前就已经 eval 过了。
+        let _ = tokio::time::timeout(Duration::from_secs(2), inst.handshake(&core, &env)).await;
+        let names = seen.lock().unwrap().clone();
+        assert!(!names.is_empty(), "握手至少要 eval 过一次");
+        assert!(
+            names.iter().all(|n| n == "命名的节点"),
+            "eval 收到的出站名不对：{names:?}"
+        );
     }
 
     #[tokio::test]
@@ -790,7 +823,7 @@ mod tests {
         let core = Arc::new(TransportCore::new());
         inst.request_stop();
         let env = SessionEnv {
-            eval: Arc::new(|_| {}),
+            eval: Arc::new(|_, _| {}),
             on_status: Arc::new(|_, _| {}),
         };
         tokio::time::timeout(Duration::from_secs(2), inst.run(core.clone(), env))
@@ -811,7 +844,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<Status>::new()));
         let s2 = seen.clone();
         let env = SessionEnv {
-            eval: Arc::new(|_| {}),
+            eval: Arc::new(|_, _| {}),
             on_status: Arc::new(move |_, s| s2.lock().unwrap().push(s.clone())),
         };
         tokio::time::timeout(Duration::from_secs(2), inst.run(core, env))

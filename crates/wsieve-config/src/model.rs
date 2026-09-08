@@ -108,8 +108,19 @@ fn default_extra_sessions() -> usize {
     3
 }
 
+/// 这里的数字是 **`MuxId` 的线上标识**（`wsieve_proto::hello::MuxId`：
+/// Yamux=0x01 / Smux=0x02 / Muxado=0x03 / Picomux=0x04 / H2mux=0x05），
+/// 不是「第几个」。曾经写成 `[0, 1, 2, 3, 4]`（0-based 序号），而 `0` 根本
+/// 不是合法 `MuxId`——`ProxyForm` 添加服务器时从不写 `mux-prefs`，于是每个
+/// 从界面新建的出站都落到这个默认值上，下次启动 `build_startup_plan` 转换
+/// 失败、进程 `exit(2)`：用户只看到「加完服务器后应用打不开了」。
+///
+/// 顺序 = 偏好顺序，与 `bootstrap::load_cfg` 里 `WSIEVE_MUX_PREFS` 缺省时
+/// 那份 `[DEFAULT_MUX, Yamux, Muxado, Picomux, H2mux]` 逐项对齐
+/// （`DEFAULT_MUX` 是 `Smux`，见 `wsieve_xhttp`）——两条默认路径给出不同的
+/// 首选 mux，会让「同一份服务端，从配置起和从 env 起协商出的复用器不一样」。
 fn default_mux_prefs() -> Vec<u8> {
-    vec![0, 1, 2, 3, 4]
+    vec![2, 1, 3, 4, 5]
 }
 
 /// 代理组（设计文档「代理组与首页视图」§1）。

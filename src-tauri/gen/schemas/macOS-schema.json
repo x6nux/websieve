@@ -189,6 +189,12 @@
           "markdownDescription": "允许控制窗口退出应用。走 app.exit(0) 以确保 RunEvent::Exit 到达 —— hosts 摘除、系统代理恢复、命中计数落盘都挂在那里。"
         },
         {
+          "description": "允许控制窗口按名字删除一个出站服务器块。删除一个不存在的名字会被拒绝而不是静默无操作。",
+          "type": "string",
+          "const": "allow-config-delete-proxy",
+          "markdownDescription": "允许控制窗口按名字删除一个出站服务器块。删除一个不存在的名字会被拒绝而不是静默无操作。"
+        },
+        {
           "description": "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。",
           "type": "string",
           "const": "allow-config-get",
@@ -199,6 +205,12 @@
           "type": "string",
           "const": "allow-config-get-raw",
           "markdownDescription": "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。"
+        },
+        {
+          "description": "允许控制窗口新增一个出站服务器块（结构化，UI 表单驱动）。名字与已有出站/代理组冲突时拒绝，写入前完整校验。",
+          "type": "string",
+          "const": "allow-config-insert-proxy",
+          "markdownDescription": "允许控制窗口新增一个出站服务器块（结构化，UI 表单驱动）。名字与已有出站/代理组冲突时拒绝，写入前完整校验。"
         },
         {
           "description": "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）",

@@ -92,99 +92,187 @@ fn main() {
         );
     }
 
+    // ── 读 config.yaml（设计文档「运行时接入 config.yaml」§2）────────────
+    //
+    // 出站、规则、模式、承载方式全部来自这份文件——`WSIEVE_SERVER_PUB` /
+    // `WSIEVE_CLIENT_PRIV` / `WSIEVE_OUTBOUND_NAME` 这条「一个硬编码出站」
+    // 的 env 引导路径到此为止（其余 env 变量仍是排障旋钮，见 bootstrap.rs）。
+    //
+    // 路径要与 `commands::config::config_path` 算出的**完全一致**，否则
+    // 控制窗口编辑的和运行时读到的是两份不同的文件，而界面上看不出来。
+    // 这一刻还没有 `AppHandle`，用不了 `app.path().app_config_dir()`，因此
+    // 复刻它的实现：`dirs::config_dir().join(identifier)`。identifier 取自
+    // `generate_context!()` 产出的那一份，不另抄一个字面量。
+    let tauri_ctx = tauri::generate_context!();
+    let config_file = match config_file_path(&tauri_ctx.config().identifier) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("取配置文件路径失败: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    // 首次启动时落一份默认配置（零出站、零规则），与 `config_get` 走同一个
+    // 函数——两处各写一份默认值迟早会分叉。
+    if let Err(e) = commands::config::ensure_config_exists(&config_file) {
+        eprintln!("创建默认配置 {} 失败: {e:?}", config_file.display());
+        std::process::exit(2);
+    }
+    let config = match load_config(&config_file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("配置无效（{}）: {e:#}", config_file.display());
+            std::process::exit(2);
+        }
+    };
+    tracing::info!(
+        "已加载 {}：{} 个出站，{} 条规则，模式 {}",
+        config_file.display(),
+        config.proxies.len(),
+        config.rules.len(),
+        config.mode
+    );
+
     // 本地条带编排：hosts 劫持 + 多端口转发（见 shard_setup）。必须在建
     // WebView 之前完成——承载 WebView 要加载的正是转发器的端口。任何一步
     // 失败都降级为单会话，不影响可用性。
     //
-    // 端口分段（Task 13）：目前 env 配置只描述一个出站，因此它独占从
-    // shard_base_port 起的一整段。多出站配置接入后（阶段 4 的配置文件），
-    // 这里改成对 `outbound::plan_ports` 的调用即可 —— 分段逻辑与它的
-    // 溢出/重叠校验已经就位并有测试。
-    let extra_sessions = wsieve_mux::stripe_runtime::StripeCfg::with_env().extra_sessions;
-    let outbound_name = std::env::var("WSIEVE_OUTBOUND_NAME")
-        .unwrap_or_else(|_| "默认节点".to_string());
-    let ports = match outbound::try_plan_ports(
-        cfg.shard_base_port,
-        &[(outbound_name.as_str(), extra_sessions)],
-    ) {
+    // 端口分段：每个出站独占 `extra_sessions + 1` 个端口，从 shard_base_port
+    // 起依次排开；溢出与重名由 `try_plan_ports` 报错（两个出站抢同一个端口
+    // 会让 A 的流量偶尔跑到 B 的服务器上）。
+    let sessions: Vec<(&str, usize)> = config
+        .proxies
+        .iter()
+        .map(|p| (p.name.as_str(), p.extra_sessions))
+        .collect();
+    let ports = match outbound::try_plan_ports(cfg.shard_base_port, &sessions) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("端口分段失败: {e:#}");
             std::process::exit(2);
         }
     };
-    let base_port = ports[&outbound_name][0];
 
     // ── TUN 的前两步（§8.3.2 的第 0 与第 2 步）────────────────────────────
     //
-    // 顺序纪律钉死的六步在这里与 `shard_setup::plan` 交错：
+    // 顺序纪律钉死的六步在这里与 `shard_setup::plan_many` 交错：
     //   0) 查 fake-ip 段归属      ← 这里（只读、无需 root，掉头最干净）
-    //   1) 解析真实 IP            ← plan 内部
-    //   2) 写 bypass 路由         ← plan 内部，经下面这个钩子
-    //   3) 起转发器               ← plan 内部
-    //   4) 写 hosts               ← plan 内部
+    //   1) 解析真实 IP            ← plan_many 内部
+    //   2) 写 bypass 路由         ← plan_many 内部，经下面这个钩子
+    //   3) 起转发器               ← plan_many 内部
+    //   4) 写 hosts               ← plan_many 内部
     //   5) 最后拉起 TUN           ← 建 WebView 之后，run_stack 里
     //
     // 第 2 步必须夹在 1 与 3 之间，因此只能做成钩子递进去 —— 那正是
     // `UpstreamHook` 存在的全部理由。
-    let tun_setup = tun_prepare(&cfg);
-    let bypass_hook = tun_setup.as_ref().map(|t| {
-        Arc::new(tun::bypass_hook(
-            t.bypass.clone(),
-            t.routes.clone(),
-            outbound_name.clone(),
-        )) as shard_setup::UpstreamHook
-    });
+    let server_urls: Vec<String> = config.proxies.iter().map(|p| p.url.clone()).collect();
+    let tun_setup = tun_prepare(&cfg, &server_urls);
 
-    let plan = tauri::async_runtime::block_on(shard_setup::plan(
-        &cfg.server_url,
-        base_port,
-        extra_sessions,
+    // **每个出站各自一个钩子**：它们的服务器 IP 各不相同，而少写任何一条
+    // bypass 路由，那个出站的转发器就会被 TUN 捕获、判「走代理」、绕回本机。
+    // 钩子内部按出站名做引用计数（`BypassSet::insert`），共享同一台服务器的
+    // 两个出站不会互相覆盖。
+    let targets: Vec<shard_setup::ShardTarget> = config
+        .proxies
+        .iter()
+        .map(|p| shard_setup::ShardTarget {
+            server_url: p.url.clone(),
+            base_port: ports[&p.name][0],
+            extra_sessions: p.extra_sessions,
+            on_upstream: tun_setup.as_ref().map(|t| {
+                Arc::new(tun::bypass_hook(
+                    t.bypass.clone(),
+                    t.routes.clone(),
+                    p.name.clone(),
+                )) as shard_setup::UpstreamHook
+            }),
+        })
+        .collect();
+
+    let shard = tauri::async_runtime::block_on(shard_setup::plan_many(
+        targets,
         custody::hosts::system_path(),
-        bypass_hook,
     ));
     // 没有 bypass 就绝不拉 TUN（§8.3.1）。这不是保守，是确定性：
     // 转发器的第一条出网连接会被 TUN 捕获、判「走代理」、绕回本机。
-    let mut tun_setup = match (tun_setup, plan.tun_may_start()) {
+    //
+    // 多出站下这条门禁是**全体通过才放行**：环路只需要一条腿就能成立，而它
+    // 是静默的。零出站同样不拉——此时规则表兜底成 `MATCH,REJECT`，接管默认
+    // 路由只会把用户整机流量黑洞掉。
+    let tun_ok = !shard.entries.is_empty() && shard.entries.iter().all(|e| e.tun_may_start());
+    let mut tun_setup = match (tun_setup, tun_ok) {
         (Some(t), true) => Some(t),
         (Some(_), false) => {
-            tracing::error!(
-                "TUN 未启用：{}。混合端口入口不受影响，代理照常可用",
-                plan.bypass_error
-                    .as_deref()
-                    .unwrap_or("服务器地址未解析成功，没有 bypass 就拉起 TUN 必成环路")
-            );
+            let why = shard
+                .entries
+                .iter()
+                .find_map(|e| e.bypass_error.clone())
+                .unwrap_or_else(|| {
+                    if shard.entries.is_empty() {
+                        "配置里还没有任何出站".to_string()
+                    } else {
+                        "有出站的服务器地址未解析成功，没有 bypass 就拉起 TUN 必成环路"
+                            .to_string()
+                    }
+                });
+            tracing::error!("TUN 未启用：{why}。混合端口入口不受影响，代理照常可用");
             None
         }
         (None, _) => None,
     };
-    let page_url = plan.page_url.clone();
     // 退出时要撤的 TUN 路由。与 hosts / 系统代理并列的第三项托管（§10）。
     // 单独留一个句柄而不是靠 `TunSetup` —— 后者被 move 进 setup 闭包里了，
     // 而撤销发生在 `RunEvent::Exit`，两处的生命周期不重叠。
     let tun_routes = std::sync::Mutex::new(tun_setup.as_ref().map(|t| t.routes.clone()));
     let show_window = cfg.show_window;
-    let session_bases = plan.session_bases.clone();
 
-    // 规则集：env 配置只有一个出站，因此规则就是「全部走它」。
-    // 这条 MATCH 是**显式**的 —— websieve 不设隐式默认（`RuleSet::build`
-    // 会拒绝没有 MATCH 的规则表），隐式直连等于静默裸奔。
-    let known: std::collections::HashSet<String> =
-        std::iter::once(outbound_name.clone()).collect();
+    // ── 从配置构建启动计划：出站配置 + 承载计划 + 规则表材料 ────────────
+    //
+    // 条带的结果是它的**输入**（承载页面 URL 与各会话基址都取决于 hosts
+    // 劫持成没成功），因此必须排在 `plan_many` 之后。
+    let plan = match runtime_state::build_startup_plan(&config, &shard.entries) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("启动计划构建失败: {e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    // 规则集。**规则表有问题时不退出，退回 `MATCH,REJECT`**：规则引用了一个
+    // 不存在的出站（UI 的保存路径只校验规则语法，不校验引用），或者用户把
+    // 收尾的 MATCH 删了——这些都是能从控制窗口改回来的错误，而直接
+    // `exit(2)` 会让用户连打开控制窗口的机会都没有，配置就此锁死。
+    // 兜底成拒绝而不是直连：与 §6.4 一致，宁可连不上也不静默裸奔。
+    let known = config.outbound_names();
     let rules = match wsieve_route::RuleSet::build(
-        &[format!("MATCH,{outbound_name}")],
-        wsieve_route::Mode::Rule,
-        "",
+        &plan.rule_lines,
+        plan.mode,
+        &plan.global_outbound,
         &known,
     ) {
         Ok(r) => Arc::new(r),
         Err(e) => {
-            eprintln!("规则表无效: {e:#}");
-            std::process::exit(2);
+            tracing::error!(
+                "规则表无效（{e}）——本次启动改用隐式 MATCH,REJECT 兜底：\
+                 全部连接都会被拒绝，直到你在控制窗口的「规则」页把它改好。\
+                 绝不静默直连（§6.4）"
+            );
+            let fallback = vec!["MATCH,REJECT".to_string()];
+            match wsieve_route::RuleSet::build(
+                &fallback,
+                wsieve_route::Mode::Rule,
+                "",
+                &Default::default(),
+            ) {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    // 连一条 MATCH,REJECT 都建不起来，说明规则引擎本身坏了。
+                    eprintln!("兜底规则表也无法构建: {e:#}");
+                    std::process::exit(2);
+                }
+            }
         }
     };
     // GEO 数据缺失不阻断启动（spec §12）：涉 GEO 的规则跳过并告警。
-    // 目前的规则表里没有 GEO 规则，因此这两个路径一个字节都不会被读。
     let geo = Arc::new(wsieve_geo::GeoDb::new(
         geo_path("WSIEVE_GEOIP", "geoip.dat"),
         geo_path("WSIEVE_GEOSITE", "geosite.dat"),
@@ -195,71 +283,49 @@ fn main() {
 
     // guard 持有 hosts 清理职责；进程正常退出时由 RunEvent::Exit 显式 drop，
     // 崩溃路径由下次启动的 clear_managed 兜底。
-    let shard_guard = std::sync::Mutex::new(plan.guard);
+    let shard_guard = std::sync::Mutex::new(shard.guard);
     // 系统代理托管（spec §8.2 / §10）。同 hosts 一样：持有即生效、drop 即恢复，
     // 崩溃残留由启动时的 clear_stale 兜底。
     let sysproxy_guard = std::sync::Mutex::new(setup_system_proxy(&cfg));
 
-    // 承载计划（Task 10）：单出站时它就是宿主，用相对路径完全同源。
-    let carrier = match outbound::carrier::CarrierPlan::build(
-        match outbound::carrier::CarrierMode::parse(
-            &std::env::var("WSIEVE_CARRIER").unwrap_or_else(|_| "shared".into()),
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("carrier 配置无效: {e:#}");
-                std::process::exit(2);
+    // 承载窗口标签表：`eval` 要按**出站名**把 JS 送进它自己的那个窗口。
+    // `isolated` 下每出站一个窗口，写死一个标签就等于把全部出站的 JS 都塞进
+    // 第一个窗口——所有出站共用一个 origin，故障隔离与多 TCP 双双落空。
+    let mut carrier_windows: BTreeMap<String, String> = BTreeMap::new();
+    match &plan.carrier {
+        Some(c) => {
+            tracing::info!("承载模式 {:?}，宿主出站「{}」", c.mode(), c.host_name());
+            for ob in &plan.outbound_cfgs {
+                match c.window_label(&ob.name) {
+                    Some(w) => {
+                        carrier_windows.insert(ob.name.clone(), w);
+                    }
+                    None => {
+                        // 承载计划与出站列表来自同一份 proxies，对不上说明
+                        // 两者的构建逻辑分叉了——猜一个窗口等于把这个出站的
+                        // 流量发去别人的 origin。
+                        eprintln!("承载计划里没有出站「{}」的窗口", ob.name);
+                        std::process::exit(2);
+                    }
+                }
             }
-        },
-        "",
-        &[(outbound_name.as_str(), page_url.as_str())],
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("承载计划无效: {e:#}");
-            std::process::exit(2);
         }
-    };
-    tracing::info!(
-        "承载模式 {:?}，宿主出站「{}」",
-        carrier.mode(),
-        carrier.host_name()
-    );
-
-    // 主会话的基址由**承载计划**决定，不是由条带决定：条带只管额外会话各自
-    // 用哪个本地端口，而「这个出站相对承载页面是同源还是跨域名」只有承载
-    // 计划知道。两层 Option 的外层是「不认识这个出站」——那必须当错误处理，
-    // 悄悄给个默认基址就等于把流量发去了另一台服务器（§6.4）。
-    let mut session_bases = session_bases;
-    match carrier.base_for(&outbound_name) {
-        Some(base) => session_bases[0] = base,
-        None => {
-            eprintln!("承载计划里没有出站「{outbound_name}」");
-            std::process::exit(2);
-        }
+        // 零出站是全新用户的正常状态：不建任何承载窗口，控制窗口与混合端口
+        // 入口照常起，用户在界面上添加第一个服务器之前不需要任何前置条件。
+        None => tracing::info!("配置里还没有出站——不建承载窗口，控制窗口与入口照常"),
     }
-    // 承载窗口标签：eval 要把 JS 送进**这一个**窗口。
-    let carrier_window = match carrier.window_label(&outbound_name) {
-        Some(w) => w,
-        None => {
-            eprintln!("承载计划里没有出站「{outbound_name}」的窗口");
-            std::process::exit(2);
-        }
-    };
 
-    let outbound_cfg = outbound::instance::OutboundCfg {
-        name: outbound_name.clone(),
-        server_pub: cfg.server_pub,
-        client_priv: cfg.client_priv,
-        mux_prefs: cfg.mux_prefs.clone(),
-        session_bases,
-    };
+    let carrier = plan.carrier;
+    let outbound_cfgs = plan.outbound_cfgs;
 
     tauri::Builder::default()
         .setup(move |app| {
             // 承载 WebView：加载服务端真实首页 + initialization_script 注入
-            // emitter（同源关键，见模块注释）。
-            outbound::carrier::spawn_carrier_windows(&app.handle().clone(), &carrier, show_window)?;
+            // emitter（同源关键，见模块注释）。零出站时没有承载计划，整段
+            // 跳过——不是「建一个空窗口」，是一个都不建。
+            if let Some(c) = &carrier {
+                outbound::carrier::spawn_carrier_windows(&app.handle().clone(), c, show_window)?;
+            }
 
             // 托盘先于窗口建：窗口建失败时用户至少还有托盘可用（这两条
             // 生命周期是独立的，见 tray.rs 模块注释）。同样不阻断代理。
@@ -294,13 +360,13 @@ fn main() {
 
             let handle = app.handle().clone();
             let bind = inbound_bind.clone();
-            let ob = outbound_cfg.clone();
+            let obs = outbound_cfgs.clone();
             let rules = rules.clone();
             let geo = geo.clone();
-            let win = carrier_window.clone();
+            let wins = carrier_windows.clone();
             let tun = tun_setup.take();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_stack(handle, bind, win, ob, rules, geo, tun).await {
+                if let Err(e) = run_stack(handle, bind, wins, obs, rules, geo, tun).await {
                     tracing::error!("入口/出站栈退出: {e:#}");
                 }
             });
@@ -331,7 +397,7 @@ fn main() {
             commands::probe::geo_status,
             commands::probe::traffic_snapshot,
         ])
-        .build(tauri::generate_context!())
+        .build(tauri_ctx)
         .expect("tauri build")
         .run(move |app, event| {
             // 退出时**按获取的相反顺序**摘除全部外部系统状态托管（spec §10）：
@@ -386,6 +452,32 @@ fn geo_path(env: &str, name: &str) -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from(name))
 }
 
+/// `config.yaml` 的绝对路径。
+///
+/// 这是 `tauri::path::PathResolver::app_config_dir()` 的复刻
+/// （`dirs::config_dir().join(identifier)`）——`main()` 里读配置的那一刻
+/// 还没有 `AppHandle`。两处**必须**算出同一条路径：不一致就意味着控制窗口
+/// 写的和运行时读的是两份文件，用户改了配置却毫无效果，而界面上一切正常。
+/// 因此 identifier 由调用方从 `generate_context!()` 里取，不在这里另抄一份
+/// 字面量。
+fn config_file_path(identifier: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = dirs::config_dir().ok_or_else(|| {
+        anyhow::anyhow!("取不到本机的用户配置目录，无法定位 config.yaml")
+    })?;
+    Ok(dir.join(identifier).join("config.yaml"))
+}
+
+/// 读 + 解析 + 语义校验。
+///
+/// `validate()` 不能省：它拦的是枚举字段取值、出站重名、未知出站类型这类
+/// 「语法对、含义不对」的问题。少了这一步，坏配置会一路漏到各个下游模块，
+/// 报出来的错离病因很远。
+fn load_config(p: &std::path::Path) -> anyhow::Result<wsieve_config::Config> {
+    let config = wsieve_config::load_file(p)?;
+    config.validate()?;
+    Ok(config)
+}
+
 /// TUN 拉起前就该准备好的东西：bypass 名单、路由托管、fake-ip 池。
 ///
 /// 之所以要在建 WebView 之前构造，是因为 `bypass_hook` 必须递进
@@ -407,7 +499,7 @@ struct TunSetup {
 /// IPv4 空间黑洞掉，而用户在任何界面上都看不出这跟本程序有关。这与
 /// `setup_system_proxy` 里「本次不开也照清」是同一条纪律。
 #[cfg(target_os = "macos")]
-fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
+fn tun_prepare(cfg: &bootstrap::AppConfig, server_urls: &[String]) -> Option<TunSetup> {
     use wsieve_tun::managed::{self, FakeIpRangeOwner, MacRouteBackend, TunRoutes};
 
     // 物理网关取不到就不能继续：全部 bypass 路由都要指向它，猜错的话每条
@@ -480,8 +572,11 @@ fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
 
     // 出站服务器域名自动并入 fake-ip filter（§7.2 纪律①）：它一旦拿到假 IP，
     // 转发器就连向虚空，且全程零报错。用户不该需要记住这件事。
-    let server_domain = server_host(&cfg.server_url);
-    let pool = tun::build_pool(Vec::new(), server_domain.as_slice());
+    //
+    // **每一个**出站的域名都要进：漏掉任何一个，那个出站就单独连向虚空，
+    // 而其余出站一切正常——这种「只有一个节点用不了」的现象最难归因。
+    let server_domains: Vec<String> = server_urls.iter().flat_map(|u| server_host(u)).collect();
+    let pool = tun::build_pool(Vec::new(), &server_domains);
 
     Some(TunSetup {
         bypass: wsieve_tun::bypass::BypassSet::new(),
@@ -494,7 +589,7 @@ fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
 ///
 /// 静默的后果与 M8 同源 —— 用户以为 TUN 开着，实际全部流量走的是别的路。
 #[cfg(not(target_os = "macos"))]
-fn tun_prepare(cfg: &bootstrap::AppConfig) -> Option<TunSetup> {
+fn tun_prepare(cfg: &bootstrap::AppConfig, _server_urls: &[String]) -> Option<TunSetup> {
     if cfg.tun {
         tracing::error!(
             "TUN 未启用：本平台暂不支持（阶段 6 只完整实现 macOS）。\
@@ -538,20 +633,25 @@ fn server_host(url: &str) -> Vec<String> {
 /// 入口只起一次并跨代复用：它持有的是 `Router`，而 `Router` 查的是出站
 /// 实例的 `dialer()`，实例本身跨代存活。换代期间 `dialer()` 为 `None`，
 /// 于是连接被**拒绝**而不是被静默改道（§6.4）。
+/// `carrier_windows` 是「出站名 → 承载窗口标签」。零出站时它是空的，
+/// 整条栈照常起来：`OutboundManager`/`Router` 的出站表为空，`start_all()`
+/// 是空操作，入口照常监听并按规则表（此时兜底为 `MATCH,REJECT`）拒绝连接。
 async fn run_stack(
     app: tauri::AppHandle,
     bind: String,
-    carrier_window: String,
-    ob_cfg: outbound::instance::OutboundCfg,
+    carrier_windows: BTreeMap<String, String>,
+    ob_cfgs: Vec<outbound::instance::OutboundCfg>,
     rules: Arc<wsieve_route::RuleSet>,
     geo: Arc<wsieve_geo::GeoDb>,
     tun_setup: Option<TunSetup>,
 ) -> anyhow::Result<()> {
-    let inst = outbound::instance::OutboundInstance::new(ob_cfg);
     let mut table = BTreeMap::new();
-    // 键取自实例自己的 `name()`，不取外面另传的一份：两者一旦不一致，
-    // 规则里写的名字就查不到实例，表现为「配置明明写了却说出站不存在」。
-    table.insert(inst.name().to_string(), inst);
+    for c in ob_cfgs {
+        let inst = outbound::instance::OutboundInstance::new(c);
+        // 键取自实例自己的 `name()`，不取外面另传的一份：两者一旦不一致，
+        // 规则里写的名字就查不到实例，表现为「配置明明写了却说出站不存在」。
+        table.insert(inst.name().to_string(), inst);
+    }
 
     // 路由分派器与出站管理器**共用同一批实例**：管理器跑它们的会话循环、
     // 往里装 dialer，分派器读 dialer 决定这条连接能不能走。各持一份副本
@@ -604,7 +704,7 @@ async fn run_stack(
         app.manage(CurrentCore(core.clone()));
 
         let env = outbound::instance::SessionEnv {
-            eval: eval_fn(app.clone(), carrier_window.clone()),
+            eval: eval_fn(app.clone(), carrier_windows.clone()),
             on_status: status_fn(app.clone()),
         };
         let manager =
@@ -767,14 +867,24 @@ fn windows_to_reload(all_labels: &[String], control_label: &str) -> Vec<String> 
         .collect()
 }
 
-/// 把 JS 送进**指定的**承载 WebView。
+/// 把 JS 送进**这条 JS 所属出站的**承载 WebView。
 ///
-/// 窗口标签来自 `CarrierPlan::window_label`，不是写死的 "main"：
+/// 窗口标签按出站名查 `CarrierPlan::window_label` 的结果，不是写死的 "main"：
 /// `isolated` 模式下每出站一个窗口，写死就会把全部出站的 JS 都塞进第一个
 /// 窗口 —— 那等于所有出站共用一个 origin，故障隔离与多 TCP 双双落空。
-fn eval_fn(app: tauri::AppHandle, window: String) -> outbound::instance::EvalFn {
-    Arc::new(move |js: String| {
-        match app.get_webview_window(&window) {
+///
+/// 查不到出站时**不挑一个窗口顶上**：那会把这个出站的请求从别人的 origin
+/// 发出去，流量到了另一台服务器而全程零报错（§6.4）。只告警并丢弃。
+fn eval_fn(
+    app: tauri::AppHandle,
+    windows: BTreeMap<String, String>,
+) -> outbound::instance::EvalFn {
+    Arc::new(move |outbound: &str, js: String| {
+        let Some(window) = windows.get(outbound) else {
+            tracing::warn!("出站「{outbound}」没有对应的承载窗口，JS 无法送达");
+            return;
+        };
+        match app.get_webview_window(window) {
             Some(w) => {
                 if let Err(e) = w.eval(&js) {
                     tracing::warn!("向承载窗口 {window} 注入 JS 失败: {e}");

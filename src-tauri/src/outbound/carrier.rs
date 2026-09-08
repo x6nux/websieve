@@ -589,7 +589,7 @@ mod tests {
         let seen = a_evals.clone();
         let fails = a_fails.clone();
         let a_env = SessionEnv {
-            eval: Arc::new(move |js: String| {
+            eval: Arc::new(move |_name: &str, js: String| {
                 seen.lock().unwrap().push(js.clone());
                 if let Some(id) = eval_request_id(&js) {
                     let c = a_core.clone();

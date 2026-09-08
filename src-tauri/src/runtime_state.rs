@@ -97,12 +97,12 @@ pub fn diff_outbounds(
 /// `OutboundInstance`、建窗口、跑本地条带）两半——前者不依赖 Tauri，
 /// 可以脱离真实文件系统/网络单测；后者留给调用方。
 ///
-/// **`session_bases` 只是占位**：每个出站的会话基址长度按
-/// `extra_sessions + 1` 算好（与既有的单出站逻辑一致），但值全部是
-/// `None`。真正的会话基址（本地条带分到的端口、承载计划决定的相对/
-/// 绝对路径）依赖异步 IO（DNS 解析、hosts 改写、起转发器），这些
-/// 不属于"纯"的范围，必须留给 `main.rs` 在有了 `AppHandle` 之后再算，
-/// 算完要整体替换掉这里的占位值，不能指望这里的值直接可用。
+/// **本地条带的结果是输入而不是输出**：会话基址与承载页面 URL 都取决于
+/// hosts 劫持有没有成功（成功则页面加载的是本地转发端口，失败则是原始
+/// 服务端 URL），而那是异步 IO，不属于"纯"的范围。因此调用方先跑
+/// `shard_setup::plan_many`，把结果原样递进来——`ShardPlanEntry` 是纯数据，
+/// 本函数照旧可以脱离 Tauri/网络单测。
+#[derive(Debug)]
 pub struct StartupPlan {
     pub outbound_cfgs: Vec<crate::outbound::instance::OutboundCfg>,
     /// 出站为空时是 `None`——`CarrierPlan::build` 在空列表上会报错，
@@ -139,9 +139,45 @@ fn rule_lines_with_reject_fallback(config: &wsieve_config::Config) -> Vec<String
     }
 }
 
-pub fn build_startup_plan(config: &wsieve_config::Config) -> anyhow::Result<StartupPlan> {
+/// `shard` 必须与 `config.proxies` **按下标一一对应**（`plan_many` 的契约
+/// 就是这样，见 `ShardManyPlan::entries`）。长度对不上时报错而非按短的那个
+/// 截断：截断意味着有出站会拿到别人的会话基址，流量发去另一台服务器
+/// （§6.4），而现象离病因极远。
+pub fn build_startup_plan(
+    config: &wsieve_config::Config,
+    shard: &[crate::shard_setup::ShardPlanEntry],
+) -> anyhow::Result<StartupPlan> {
+    if shard.len() != config.proxies.len() {
+        anyhow::bail!(
+            "本地条带结果有 {} 项，出站有 {} 项——两者必须按下标一一对应",
+            shard.len(),
+            config.proxies.len()
+        );
+    }
+
+    // 承载计划先算：**会话 0 的基址由它决定**，不是由条带决定。条带只知道
+    // 额外会话各自用哪个本地端口，而「这个出站相对承载页面是同源还是跨域名」
+    // 只有承载计划知道。而承载计划自己要的页面 URL 又来自条带（劫持成功时
+    // 是本地端口），所以顺序只能是条带 → 承载 → 会话基址。
+    let carrier = if config.proxies.is_empty() {
+        None
+    } else {
+        let mode = crate::outbound::carrier::CarrierMode::parse(&config.carrier)?;
+        let entries: Vec<(&str, &str)> = config
+            .proxies
+            .iter()
+            .zip(shard)
+            .map(|(p, e)| (p.name.as_str(), e.page_url.as_str()))
+            .collect();
+        Some(crate::outbound::carrier::CarrierPlan::build(
+            mode,
+            &config.carrier_host,
+            &entries,
+        )?)
+    };
+
     let mut outbound_cfgs = Vec::with_capacity(config.proxies.len());
-    for p in &config.proxies {
+    for (p, entry) in config.proxies.iter().zip(shard) {
         let server_pub = crate::bootstrap::hex32(&p.server_pub).map_err(|e| {
             anyhow::anyhow!("出站「{}」的 server-pub 不是合法的十六进制: {e}", p.name)
         })?;
@@ -160,31 +196,29 @@ pub fn build_startup_plan(config: &wsieve_config::Config) -> anyhow::Result<Star
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // 条带给出的会话基址（会话 0 之外的每一项都是它分到的本地端口），
+        // 会话 0 那一项由承载计划改写。
+        let mut session_bases = entry.session_bases.clone();
+        if session_bases.is_empty() {
+            anyhow::bail!("出站「{}」的条带结果没有任何会话基址", p.name);
+        }
+        // 两层 Option 的**外层** `None` 是「承载计划不认识这个出站」——必须
+        // 当错误处理。悄悄给个默认基址就等于把流量发去了另一台服务器（§6.4）。
+        session_bases[0] = carrier
+            .as_ref()
+            .expect("出站非空时承载计划必然已构建")
+            .base_for(&p.name)
+            .ok_or_else(|| anyhow::anyhow!("承载计划里没有出站「{}」", p.name))?;
+
         outbound_cfgs.push(crate::outbound::instance::OutboundCfg {
             name: p.name.clone(),
             server_pub,
             client_priv,
             mux_prefs,
-            // 占位，main.rs 建好本地条带之后整体替换——见结构体文档。
-            session_bases: vec![None; p.extra_sessions + 1],
+            session_bases,
         });
     }
-
-    let carrier = if outbound_cfgs.is_empty() {
-        None
-    } else {
-        let mode = crate::outbound::carrier::CarrierMode::parse(&config.carrier)?;
-        let entries: Vec<(&str, &str)> = config
-            .proxies
-            .iter()
-            .map(|p| (p.name.as_str(), p.url.as_str()))
-            .collect();
-        Some(crate::outbound::carrier::CarrierPlan::build(
-            mode,
-            &config.carrier_host,
-            &entries,
-        )?)
-    };
 
     let mode: wsieve_route::Mode = config
         .mode
@@ -235,10 +269,30 @@ mod startup_plan_tests {
         }
     }
 
+    /// 一份「hosts 劫持没生效」的条带结果：页面就是原始 URL，会话数按
+    /// `extra_sessions + 1` 排开但都还没有各自的端口。这正是没有管理员
+    /// 权限时的真实形态，也是这些测试唯一关心的输入形状。
+    fn shard_for(cfg: &wsieve_config::Config) -> Vec<crate::shard_setup::ShardPlanEntry> {
+        cfg.proxies
+            .iter()
+            .map(|p| crate::shard_setup::ShardPlanEntry {
+                page_url: p.url.clone(),
+                session_bases: vec![None; p.extra_sessions + 1],
+                upstream: None,
+                bypass_error: None,
+            })
+            .collect()
+    }
+
+    /// 测试入口：把 `shard_for` 的结果一并递进去，省得每个用例重复两行。
+    fn plan_of(cfg: &wsieve_config::Config) -> anyhow::Result<StartupPlan> {
+        build_startup_plan(cfg, &shard_for(cfg))
+    }
+
     #[test]
     fn empty_proxies_yield_no_outbounds_and_no_carrier() {
         let cfg = config_with(vec![]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         assert!(plan.outbound_cfgs.is_empty());
         assert!(plan.carrier.is_none(), "空出站不该调 CarrierPlan::build");
     }
@@ -246,7 +300,7 @@ mod startup_plan_tests {
     #[test]
     fn a_single_proxy_is_hex_decoded_into_the_outbound_cfg() {
         let cfg = config_with(vec![proxy("A", &valid_pub(), &valid_priv())]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         assert_eq!(plan.outbound_cfgs.len(), 1);
         let ob = &plan.outbound_cfgs[0];
         assert_eq!(ob.name, "A");
@@ -262,45 +316,70 @@ mod startup_plan_tests {
         let mut p = proxy("A", &valid_pub(), &valid_priv());
         p.extra_sessions = 3;
         let cfg = config_with(vec![p]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         assert_eq!(plan.outbound_cfgs[0].session_bases.len(), 4);
     }
 
     #[test]
     fn invalid_hex_in_server_pub_is_an_error_not_a_panic_or_zero_fill() {
         let cfg = config_with(vec![proxy("A", "不是十六进制", &valid_priv())]);
-        let err = build_startup_plan(&cfg).unwrap_err().to_string();
+        let err = plan_of(&cfg).unwrap_err().to_string();
         assert!(err.contains('A'), "错误要点名是哪个出站：{err}");
     }
 
     #[test]
     fn invalid_hex_in_client_priv_is_an_error_not_a_panic_or_zero_fill() {
         let cfg = config_with(vec![proxy("A", &valid_pub(), "zz")]);
-        assert!(build_startup_plan(&cfg).is_err());
+        assert!(plan_of(&cfg).is_err());
     }
 
     #[test]
     fn wrong_length_hex_is_an_error() {
         // 32 字节要求 64 个十六进制字符，短一位也不能悄悄放行。
         let cfg = config_with(vec![proxy("A", "11", &valid_priv())]);
-        assert!(build_startup_plan(&cfg).is_err());
+        assert!(plan_of(&cfg).is_err());
     }
 
+    /// **`wsieve-config` 的 `mux-prefs` 默认值必须全部是合法 `MuxId`。**
+    ///
+    /// 这是跨 crate 的一条契约，而两边谁都看不见对方：`wsieve-config` 依赖
+    /// 不到 `wsieve-proto`，`wsieve-proto` 也不知道有人给它的枚举写了默认
+    /// 列表。src-tauri 是唯一同时看得到两者的地方，所以守卫只能立在这里。
+    ///
+    /// 破了的后果不是「少一种复用器」：`ProxyForm` 添加服务器时从不写
+    /// `mux-prefs`，每个从界面新建的出站都吃这个默认值，一旦其中有非法项，
+    /// `build_startup_plan` 就会失败、`main` 随即 `exit(2)`——用户看到的是
+    /// 「加完服务器，应用再也打不开了」，而配置文件本身看着一切正常。
+    /// （这正是 2026-09-08 之前 `[0, 1, 2, 3, 4]` 那份默认值的真实行为。）
     #[test]
-    fn a_proxy_using_the_crate_default_mux_prefs_currently_fails_to_convert() {
-        // 已知的、本 Task 之外的既有不一致：`wsieve_config::model` 里
-        // `default_mux_prefs()` 返回 `[0, 1, 2, 3, 4]`，而
-        // `MuxId::from_u8` 的合法输入是 `0x01..=0x05`（即 1-5）——`0`
-        // 不在其中。也就是说，用户在 UI 上添加一个不手动填 mux-prefs
-        // 的出站，会在这里报错。这条测试如实记录当前行为（报错，不是
-        // panic，也不是悄悄吞掉），并把这个不一致钉在测试里：
-        // wsieve-config 那边一旦修好默认值，这条测试会变红，提醒同步
-        // 更新——细节见本次任务（Task 3）的完成报告。
+    fn the_crate_default_mux_prefs_are_all_valid_mux_ids() {
+        let default_proxy: wsieve_config::Proxy = wsieve_config::load_str(
+            "proxies:\n  - name: \"A\"\n    type: websieve\n    \
+             url: https://a.example/\n    server-pub: \"x\"\n    client-priv: \"y\"\n",
+        )
+        .unwrap()
+        .proxies
+        .remove(0);
+        for id in &default_proxy.mux_prefs {
+            assert!(
+                wsieve_proto::hello::MuxId::from_u8(*id).is_some(),
+                "wsieve-config 的 mux-prefs 默认值含非法 MuxId {id}——\
+                 从界面新建的出站会全部落到这份默认值上，下次启动直接 exit(2)"
+            );
+        }
+        assert!(!default_proxy.mux_prefs.is_empty(), "空偏好列表握不了手");
+    }
+
+    /// 非法 `mux-prefs` 仍要报错（而不是静默丢弃那一项）——上面那条守的是
+    /// 默认值本身，这条守的是「用户手写了一个非法值」时的行为。
+    #[test]
+    fn an_invalid_mux_pref_is_reported_with_the_outbound_name() {
         let mut p = proxy("A", &valid_pub(), &valid_priv());
-        p.mux_prefs = vec![0, 1, 2, 3, 4];
+        p.mux_prefs = vec![1, 99];
         let cfg = config_with(vec![p]);
-        let err = build_startup_plan(&cfg).unwrap_err().to_string();
+        let err = plan_of(&cfg).unwrap_err().to_string();
         assert!(err.contains("mux-prefs"), "{err}");
+        assert!(err.contains('A'), "错误要点名是哪个出站：{err}");
     }
 
     #[test]
@@ -309,7 +388,7 @@ mod startup_plan_tests {
             proxy("A", &valid_pub(), &valid_priv()),
             proxy("B", &valid_pub(), &valid_priv()),
         ]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         let carrier = plan.carrier.expect("两个出站应当有承载计划");
         assert_eq!(
             carrier.window_label("A"),
@@ -326,9 +405,84 @@ mod startup_plan_tests {
             proxy("B", &valid_pub(), &valid_priv()),
         ]);
         cfg.carrier = "isolated".to_string();
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         let carrier = plan.carrier.unwrap();
         assert_ne!(carrier.window_label("A"), carrier.window_label("B"));
+    }
+
+    /// **承载页面必须是条带算出来的 URL，不是配置里的原始 URL。**
+    ///
+    /// hosts 劫持成功时，页面要加载的是本地转发端口；照抄配置里的原始
+    /// URL 会让会话 0 直连 :443，绕过整条转发链——多 TCP 条带的第一条腿
+    /// 就此静默失效，而日志里一切正常。
+    #[test]
+    fn the_carrier_page_comes_from_the_shard_result_not_the_raw_config_url() {
+        let cfg = config_with(vec![proxy("A", &valid_pub(), &valid_priv())]);
+        let shard = vec![crate::shard_setup::ShardPlanEntry {
+            page_url: "https://a.example:18443/".to_string(),
+            session_bases: vec![None, Some("https://a.example:18444".to_string())],
+            upstream: None,
+            bypass_error: None,
+        }];
+        let plan = build_startup_plan(&cfg, &shard).unwrap();
+        let carrier = plan.carrier.expect("有出站就该有承载计划");
+        assert_eq!(
+            carrier.windows(),
+            vec![("main".to_string(), "https://a.example:18443/".to_string())],
+            "承载窗口该加载条带给出的本地端口页面"
+        );
+        // 额外会话的基址原样保留，会话 0 由承载计划改写成「相对路径」。
+        assert_eq!(
+            plan.outbound_cfgs[0].session_bases,
+            vec![None, Some("https://a.example:18444".to_string())]
+        );
+    }
+
+    /// shared 模式下**非宿主**出站拿到的是绝对 URL（跨域名），而这个 URL
+    /// 也必须来自条带——否则非宿主出站的全部会话都会绕过转发器。
+    #[test]
+    fn a_non_host_outbound_gets_an_absolute_base_taken_from_its_shard_page() {
+        let cfg = config_with(vec![
+            proxy("A", &valid_pub(), &valid_priv()),
+            proxy("B", &valid_pub(), &valid_priv()),
+        ]);
+        let shard = vec![
+            crate::shard_setup::ShardPlanEntry {
+                page_url: "https://a.example:18443/".to_string(),
+                session_bases: vec![None],
+                upstream: None,
+                bypass_error: None,
+            },
+            crate::shard_setup::ShardPlanEntry {
+                page_url: "https://b.example:18450/".to_string(),
+                session_bases: vec![None],
+                upstream: None,
+                bypass_error: None,
+            },
+        ];
+        let plan = build_startup_plan(&cfg, &shard).unwrap();
+        assert_eq!(plan.outbound_cfgs[0].session_bases, vec![None], "宿主同源");
+        assert_eq!(
+            plan.outbound_cfgs[1].session_bases,
+            vec![Some("https://b.example:18450".to_string())],
+            "非宿主要走自己那份被劫持的 origin"
+        );
+    }
+
+    /// 下标错位就是把流量发去另一台服务器，必须报错而不是按短的那个截断。
+    #[test]
+    fn a_shard_result_of_the_wrong_length_is_rejected() {
+        let cfg = config_with(vec![
+            proxy("A", &valid_pub(), &valid_priv()),
+            proxy("B", &valid_pub(), &valid_priv()),
+        ]);
+        let short = vec![crate::shard_setup::ShardPlanEntry {
+            page_url: "https://a.example/".to_string(),
+            session_bases: vec![None],
+            upstream: None,
+            bypass_error: None,
+        }];
+        assert!(build_startup_plan(&cfg, &short).is_err());
     }
 
     #[test]
@@ -354,7 +508,7 @@ mod startup_plan_tests {
             valid_priv()
         );
         let cfg = wsieve_config::load_str(&text).unwrap();
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         assert_eq!(plan.mode, wsieve_route::Mode::Global);
         assert_eq!(plan.global_outbound, "A");
         assert_eq!(
@@ -366,7 +520,7 @@ mod startup_plan_tests {
     #[test]
     fn empty_rules_get_an_implicit_reject_fallback() {
         let cfg = config_with(vec![]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         assert_eq!(plan.rule_lines, vec!["MATCH,REJECT".to_string()]);
     }
 
@@ -375,7 +529,7 @@ mod startup_plan_tests {
         // 这是本函数存在的核心动机：零规则的默认配置不能在
         // RuleSet::build 这一步把整个启动炸掉。
         let cfg = config_with(vec![]);
-        let plan = build_startup_plan(&cfg).unwrap();
+        let plan = plan_of(&cfg).unwrap();
         let known = std::collections::HashSet::new();
         wsieve_route::RuleSet::build(&plan.rule_lines, plan.mode, &plan.global_outbound, &known)
             .expect("空规则应当能通过隐式 REJECT 兜底通过 RuleSet::build");
@@ -385,7 +539,7 @@ mod startup_plan_tests {
     fn an_invalid_mode_string_is_reported_not_panicked() {
         let mut cfg = config_with(vec![]);
         cfg.mode = "bogus".to_string();
-        assert!(build_startup_plan(&cfg).is_err());
+        assert!(plan_of(&cfg).is_err());
     }
 }
 

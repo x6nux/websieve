@@ -263,7 +263,7 @@ mod tests {
     /// 一个不碰 Tauri 的 env：eval 记次数，状态回调记录序列。
     fn test_env(evals: Arc<AtomicUsize>) -> SessionEnv {
         SessionEnv {
-            eval: Arc::new(move |_| {
+            eval: Arc::new(move |_, _| {
                 evals.fetch_add(1, Ordering::SeqCst);
             }),
             on_status: Arc::new(|_, _| {}),

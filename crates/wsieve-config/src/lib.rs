@@ -246,7 +246,10 @@ rules:
         // extra-sessions / mux-prefs 省略时要有值，否则条带数会是 0
         let c = load_str(MINIMAL).unwrap();
         assert_eq!(c.proxies[0].extra_sessions, 3);
-        assert_eq!(c.proxies[0].mux_prefs, vec![0, 1, 2, 3, 4]);
+        // MuxId 的线上标识，不是 0-based 序号——本 crate 依赖不到
+        // `wsieve_proto::hello::MuxId`，「这五个值确实全部可转换」由
+        // src-tauri 的 `runtime_state` 测试守着（那边两个 crate 都在）。
+        assert_eq!(c.proxies[0].mux_prefs, vec![2, 1, 3, 4, 5]);
     }
 
     #[test]
