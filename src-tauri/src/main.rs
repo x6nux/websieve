@@ -64,39 +64,12 @@ fn main() {
         )
         .init();
 
-    let cfg = match bootstrap::load_cfg() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("config error: {e:#}");
-            std::process::exit(2);
-        }
-    };
-
-    // 混合端口入口的绑定地址。**这是一个安全决策，不是一个便利选项**：
-    // 入口链路上目前没有任何认证（SOCKS5 只实现方法 0x00，HTTP 侧剔除
-    // Proxy-Authorization 而不校验），绑到 0.0.0.0 就等于开一个经本机隧道
-    // 出网的开放中继。默认关，开启时下面会打一条醒目告警。
-    let inbound_bind = match bootstrap::inbound_bind_addr(&cfg.socks_listen, cfg.allow_lan) {
-        Ok(a) => a,
-        Err(e) => {
-            // 猜一个地址等于把入口开在用户没预期的地方，宁可不启动。
-            eprintln!("入口监听地址无效: {e:#}");
-            std::process::exit(2);
-        }
-    };
-    if cfg.allow_lan {
-        tracing::warn!(
-            "allow-lan 已开启：入口绑定 {inbound_bind}，同网段任何设备都能经本机隧道出网。\
-             该路径**没有认证**（SOCKS5 仅方法 0x00；HTTP 不校验 Proxy-Authorization），\
-             等同于一个开放中继。仅在完全可信的网段这样用。"
-        );
-    }
-
     // ── 读 config.yaml（设计文档「运行时接入 config.yaml」§2）────────────
     //
-    // 出站、规则、模式、承载方式全部来自这份文件——`WSIEVE_SERVER_PUB` /
-    // `WSIEVE_CLIENT_PRIV` / `WSIEVE_OUTBOUND_NAME` 这条「一个硬编码出站」
-    // 的 env 引导路径到此为止（其余 env 变量仍是排障旋钮，见 bootstrap.rs）。
+    // 出站、规则、模式、承载方式、入口端口、TUN/系统代理开关全部来自这份
+    // 文件——`WSIEVE_SERVER_PUB` / `WSIEVE_CLIENT_PRIV` / `WSIEVE_OUTBOUND_NAME`
+    // 这条「一个硬编码出站」的 env 引导路径到此为止；其余 env 变量降级成
+    // **排障旋钮**，显式设置时才压过配置文件（见 bootstrap::load_cfg）。
     //
     // 路径要与 `commands::config::config_path` 算出的**完全一致**，否则
     // 控制窗口编辑的和运行时读到的是两份不同的文件，而界面上看不出来。
@@ -131,6 +104,34 @@ fn main() {
         config.rules.len(),
         config.mode
     );
+
+    let cfg = match bootstrap::load_cfg(&config) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e:#}");
+            std::process::exit(2);
+        }
+    };
+
+    // 混合端口入口的绑定地址。**这是一个安全决策，不是一个便利选项**：
+    // 入口链路上目前没有任何认证（SOCKS5 只实现方法 0x00，HTTP 侧剔除
+    // Proxy-Authorization 而不校验），绑到 0.0.0.0 就等于开一个经本机隧道
+    // 出网的开放中继。默认关，开启时下面会打一条醒目告警。
+    let inbound_bind = match bootstrap::inbound_bind_addr(&cfg.socks_listen, cfg.allow_lan) {
+        Ok(a) => a,
+        Err(e) => {
+            // 猜一个地址等于把入口开在用户没预期的地方，宁可不启动。
+            eprintln!("入口监听地址无效: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    if cfg.allow_lan {
+        tracing::warn!(
+            "allow-lan 已开启：入口绑定 {inbound_bind}，同网段任何设备都能经本机隧道出网。\
+             该路径**没有认证**（SOCKS5 仅方法 0x00；HTTP 不校验 Proxy-Authorization），\
+             等同于一个开放中继。仅在完全可信的网段这样用。"
+        );
+    }
 
     // 本地条带编排：hosts 劫持 + 多端口转发（见 shard_setup）。必须在建
     // WebView 之前完成——承载 WebView 要加载的正是转发器的端口。任何一步

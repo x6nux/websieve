@@ -104,9 +104,31 @@ pub(crate) fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
         .map_err(|v: Vec<u8>| anyhow::anyhow!("expected 32 bytes, got {}", v.len()))
 }
 
-pub fn load_cfg() -> anyhow::Result<AppConfig> {
-    let socks_listen =
-        std::env::var("WSIEVE_SOCKS").unwrap_or_else(|_| "127.0.0.1:1080".to_string());
+/// 一个布尔型 env 旋钮：没设置返回 `None`（交给配置文件定），设置了就
+/// 按「非空且不是 `0`」判真。
+///
+/// 返回 `Option` 而不是带默认值的 `bool` 是关键：分不清「没设置」与
+/// 「设成了 false」的话，env 就会用它的默认值把配置文件里的 `true` 盖掉，
+/// 表现为「界面上开关是开的，运行时却是关的」。
+fn env_bool(key: &str) -> Option<bool> {
+    std::env::var(key).ok().map(|v| v != "0" && !v.is_empty())
+}
+
+/// 从 `config.yaml` 装配运行参数。
+///
+/// **`config.yaml` 是事实来源，env 变量只是排障旋钮**（显式设置时压过它）。
+/// 反过来的话，用户在控制窗口里改的端口/开关永远不会生效——而这正是这轮
+/// 「运行时接入 config.yaml」要消灭的那类断层：`mixed-port` / `allow-lan` /
+/// `system-proxy` / `shard-base-port` / `tun.enable` 五个字段此前**没有
+/// 任何调用方**，界面上改完连重启都不生效，且没有任何提示。
+///
+/// `show_window` 没有对应的配置字段，仍然只认 env——它是排障用的窗口开关，
+/// 不是产品级配置，设计文档 §5.2 也没有列它。
+pub fn load_cfg(config: &wsieve_config::Config) -> anyhow::Result<AppConfig> {
+    // 监听地址的**主机部分**只是记录：真正绑哪个网卡由 `inbound_bind_addr`
+    // 按 allow-lan 决定（那是安全边界，不允许从地址里绕过去，见该函数注释）。
+    let socks_listen = std::env::var("WSIEVE_SOCKS")
+        .unwrap_or_else(|_| format!("{}:{}", config.bind_address, config.mixed_port));
     let mux_prefs = match std::env::var("WSIEVE_MUX_PREFS") {
         Ok(s) => s
             .split(',')
@@ -123,30 +145,22 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
             MuxId::H2mux,
         ],
     };
+    // 高端口：绑定 <1024 需要 root，而 hosts 已经要一次管理员权限了，
+    // 不该再多要一个。对外仍然只走 :443，本地端口不出网。
     let shard_base_port = std::env::var("WSIEVE_SHARD_BASE_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        // 高端口：绑定 <1024 需要 root，而 hosts 已经要一次管理员权限了，
-        // 不该再多要一个。对外仍然只走 :443，本地端口不出网。
-        .unwrap_or(18443);
+        .unwrap_or(config.shard_base_port);
     // 传输 WebView 默认隐藏（见字段注释）。注意 macOS 的 WKWebView 在窗口
     // 不可见时会挂起 JS 定时器与 fetch，靠建窗时的
     // background_throttling(Disabled) 压制（macOS 14+ 生效）。
-    let show_window = std::env::var("WSIEVE_SHOW_WINDOW")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    // 系统代理默认关：改的是全局设置，崩一次就让用户整机断网（见字段注释）。
-    let system_proxy = std::env::var("WSIEVE_SYSTEM_PROXY")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    // 局域网开放默认关：这条路径上没有认证，开了就是开放中继（见字段注释）。
-    let allow_lan = std::env::var("WSIEVE_ALLOW_LAN")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    // TUN 默认关：要 root，且改的是整机默认路由（见字段注释）。
-    let tun = std::env::var("WSIEVE_TUN")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    // 只认 env：它没有对应的配置字段（见 load_cfg 的文档）。
+    let show_window = env_bool("WSIEVE_SHOW_WINDOW").unwrap_or(false);
+    // 下面三个的「默认关」现在由 `Config` 的 Default 承担（system-proxy /
+    // allow-lan / tun.enable 都默认 false），各自为什么默认关见字段注释。
+    let system_proxy = env_bool("WSIEVE_SYSTEM_PROXY").unwrap_or(config.system_proxy);
+    let allow_lan = env_bool("WSIEVE_ALLOW_LAN").unwrap_or(config.allow_lan);
+    let tun = env_bool("WSIEVE_TUN").unwrap_or(config.tun.enable);
     Ok(AppConfig {
         mux_prefs,
         socks_listen,
@@ -205,6 +219,46 @@ pub fn loader_js() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`config.yaml` 里的运行参数必须真的到达运行时。**
+    ///
+    /// 这五个字段（`mixed-port` / `allow-lan` / `system-proxy` /
+    /// `shard-base-port` / `tun.enable`）此前**没有任何调用方**——`load_cfg`
+    /// 只读 env，配置文件里写什么都不看。用户在控制窗口把端口从 25500 改成
+    /// 别的，保存成功、界面显示新值、重启也没用，而且没有一条诊断。这条
+    /// 测试就是防它复发。
+    ///
+    /// 环境里已经设了对应旋钮时跳过：那说明测试进程本身被显式覆盖了，
+    /// 此时断言配置值反而是错的（旋钮就该压过配置文件）。
+    #[test]
+    fn the_config_file_drives_the_runtime_parameters() {
+        for k in [
+            "WSIEVE_SOCKS",
+            "WSIEVE_ALLOW_LAN",
+            "WSIEVE_SYSTEM_PROXY",
+            "WSIEVE_TUN",
+            "WSIEVE_SHARD_BASE_PORT",
+        ] {
+            if std::env::var(k).is_ok() {
+                return;
+            }
+        }
+        let mut c = wsieve_config::Config {
+            mixed_port: 9999,
+            allow_lan: true,
+            system_proxy: true,
+            shard_base_port: 30000,
+            ..Default::default()
+        };
+        c.tun.enable = true;
+
+        let cfg = load_cfg(&c).unwrap();
+        assert_eq!(cfg.socks_listen, "127.0.0.1:9999", "mixed-port 没到达入口");
+        assert!(cfg.allow_lan, "allow-lan 没到达入口");
+        assert!(cfg.system_proxy, "system-proxy 没到达托管");
+        assert!(cfg.tun, "tun.enable 没到达 TUN 准备");
+        assert_eq!(cfg.shard_base_port, 30000, "shard-base-port 没到达条带");
+    }
 
     #[test]
     fn the_default_posture_is_loopback_only() {
