@@ -280,7 +280,7 @@ describe('设置面板——外观（主题切换）', () => {
     expect(onsave).not.toHaveBeenCalled();
   });
 
-  it('点击「跟随系统」后关闭面板（不点保存），主题选择仍然生效', async () => {
+  it('点击「浅色」后关闭面板（不点保存），主题选择仍然生效', async () => {
     const u = userEvent.setup();
     const onclose = vi.fn();
     render(SettingsOverlay, { open: true, config: {}, onclose });
