@@ -13,6 +13,7 @@ use crate::outbound::instance::OutboundInstance;
 use crate::outbound::OutboundManager;
 use crate::router::Router;
 
+#[allow(dead_code)] // Task 4 才会真正构造并托管进 Tauri 状态
 pub struct RuntimeState {
     pub rule_set: Arc<wsieve_route::RuleSet>,
     pub outbound_manager: Arc<OutboundManager>,
@@ -23,6 +24,7 @@ pub struct RuntimeState {
 }
 
 /// 代理组表——本计划只放占位结构，真正的构建逻辑属于 Part 3。
+#[allow(dead_code)] // 同上：Part 3 才会真正读写它
 #[derive(Default)]
 pub struct GroupTable;
 
@@ -32,6 +34,7 @@ pub struct GroupTable;
 /// 的重点就是**不重新构造实例**——上层拿到这个结构后，`reused` 里的每一项
 /// 直接原样放进新 `OutboundManager`，`added` 里的每一项才需要真的
 /// `OutboundInstance::new(cfg)`。
+#[allow(dead_code)] // Task 4 才会真正调用 diff_outbounds 并消费这个结构
 pub struct OutboundDiff {
     /// 名字与关键字段都未变的出站：原样复用的 `Arc`。
     pub reused: BTreeMap<String, Arc<OutboundInstance>>,
@@ -48,6 +51,14 @@ pub struct OutboundDiff {
 /// 计划算出、不来自 `Proxy` 本身，所以调用方要在算出新的 `session_bases`
 /// 之后才能调这个函数；本函数只管"给定两份完整 `OutboundCfg`，谁跟谁一样"，
 /// 不负责计算 `session_bases`。
+///
+/// **前提：`new_cfgs` 内 `name` 唯一**——调用方不必在这里再查一遍重名，
+/// 因为 `wsieve_config::Config::validate()` 在写盘前已经拒绝了重名的
+/// `proxies`（`ConfigError::DuplicateProxyName`），走到这个函数时的输入
+/// 必然已经去重过。若未来某个调用方绕过了 `validate()` 直接喂重名列表
+/// 进来，行为未定义（哪一条会被当成"这个名字对应的配置"取决于遍历顺序），
+/// 这不是本函数要防的边界。
+#[allow(dead_code)] // Task 4 才会把它接进 rebuild_and_swap，现在只有测试在调
 pub fn diff_outbounds(
     old: &BTreeMap<String, Arc<OutboundInstance>>,
     new_cfgs: &[crate::outbound::instance::OutboundCfg],
