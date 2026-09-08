@@ -87,7 +87,11 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// `PartialEq`：运行时要回答「这次保存到底动没动出站段」。逐字段比较而不是
+/// 只比几个「看起来重要的」字段——`url` 改了同样要重连，而它在
+/// `OutboundCfg` 里根本没有对应项，只比那边的字段会把它整个漏掉，表现为
+/// 「改了地址保存成功，流量却还发去旧服务器，且没有任何提示」。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Proxy {
     pub name: String,

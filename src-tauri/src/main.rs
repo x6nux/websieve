@@ -317,6 +317,9 @@ fn main() {
 
     let carrier = plan.carrier;
     let outbound_cfgs = plan.outbound_cfgs;
+    // 产生首份运行时快照的那一段 `proxies:`——配置保存后要拿它比对「出站段
+    // 到底动没动」（`runtime_state::outbound_changes_pending`）。
+    let proxies = Arc::new(config.proxies.clone());
 
     tauri::Builder::default()
         .setup(move |app| {
@@ -361,12 +364,13 @@ fn main() {
             let handle = app.handle().clone();
             let bind = inbound_bind.clone();
             let obs = outbound_cfgs.clone();
+            let proxies = proxies.clone();
             let rules = rules.clone();
             let geo = geo.clone();
             let wins = carrier_windows.clone();
             let tun = tun_setup.take();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_stack(handle, bind, wins, obs, rules, geo, tun).await {
+                if let Err(e) = run_stack(handle, bind, wins, obs, proxies, rules, geo, tun).await {
                     tracing::error!("入口/出站栈退出: {e:#}");
                 }
             });
@@ -641,6 +645,7 @@ async fn run_stack(
     bind: String,
     carrier_windows: BTreeMap<String, String>,
     ob_cfgs: Vec<outbound::instance::OutboundCfg>,
+    proxies: Arc<Vec<wsieve_config::Proxy>>,
     rules: Arc<wsieve_route::RuleSet>,
     geo: Arc<wsieve_geo::GeoDb>,
     tun_setup: Option<TunSetup>,
@@ -660,7 +665,30 @@ async fn run_stack(
     //
     // 阶段 2 尚未接入 DNS 解析器，`without_resolver` 会对着规则表里的
     // IP 类规则条数如实告警 —— 静默的覆盖面缺失比报错更危险。
-    let router = Arc::new(router::Router::without_resolver(rules, geo, table.clone()));
+    let router = Arc::new(router::Router::without_resolver(
+        rules.clone(),
+        geo,
+        table.clone(),
+    ));
+
+    // 第一代承载核心先建出来：运行时快照要在 `dispatch` 之前就位（下面
+    // 每条连接都经它读当前 `Router`），而快照里的 `OutboundManager` 需要
+    // 一个 core。之后每一代在循环末尾换新的。
+    let mut core = Arc::new(bridge::TransportCore::new_beat_pending());
+    let mut manager = new_manager(&app, &carrier_windows, &table, &core);
+
+    // **只托管这一次**：Tauri 的 `manage()` 在类型已注册时是空操作，后续
+    // 更新一律走 `RuntimeHandle` 那把写锁（见 `runtime_state::install`）。
+    runtime_state::install(
+        &app,
+        runtime_state::RuntimeState {
+            rule_set: rules,
+            outbound_manager: manager.clone(),
+            router,
+            groups: Arc::new(runtime_state::GroupTable),
+            proxies,
+        },
+    );
 
     // 混合端口入口（Part C）：同一端口上嗅探 SOCKS5 与 HTTP。
     // bind 决策见 main() 里的注释与告警。
@@ -672,11 +700,30 @@ async fn run_stack(
     // 下面把同一个 `dispatch` 分别递给混合端口的 `serve` 与 TUN 的 `run`。
     // 若哪天这里需要第二个 dispatch，说明有人在 TUN 那边另建了一条通路 ——
     // 那正是 §4.2 纪律②禁止的事。
+    //
+    // **每条连接都现读当前快照里的 `Router`，不捕获一份。** 捕获的话，
+    // 配置保存后换上的那个新 `Router` 永远不会被真实流量用到——用户改了
+    // 规则、日志说已生效、UI 也显示新规则，而分流仍按旧表走，且没有任何
+    // 迹象。设计文档 §1 正是把「路由决策」列为这把锁的读者之一。
+    // 读一次只是拿读锁克隆一个 `Arc`（引用计数 +1），不在热路径上引入
+    // 可观察的开销。
     let dispatch: wsieve_inbound::Dispatch = {
-        let router = router.clone();
+        let app = app.clone();
         Arc::new(move |target| {
-            let router = router.clone();
-            Box::pin(async move { router.dispatch(target).await })
+            // 取不到快照就**拒绝**这条连接，绝不兜底直连（§6.4）——
+            // 正常路径上它必然已托管（上面几行），走到这里说明有人改坏了
+            // 启动顺序，此时静默放行比连不上危险得多。
+            let state = app
+                .try_state::<runtime_state::RuntimeHandle>()
+                .map(|h| h.current());
+            Box::pin(async move {
+                match state {
+                    Some(s) => s.router.dispatch(target).await,
+                    None => Err(std::io::Error::other(
+                        "运行时快照尚未就绪，拒绝这条连接（绝不回退直连）",
+                    )),
+                }
+            })
         })
     };
     {
@@ -700,15 +747,7 @@ async fn run_stack(
 
     // 承载代循环：core 死一次就换一代。
     loop {
-        let core = Arc::new(bridge::TransportCore::new_beat_pending());
         app.manage(CurrentCore(core.clone()));
-
-        let env = outbound::instance::SessionEnv {
-            eval: eval_fn(app.clone(), carrier_windows.clone()),
-            on_status: status_fn(app.clone()),
-        };
-        let manager =
-            outbound::OutboundManager::new(table.clone(), core.clone(), env);
 
         // 等 emitter 就绪再拉起出站：没有 emitter 就没有 fetch，握手必然
         // 失败并白白吃掉一轮退避。
@@ -740,7 +779,33 @@ async fn run_stack(
         }
         // 给页面一点时间重新加载并把 emitter 注回去。
         tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // 下一代：换 core、换管理器。**只把管理器这一个字段写回快照** ——
+        // 这一代跑着的期间用户可能保存过配置（`rebuild_and_swap` 已经换掉
+        // 了 rule_set/router），拿本代开头捕获的整份快照去覆盖，会把刚保存
+        // 的规则悄悄回滚，而 UI 上显示的仍是新规则。
+        core = Arc::new(bridge::TransportCore::new_beat_pending());
+        manager = new_manager(&app, &carrier_windows, &table, &core);
+        runtime_state::swap_outbound_manager(&app, manager.clone());
     }
+}
+
+/// 建一代出站管理器。
+///
+/// 实例表与 `Router` 共用**同一批** `Arc`（见 `run_stack` 里的说明），
+/// core 是这一代承载的；换代时除了 core 之外的一切都原样沿用，因此这里
+/// 收的是引用、只做克隆，不重新构造任何实例。
+fn new_manager(
+    app: &tauri::AppHandle,
+    carrier_windows: &BTreeMap<String, String>,
+    table: &BTreeMap<String, Arc<outbound::instance::OutboundInstance>>,
+    core: &Arc<bridge::TransportCore>,
+) -> Arc<outbound::OutboundManager> {
+    let env = outbound::instance::SessionEnv {
+        eval: eval_fn(app.clone(), carrier_windows.clone()),
+        on_status: status_fn(app.clone()),
+    };
+    outbound::OutboundManager::new(table.clone(), core.clone(), env)
 }
 
 /// §8.3.2 的第 5 步：创建 utun、写默认路由、起 fake-ip DNS、跑入站循环。

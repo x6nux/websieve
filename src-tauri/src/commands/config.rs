@@ -186,7 +186,9 @@ pub async fn config_get_raw(app: tauri::AppHandle) -> CmdResult<String> {
 /// 又一次静默损坏。从下往上改则每一条未处理的操作都还没被触碰过。
 #[tauri::command]
 pub async fn config_save(app: tauri::AppHandle, ops: Vec<RuleOp>) -> CmdResult<()> {
-    apply_rule_ops(&config_path(&app)?, ops)
+    apply_rule_ops(&config_path(&app)?, ops)?;
+    refresh_runtime(&app);
+    Ok(())
 }
 
 /// 原文写 —— 逃生舱（§5.6），一字不动地覆盖。
@@ -195,7 +197,27 @@ pub async fn config_save(app: tauri::AppHandle, ops: Vec<RuleOp>) -> CmdResult<(
 /// 而那时用户可能已经关掉界面了。宁可在这里拒绝，并把行列号带回去。
 #[tauri::command]
 pub async fn config_save_raw(app: tauri::AppHandle, text: String) -> CmdResult<()> {
-    save_text(&config_path(&app)?, &text)
+    save_text(&config_path(&app)?, &text)?;
+    refresh_runtime(&app);
+    Ok(())
+}
+
+/// 写盘成功之后让运行时跟上新配置（设计文档「运行时接入 config.yaml」§1）。
+///
+/// **重建失败绝不让这次保存报错给用户**：盘已经写成功了，文件是对的。
+/// 重建运行时状态失败是另一个层面的问题——旧快照继续用，重启一次就恢复。
+/// 把「保存成功但运行时暂时没跟上」升级成「保存失败」，会让用户以为自己的
+/// 编辑丢了，转头去重做一遍其实已经落盘的改动，甚至怀疑配置文件坏了。
+/// 所以这里只记日志，不改调用方的返回值。
+///
+/// 本轮只有规则与模式会立即生效；出站段的增删改需要重启，`rebuild_and_swap`
+/// 会把具体是哪几个出站写进日志（原因见它的文档）。
+fn refresh_runtime(app: &tauri::AppHandle) {
+    if let Err(e) = crate::runtime_state::rebuild_and_swap(app) {
+        tracing::error!(
+            "配置已写盘，但运行时状态重建失败（{e:#}）——仍按旧配置运行，重启后生效"
+        );
+    }
 }
 
 // ── 实现（与 AppHandle 无关，因而可直接测）─────────────────────
@@ -445,7 +467,9 @@ fn delete_proxy_block_cmd(p: &Path, name: &str) -> CmdResult<()> {
 /// UI 侧的处置义务见设计文档 §6.2。
 #[tauri::command]
 pub async fn config_insert_proxy(app: tauri::AppHandle, lines: Vec<String>) -> CmdResult<()> {
-    insert_proxy_block(&config_path(&app)?, lines)
+    insert_proxy_block(&config_path(&app)?, lines)?;
+    refresh_runtime(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -455,7 +479,9 @@ pub async fn config_delete_proxy(app: tauri::AppHandle, name: String) -> CmdResu
             message: "出站名不能为空".to_string(),
         });
     }
-    delete_proxy_block_cmd(&config_path(&app)?, &name)
+    delete_proxy_block_cmd(&config_path(&app)?, &name)?;
+    refresh_runtime(&app);
+    Ok(())
 }
 
 /// 以 0600 创建并原子替换。

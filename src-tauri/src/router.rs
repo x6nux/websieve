@@ -136,6 +136,25 @@ impl Router {
         Self::new(rules, geo, outbounds, Arc::new(NoResolver))
     }
 
+    /// 换一份规则表，其余（GeoDb / 出站表 / 解析器 / 启动等待）原样沿用。
+    ///
+    /// 配置保存后重建运行时快照用（「运行时接入 config.yaml」§3）。出站表
+    /// 照抄的是**同一批 `Arc<OutboundInstance>`**，不是重新构造——重造实例
+    /// 会把所有已经连上的出站一起断掉，而用户只是改了一条规则。这正是 §3
+    /// 「没变的出站不重启、不断连接」那条产品决策落到代码上的样子。
+    ///
+    /// 不打 `without_resolver` 那条覆盖面告警：解析器没换，重复告警只是
+    /// 每次保存都往日志里刷一遍同一句话。
+    pub fn with_rules(&self, rules: Arc<RuleSet>) -> Self {
+        Self {
+            rules,
+            geo: self.geo.clone(),
+            outbounds: self.outbounds.clone(),
+            resolver: self.resolver.clone(),
+            start_wait: self.start_wait,
+        }
+    }
+
     /// 改「正在启动中」的排队上限。
     ///
     /// `#[cfg(test)]`：当前生产路径一律用 `DEFAULT_START_WAIT`。等它变成

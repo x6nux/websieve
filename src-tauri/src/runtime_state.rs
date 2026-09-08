@@ -13,7 +13,6 @@ use crate::outbound::instance::OutboundInstance;
 use crate::outbound::OutboundManager;
 use crate::router::Router;
 
-#[allow(dead_code)] // Task 4 才会真正构造并托管进 Tauri 状态
 pub struct RuntimeState {
     pub rule_set: Arc<wsieve_route::RuleSet>,
     pub outbound_manager: Arc<OutboundManager>,
@@ -21,12 +20,196 @@ pub struct RuntimeState {
     // GroupTable 是 Part 3（代理组接入）的产出，本计划不实现，先占位成
     // 一个空结构体，避免 Part 3 落地时要改这里的字段名/调用点。
     pub groups: Arc<GroupTable>,
+    /// **产生这份快照的那一段 `proxies:`**。
+    ///
+    /// 留着原始配置而不是只留 `OutboundCfg`，是为了能如实回答「这次保存
+    /// 动没动出站段」：`url` / `extra-sessions` 改了同样要重连，而 `url`
+    /// 在 `OutboundCfg` 里根本没有对应项——只比 `OutboundCfg` 会把它整个
+    /// 漏掉。Part 2 做出站热增删时，diff 的另一边也正是这份。
+    pub proxies: Arc<Vec<wsieve_config::Proxy>>,
 }
 
 /// 代理组表——本计划只放占位结构，真正的构建逻辑属于 Part 3。
-#[allow(dead_code)] // 同上：Part 3 才会真正读写它
 #[derive(Default)]
 pub struct GroupTable;
+
+/// 托管进 Tauri 状态的那一份快照，可原子替换。
+///
+/// **`app.manage()` 只调用一次**（`install`），之后的更新一律是对这把锁的
+/// 写入。Tauri 的 `manage()` 在类型已注册时是**空操作**——靠反复 `manage`
+/// 来「更新」不会报错，只是静默无效，读到的永远是第一次注册的那份。
+/// `CurrentCore` 正踩在这个坑里（`run_stack` 的承载代循环每一代都
+/// `manage` 一次，IPC 命令读到的却始终是第一代那个早已死掉的 core）。
+/// 本结构用真正可变的 `RwLock` 从根上避开，见设计文档 §1。
+pub struct RuntimeHandle(std::sync::RwLock<Arc<RuntimeState>>);
+
+impl RuntimeHandle {
+    /// 取当前快照。
+    ///
+    /// **路由热路径每条连接都会调它**，所以持锁区间只覆盖一次 `Arc` 克隆
+    /// （引用计数 +1，纳秒级），锁里绝不做别的事。
+    ///
+    /// 锁中毒时取回内层值继续用，而不是跟着 panic：这里护的数据只是一个
+    /// `Arc` 指针，写者持锁期间只做一次赋值，不存在「改了一半」的中间态。
+    /// 让一次无关的 panic 把此后每一条连接都打死，比中毒本身危险得多。
+    pub fn current(&self) -> Arc<RuntimeState> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set(&self, next: Arc<RuntimeState>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = next;
+    }
+}
+
+/// 进程启动时托管一次（`run_stack` 里，第一份快照就绪之后、`dispatch`
+/// 建立之前——`dispatch` 每条连接都要经它读当前 `Router`）。
+pub fn install(app: &tauri::AppHandle, state: RuntimeState) {
+    use tauri::Manager;
+    app.manage(RuntimeHandle(std::sync::RwLock::new(Arc::new(state))));
+}
+
+/// 换代时替换 `outbound_manager`，**其余字段沿用当前快照**。
+///
+/// 不能拿换代开始时捕获的那份快照整体覆盖：两次换代之间用户可能保存过
+/// 配置（`rebuild_and_swap` 已经换掉了 `rule_set`/`router`），整体覆盖会
+/// 把刚保存的规则悄悄回滚成旧的——而控制窗口上显示的仍是新规则，用户
+/// 完全看不出流量正在按一份已经被自己改掉的规则表走。
+pub fn swap_outbound_manager(app: &tauri::AppHandle, manager: Arc<OutboundManager>) {
+    use tauri::Manager;
+    let Some(h) = app.try_state::<RuntimeHandle>() else {
+        // 托管发生在第一代之前，走到这里说明调用顺序被改坏了。
+        tracing::error!("运行时快照尚未托管，换代后的出站管理器无处安放");
+        return;
+    };
+    let cur = h.current();
+    h.set(Arc::new(RuntimeState {
+        rule_set: cur.rule_set.clone(),
+        outbound_manager: manager,
+        router: cur.router.clone(),
+        groups: cur.groups.clone(),
+        proxies: cur.proxies.clone(),
+    }));
+}
+
+/// 纯函数：给定当前快照与刚保存的配置，算出下一份快照。
+///
+/// **本 Part 只热替换规则与模式**，出站表原样沿用当前快照里的那一批
+/// `Arc<OutboundInstance>`。这不是「没做完」，是 `shard_setup` 现在的形状
+/// 决定的：`ShardGuard` 持有的是「全部转发器 + 一份整体替换的 hosts 托管」，
+/// 要给新出站起转发器就得重跑 `plan_many`，而那必须先 drop 旧 guard——于是
+/// **没有变化的出站的转发器也会一起被 abort**，已经连上的连接全断。这与
+/// 设计文档 §3「没变的出站不重启、不断连接」这条已确认的产品决策直接冲突。
+/// 真正支持出站热增删，要先把转发器与 hosts 托管改成按出站增量持有，那是
+/// Part 2 的范围。在那之前，出站的增删改由 `outbound_changes_pending`
+/// 如实报给用户（需要重启），而不是假装已经生效。
+///
+/// 失败时调用方**保留旧快照**——半份新状态比一份旧状态危险得多。
+pub fn next_state(
+    current: &RuntimeState,
+    config: &wsieve_config::Config,
+) -> anyhow::Result<RuntimeState> {
+    let mode: wsieve_route::Mode = config
+        .mode
+        .parse()
+        .map_err(|e: wsieve_route::RuleError| anyhow::anyhow!("mode 无效: {e}"))?;
+
+    // `known` 取**配置里**的出站名，不是当前正在跑的那一批。用户新加了一个
+    // 出站、同时写了引用它的规则时，规则表应当照常建起来：那个出站要等重启
+    // 才真正跑，此前落到它头上的判决会在 `Router::via_outbound` 处被拒绝，
+    // 与「出站在运行时被删了」是同一条既有错误路径（§2.1）。若改用正在跑的
+    // 那一批，整张规则表会因为「引用了不存在的出站」被拒——一条规则连累全部。
+    let known = config.outbound_names();
+    let rule_set = Arc::new(wsieve_route::RuleSet::build(
+        &rule_lines_with_reject_fallback(config),
+        mode,
+        &config.global_outbound,
+        &known,
+    )?);
+
+    Ok(RuntimeState {
+        router: Arc::new(current.router.with_rules(rule_set.clone())),
+        rule_set,
+        outbound_manager: current.outbound_manager.clone(),
+        groups: current.groups.clone(),
+        proxies: Arc::new(config.proxies.clone()),
+    })
+}
+
+/// 这次保存里，出站段有哪些改动是本轮热替换**吃不下的**（见 `next_state`）。
+///
+/// 返回人话描述，空表示出站段没动。调用方原样写进日志：用户改了出站却什么
+/// 都没发生、还不告诉他为什么，比明说「暂不支持，请重启」糟糕得多。
+pub fn outbound_changes_pending(
+    current: &RuntimeState,
+    config: &wsieve_config::Config,
+) -> Vec<String> {
+    let old = &*current.proxies;
+    let new = &config.proxies;
+    let mut out = Vec::new();
+    for p in new {
+        match old.iter().find(|o| o.name == p.name) {
+            None => out.push(format!("新增了出站「{}」", p.name)),
+            // 逐字段比较：`url` 改了也要重连，而它在 OutboundCfg 里没有
+            // 对应项——只比那边的字段会把这种改动整个漏掉。
+            Some(o) if o != p => out.push(format!("改动了出站「{}」", p.name)),
+            Some(_) => {}
+        }
+    }
+    for o in old {
+        if !new.iter().any(|p| p.name == o.name) {
+            out.push(format!("删除了出站「{}」", o.name));
+        }
+    }
+    out
+}
+
+/// 从磁盘重新读配置、重建快照、原子替换托管状态里的那一份。
+///
+/// **失败时保留旧快照，不替换**（设计文档「错误处理」一节）：写盘前的
+/// `validate()` 已经挡住绝大多数非法配置，走到这里的失败基本只剩「写盘与
+/// 重读之间文件被外部改坏」这类边缘情况。此时让运行时继续用旧的那一份、
+/// 只记一条错误日志，比强行换上一个不完整的半成品安全。
+///
+/// 调用方是 `config_save` 系列命令，**它们不该因为这里失败而报错给用户**：
+/// 盘已经写成功了（文件是对的），重建运行时状态失败是另一个层面的问题。
+/// 把「保存成功但运行时暂时没跟上」升级成「保存失败」，是把一个可恢复状况
+/// 误报成一个更严重的状况。
+pub fn rebuild_and_swap(app: &tauri::AppHandle) -> anyhow::Result<()> {
+    use tauri::Manager;
+    let Some(h) = app.try_state::<RuntimeHandle>() else {
+        // 出站栈还没起来（`run_stack` 在 `.setup()` 之后才 spawn）。盘已经
+        // 写了，等它起来时会照常读到新配置，不需要额外补偿。
+        anyhow::bail!("运行时快照尚未托管——出站栈还没起来，本次保存只落了盘");
+    };
+    let path = crate::commands::config::config_path(app)
+        .map_err(|e| anyhow::anyhow!("取配置路径失败: {e:?}"))?;
+    // 与启动路径同一个函数：读 + 解析 + 语义校验。两处各写一份迟早分叉。
+    let config = crate::load_config(&path)?;
+
+    let current = h.current();
+    // 先算出新快照再取差异：`next_state` 失败时（比如规则表引用了不存在的
+    // 出站）什么都不该换，此时报告出站差异只会误导——用户会以为「除了出站
+    // 之外都生效了」，而实际上规则也没换。
+    let next = next_state(&current, &config)?;
+    let pending = outbound_changes_pending(&current, &config);
+    h.set(Arc::new(next));
+
+    tracing::info!(
+        "配置已重新加载：{} 条规则、模式 {} 立即生效",
+        config.rules.len(),
+        config.mode
+    );
+    if !pending.is_empty() {
+        tracing::warn!(
+            "以下改动本次**未生效**，需要重启应用：{}。\
+             原因：本地条带的转发器与 hosts 托管目前是整体持有的，为新出站\
+             重跑一遍会把已经连上的其余出站一并断开——宁可明说要重启，也不\
+             悄悄断掉用户正在用的连接。出站的热增删见 Part 2",
+            pending.join("、")
+        );
+    }
+    Ok(())
+}
 
 /// 一次配置更新里，出站集合要如何从旧的过渡到新的。
 ///
@@ -232,6 +415,156 @@ pub fn build_startup_plan(
         mode,
         global_outbound: config.global_outbound.clone(),
     })
+}
+
+#[cfg(test)]
+mod next_state_tests {
+    use super::*;
+
+    /// 一份最小可用的运行时快照。不碰 Tauri、不碰网络——`next_state` 与
+    /// `outbound_changes_pending` 都是纯函数，这正是它们被切出来的理由
+    /// （胶水层 `rebuild_and_swap` 需要 `AppHandle`，靠手动验证兜底）。
+    fn snapshot(rules: &[&str], proxies: Vec<wsieve_config::Proxy>) -> RuntimeState {
+        let lines: Vec<String> = rules.iter().map(|s| s.to_string()).collect();
+        let known: std::collections::HashSet<String> =
+            proxies.iter().map(|p| p.name.clone()).collect();
+        let rule_set = Arc::new(
+            wsieve_route::RuleSet::build(&lines, wsieve_route::Mode::Rule, "", &known).unwrap(),
+        );
+        let table = BTreeMap::new();
+        let geo = Arc::new(wsieve_geo::GeoDb::new("geoip.dat".into(), "geosite.dat".into()));
+        let env = crate::outbound::instance::SessionEnv {
+            eval: Arc::new(|_, _| {}),
+            on_status: Arc::new(|_, _| {}),
+        };
+        RuntimeState {
+            router: Arc::new(crate::router::Router::without_resolver(
+                rule_set.clone(),
+                geo,
+                table.clone(),
+            )),
+            rule_set,
+            outbound_manager: crate::outbound::OutboundManager::new(
+                table,
+                Arc::new(crate::bridge::TransportCore::new()),
+                env,
+            ),
+            groups: Arc::new(GroupTable),
+            proxies: Arc::new(proxies),
+        }
+    }
+
+    fn proxy(name: &str, url: &str) -> wsieve_config::Proxy {
+        wsieve_config::Proxy {
+            name: name.to_string(),
+            kind: "websieve".to_string(),
+            url: url.to_string(),
+            server_pub: "11".repeat(32),
+            client_priv: "22".repeat(32),
+            extra_sessions: 0,
+            mux_prefs: vec![1, 2, 3, 4, 5],
+        }
+    }
+
+    fn config(mode: &str, rules: &[&str], proxies: Vec<wsieve_config::Proxy>) -> wsieve_config::Config {
+        // `rules: Vec<Spanned<String>>` 手工构造要引入 serde-saphyr（src-tauri
+        // 并不直接依赖它），走真实 YAML 解析更贴近生产输入形态。
+        let mut text = format!("mode: {mode}\nrules:\n");
+        for r in rules {
+            text.push_str(&format!("  - {r}\n"));
+        }
+        let mut cfg = wsieve_config::load_str(&text).unwrap();
+        cfg.proxies = proxies;
+        cfg
+    }
+
+    /// 改一条规则只换规则表，**出站实例一个都不重建**——这是设计文档 §3
+    /// 那条产品决策的核心断言：用户改了一条规则，已经连上的出站不该断。
+    #[test]
+    fn a_rule_edit_swaps_the_rule_set_and_reuses_every_outbound_instance() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![]);
+        let next = next_state(&cur, &config("rule", &["MATCH,DIRECT"], vec![])).unwrap();
+        assert!(
+            Arc::ptr_eq(&next.outbound_manager, &cur.outbound_manager),
+            "改规则绝不能顺手换掉出站管理器——那等于把全部连接断一遍"
+        );
+        assert!(
+            !Arc::ptr_eq(&next.rule_set, &cur.rule_set),
+            "规则表应当是新建的那一份"
+        );
+    }
+
+    #[test]
+    fn a_mode_change_is_picked_up() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![]);
+        let next = next_state(&cur, &config("direct", &["MATCH,DIRECT"], vec![])).unwrap();
+        // 换代/保存都不该动 groups 这个占位表（Part 3 才充实它）。
+        assert!(Arc::ptr_eq(&next.groups, &cur.groups));
+        assert!(next.rule_set.resolving_rule_count() == 0);
+    }
+
+    /// **规则引用一个「配置里有、但还没跑起来」的出站，规则表照样要建起来。**
+    ///
+    /// 这是 `known` 取配置里的出站名而不是正在跑的那一批的理由：用户在同一次
+    /// 保存里加了出站 B 又写了 `MATCH,B`，若拿正在跑的那批（还没有 B）去校验，
+    /// 整张规则表会被判「引用了不存在的出站」而拒绝，一条规则连累全部，
+    /// 用户看到的是「保存后所有分流都失效了」。
+    #[test]
+    fn a_rule_naming_a_not_yet_running_outbound_still_builds() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![]);
+        let cfg = config("rule", &["MATCH,B"], vec![proxy("B", "https://b.example/")]);
+        assert!(
+            next_state(&cur, &cfg).is_ok(),
+            "新出站还没起来不该让整张规则表建不出来"
+        );
+    }
+
+    /// 规则表建不出来时报错，调用方据此保留旧快照——半份新状态比一份旧状态
+    /// 危险得多。
+    #[test]
+    fn an_unbuildable_rule_table_is_an_error_so_the_old_snapshot_survives() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![]);
+        // 引用了配置里根本没有的出站
+        let bad = config("rule", &["MATCH,幽灵节点"], vec![]);
+        assert!(next_state(&cur, &bad).is_err());
+    }
+
+    #[test]
+    fn an_invalid_mode_is_an_error_not_a_silent_fallback() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![]);
+        let mut bad = config("rule", &["MATCH,DIRECT"], vec![]);
+        bad.mode = "bogus".to_string();
+        assert!(next_state(&cur, &bad).is_err());
+    }
+
+    #[test]
+    fn an_untouched_outbound_section_reports_nothing_pending() {
+        let p = proxy("A", "https://a.example/");
+        let cur = snapshot(&["MATCH,A"], vec![p.clone()]);
+        let cfg = config("rule", &["MATCH,A"], vec![p]);
+        assert!(outbound_changes_pending(&cur, &cfg).is_empty());
+    }
+
+    #[test]
+    fn added_and_removed_outbounds_are_both_reported() {
+        let cur = snapshot(&["MATCH,REJECT"], vec![proxy("A", "https://a.example/")]);
+        let cfg = config("rule", &["MATCH,REJECT"], vec![proxy("B", "https://b.example/")]);
+        let pending = outbound_changes_pending(&cur, &cfg);
+        assert!(pending.iter().any(|s| s.contains('B') && s.contains("新增")), "{pending:?}");
+        assert!(pending.iter().any(|s| s.contains('A') && s.contains("删除")), "{pending:?}");
+    }
+
+    /// **只改 `url` 也要被报出来。** `url` 在 `OutboundCfg` 里根本没有对应项，
+    /// 拿运行中的 `OutboundCfg` 去比会把这种改动整个漏掉——用户改了服务器
+    /// 地址、保存成功、流量却仍然发去旧服务器，且没有任何提示。
+    #[test]
+    fn a_url_only_edit_is_still_reported_as_pending() {
+        let cur = snapshot(&["MATCH,A"], vec![proxy("A", "https://old.example/")]);
+        let cfg = config("rule", &["MATCH,A"], vec![proxy("A", "https://new.example/")]);
+        let pending = outbound_changes_pending(&cur, &cfg);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(pending[0].contains("改动") && pending[0].contains('A'), "{pending:?}");
+    }
 }
 
 #[cfg(test)]
