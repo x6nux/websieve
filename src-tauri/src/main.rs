@@ -35,6 +35,7 @@ mod emitter_src;
 mod events;
 mod outbound;
 mod router;
+mod runtime_state;
 mod shard;
 mod shard_setup;
 mod stats;

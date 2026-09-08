@@ -105,7 +105,7 @@ impl Default for Backoff {
 }
 
 /// 单个出站的连接参数。由 `wsieve-config` 的 `Proxy` 加承载计划共同产出。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutboundCfg {
     /// 出站名（配置里的 `name`，也是规则里引用的标识）。
     pub name: String,
