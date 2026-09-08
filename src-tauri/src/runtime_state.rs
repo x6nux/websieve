@@ -59,6 +59,23 @@ impl RuntimeHandle {
     fn set(&self, next: Arc<RuntimeState>) {
         *self.0.write().unwrap_or_else(|e| e.into_inner()) = next;
     }
+
+    /// 换代时替换 `outbound_manager`，**其余字段沿用当前快照**。
+    ///
+    /// 不能拿换代开始时捕获的那份快照整体覆盖：两次换代之间用户可能保存过
+    /// 配置（`rebuild_and_swap` 已经换掉了 `rule_set`/`router`），整体覆盖
+    /// 会把刚保存的规则悄悄回滚成旧的——而控制窗口上显示的仍是新规则，
+    /// 用户完全看不出流量正在按一份已经被自己改掉的规则表走。
+    fn set_outbound_manager(&self, manager: Arc<OutboundManager>) {
+        let cur = self.current();
+        self.set(Arc::new(RuntimeState {
+            rule_set: cur.rule_set.clone(),
+            outbound_manager: manager,
+            router: cur.router.clone(),
+            groups: cur.groups.clone(),
+            proxies: cur.proxies.clone(),
+        }));
+    }
 }
 
 /// 进程启动时托管一次（`run_stack` 里，第一份快照就绪之后、`dispatch`
@@ -68,27 +85,15 @@ pub fn install(app: &tauri::AppHandle, state: RuntimeState) {
     app.manage(RuntimeHandle(std::sync::RwLock::new(Arc::new(state))));
 }
 
-/// 换代时替换 `outbound_manager`，**其余字段沿用当前快照**。
-///
-/// 不能拿换代开始时捕获的那份快照整体覆盖：两次换代之间用户可能保存过
-/// 配置（`rebuild_and_swap` 已经换掉了 `rule_set`/`router`），整体覆盖会
-/// 把刚保存的规则悄悄回滚成旧的——而控制窗口上显示的仍是新规则，用户
-/// 完全看不出流量正在按一份已经被自己改掉的规则表走。
+/// `RuntimeHandle::set_outbound_manager` 的取状态包装（换代逻辑本身在那边，
+/// 好脱离 Tauri 单测）。
 pub fn swap_outbound_manager(app: &tauri::AppHandle, manager: Arc<OutboundManager>) {
     use tauri::Manager;
-    let Some(h) = app.try_state::<RuntimeHandle>() else {
+    match app.try_state::<RuntimeHandle>() {
+        Some(h) => h.set_outbound_manager(manager),
         // 托管发生在第一代之前，走到这里说明调用顺序被改坏了。
-        tracing::error!("运行时快照尚未托管，换代后的出站管理器无处安放");
-        return;
-    };
-    let cur = h.current();
-    h.set(Arc::new(RuntimeState {
-        rule_set: cur.rule_set.clone(),
-        outbound_manager: manager,
-        router: cur.router.clone(),
-        groups: cur.groups.clone(),
-        proxies: cur.proxies.clone(),
-    }));
+        None => tracing::error!("运行时快照尚未托管，换代后的出站管理器无处安放"),
+    }
 }
 
 /// 纯函数：给定当前快照与刚保存的配置，算出下一份快照。
@@ -557,6 +562,51 @@ mod next_state_tests {
     /// **只改 `url` 也要被报出来。** `url` 在 `OutboundCfg` 里根本没有对应项，
     /// 拿运行中的 `OutboundCfg` 去比会把这种改动整个漏掉——用户改了服务器
     /// 地址、保存成功、流量却仍然发去旧服务器，且没有任何提示。
+    /// **换指针必须真的换掉。** 这条测试是冲着 `manage()` 那个坑来的：
+    /// Tauri 的 `manage()` 在类型已注册时是空操作，靠它「更新」不报错、
+    /// 只是静默无效，读到的永远是第一次注册的那份（`CurrentCore` 至今
+    /// 如此）。`RuntimeHandle` 换成 `RwLock` 就是为了不重蹈覆辙，那就得
+    /// 有一条测试真的去读一次换后的值。
+    #[test]
+    fn a_swap_is_visible_to_the_very_next_reader() {
+        let h = RuntimeHandle(std::sync::RwLock::new(Arc::new(snapshot(
+            &["MATCH,REJECT"],
+            vec![],
+        ))));
+        let before = h.current();
+        h.set(Arc::new(snapshot(&["MATCH,DIRECT"], vec![])));
+        assert!(
+            !Arc::ptr_eq(&before, &h.current()),
+            "换进去的快照必须立刻被下一个读者看到，不能像 manage() 那样静默无效"
+        );
+    }
+
+    /// **换代绝不能回滚刚保存的规则。** 承载页面死掉换一代时，只该换
+    /// `outbound_manager`；若拿本代开头捕获的整份快照去覆盖，用户在这一代
+    /// 期间保存的规则会被悄悄换回旧的，而控制窗口显示的仍是新规则——流量
+    /// 按一份用户已经改掉的表在走，且没有任何迹象。
+    #[test]
+    fn a_generation_swap_keeps_the_rules_saved_during_that_generation() {
+        let h = RuntimeHandle(std::sync::RwLock::new(Arc::new(snapshot(
+            &["MATCH,REJECT"],
+            vec![],
+        ))));
+        // 这一代跑着的期间，用户保存了新规则。
+        let saved = next_state(&h.current(), &config("rule", &["MATCH,DIRECT"], vec![])).unwrap();
+        let saved_rules = saved.rule_set.clone();
+        h.set(Arc::new(saved));
+        // 然后承载页面死了，换代。
+        let fresh_manager = snapshot(&["MATCH,REJECT"], vec![]).outbound_manager;
+        h.set_outbound_manager(fresh_manager.clone());
+
+        let now = h.current();
+        assert!(
+            Arc::ptr_eq(&now.rule_set, &saved_rules),
+            "换代把用户刚保存的规则回滚掉了"
+        );
+        assert!(Arc::ptr_eq(&now.outbound_manager, &fresh_manager), "新一代的管理器该就位");
+    }
+
     #[test]
     fn a_url_only_edit_is_still_reported_as_pending() {
         let cur = snapshot(&["MATCH,A"], vec![proxy("A", "https://old.example/")]);
