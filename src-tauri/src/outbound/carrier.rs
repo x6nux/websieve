@@ -219,6 +219,46 @@ impl CarrierPlan {
     }
 }
 
+/// 按 `carrier.windows()` 给出的每一个 `(标签, URL)` 建一个隐藏（或按
+/// `show_window` 显示）的承载 WebView。
+///
+/// 可以在 `.setup()` 里调（进程启动时），也可以在启动之后调（运行时
+/// 新增出站需要一个之前没有过的窗口时）——两处用的是同一份逻辑，参数
+/// 完全一致，不允许出现"启动时建的窗口"和"运行时建的窗口"配置不一致
+/// 这种分叉。
+///
+/// **幂等**：若某个标签对应的窗口已经存在，跳过，不重复建（不返回错误——
+/// 调用方在"增量出站更新"场景下，`carrier.windows()` 里混着新旧标签是
+/// 正常情况，不该因为窗口已存在就整体失败）。
+pub fn spawn_carrier_windows(
+    app: &tauri::AppHandle,
+    plan: &CarrierPlan,
+    show_window: bool,
+) -> anyhow::Result<()> {
+    use tauri::Manager;
+    for (label, url) in plan.windows() {
+        if app.get_webview_window(&label).is_some() {
+            continue;
+        }
+        tauri::webview::WebviewWindowBuilder::new(
+            app,
+            label,
+            tauri::WebviewUrl::External(url.parse()?),
+        )
+        .title("websieve")
+        .inner_size(480.0, 320.0)
+        // 传输载体，不是用户界面（spec §6.7）。默认隐藏；
+        // WSIEVE_SHOW_WINDOW=1 可打开排障。
+        .visible(show_window)
+        // spec §3.4：后台节流压制——macOS WKWebView 后台/隐藏时挂起
+        // JS 定时器与 fetch（Task 18 E2E 实测心跳/流分块会停摆）。
+        .background_throttling(tauri_utils::config::BackgroundThrottlingPolicy::Disabled)
+        .initialization_script(crate::bootstrap::loader_js())
+        .build()?;
+    }
+    Ok(())
+}
+
 /// 校验出站表：非空、无重名、名字非空、URL 可解析出 origin。
 ///
 /// 这四条全都**报错而非兜底**：

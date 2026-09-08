@@ -259,25 +259,7 @@ fn main() {
         .setup(move |app| {
             // 承载 WebView：加载服务端真实首页 + initialization_script 注入
             // emitter（同源关键，见模块注释）。
-            for (label, url) in carrier.windows() {
-                tauri::webview::WebviewWindowBuilder::new(
-                    app,
-                    label,
-                    tauri::WebviewUrl::External(url.parse()?),
-                )
-                .title("websieve")
-                .inner_size(480.0, 320.0)
-                // 传输载体，不是用户界面（spec §6.7）。默认隐藏；
-                // WSIEVE_SHOW_WINDOW=1 可打开排障。
-                .visible(show_window)
-                // spec §3.4：后台节流压制——macOS WKWebView 后台/隐藏时挂起
-                // JS 定时器与 fetch（Task 18 E2E 实测心跳/流分块会停摆）。
-                .background_throttling(
-                    tauri_utils::config::BackgroundThrottlingPolicy::Disabled,
-                )
-                .initialization_script(bootstrap::loader_js())
-                .build()?;
-            }
+            outbound::carrier::spawn_carrier_windows(&app.handle().clone(), &carrier, show_window)?;
 
             // 托盘先于窗口建：窗口建失败时用户至少还有托盘可用（这两条
             // 生命周期是独立的，见 tray.rs 模块注释）。同样不阻断代理。
