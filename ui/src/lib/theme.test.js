@@ -28,12 +28,19 @@ function mockMatchMedia(initialMatches) {
   };
 }
 
+// mockMatchMedia() 用裸赋值换掉 window.matchMedia（vi.restoreAllMocks 不会撤销
+// 裸赋值，只对 vi.spyOn 生效），所以在这里显式存一份原值（test-setup.js 装的
+// polyfill），每个测试后自己恢复，而不是依赖 Vitest 按文件隔离全局对象这个隐式前提。
+let originalMatchMedia;
+
 beforeEach(() => {
+  originalMatchMedia = window.matchMedia;
   localStorage.clear();
   document.documentElement.removeAttribute('data-theme');
 });
 
 afterEach(() => {
+  window.matchMedia = originalMatchMedia;
   vi.restoreAllMocks();
 });
 
@@ -100,6 +107,14 @@ describe('跟随系统', () => {
     expect(document.documentElement.dataset.theme).toBe('light');
     mm.fireSystemChange(false);
     expect(document.documentElement.dataset.theme).toBe('light');
+  });
+
+  it('切换离开 system 偏好后，旧的系统监听器被移除（listenerCount 归零）', () => {
+    const mm = mockMatchMedia(false);
+    setThemePreference('system');
+    expect(mm.listenerCount()).toBe(1);
+    setThemePreference('dark');
+    expect(mm.listenerCount()).toBe(0);
   });
 });
 
