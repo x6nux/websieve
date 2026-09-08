@@ -1,7 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import SettingsOverlay from './SettingsOverlay.svelte';
+import { setThemePreference, getThemePreference } from '../lib/theme.js';
 
 const config = {
   mixedPort: 7890,
@@ -253,5 +254,38 @@ describe('设置覆盖层 · 草稿与焦点', () => {
     focusables[0].focus();
     await u.tab({ shift: true });
     expect(document.activeElement).toBe(focusables[focusables.length - 1]);
+  });
+});
+
+describe('设置面板——外观（主题切换）', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.removeAttribute('data-theme');
+  });
+
+  it('渲染深色/浅色/跟随系统三个选项，默认选中当前偏好', () => {
+    localStorage.setItem('websieve:theme', 'light');
+    render(SettingsOverlay, { open: true, config: {} });
+    const radios = screen.getAllByRole('radio', { name: /深色|浅色|跟随系统/ });
+    expect(radios).toHaveLength(3);
+    expect(screen.getByRole('radio', { name: '浅色' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('点击「深色」立即应用，且不调用 onsave', async () => {
+    const u = userEvent.setup();
+    const onsave = vi.fn();
+    render(SettingsOverlay, { open: true, config: {}, onsave });
+    await u.click(screen.getByRole('radio', { name: '深色' }));
+    expect(document.documentElement.dataset.theme).toBe('dark');
+    expect(onsave).not.toHaveBeenCalled();
+  });
+
+  it('点击「跟随系统」后关闭面板（不点保存），主题选择仍然生效', async () => {
+    const u = userEvent.setup();
+    const onclose = vi.fn();
+    render(SettingsOverlay, { open: true, config: {}, onclose });
+    await u.click(screen.getByRole('radio', { name: '浅色' }));
+    await u.click(screen.getByRole('button', { name: '取消' }));
+    expect(localStorage.getItem('websieve:theme')).toBe('light');
   });
 });

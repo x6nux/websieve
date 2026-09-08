@@ -39,6 +39,8 @@
    * 那条路走的是 `config_save` 的行级定点改写。
    */
   import { tick, onDestroy, untrack } from 'svelte';
+  import { getThemePreference, setThemePreference } from '../lib/theme.js';
+  import Segmented from '../lib/Segmented.svelte';
 
   let {
     open = false,
@@ -63,6 +65,11 @@
    * **之后**才跑，那样打开的第一帧全部输入框是空的，然后跳成真实值。
    */
   let draft = $state({ ...untrack(() => config) });
+
+  /** 主题偏好——不进 draft：它不是 config 的字段，点选即生效，不受
+   *  「取消」影响。初值只取一次，理由与 draft 的 untrack 注释相同。 */
+  let themePref = $state(untrack(() => getThemePreference()));
+
   let error = $state('');
   let restoreFocus = null;
 
@@ -199,6 +206,19 @@
     </header>
 
     <div class="body">
+      <section>
+        <h3>外观</h3>
+        <Segmented
+          label="主题"
+          options={[
+            { value: 'dark', label: '深色' },
+            { value: 'light', label: '浅色' },
+            { value: 'system', label: '跟随系统' },
+          ]}
+          value={themePref}
+          onchange={(v) => (themePref = setThemePreference(v))} />
+      </section>
+
       <section>
         <h3>入口</h3>
         <div class="field">
