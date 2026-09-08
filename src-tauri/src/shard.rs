@@ -271,27 +271,31 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-/// 本地条带的运行态：转发器 + hosts 托管，drop 时自动摘除 hosts 条目。
+/// 本地条带的运行态：一批转发器 + 一份 hosts 托管，drop 时自动摘除 hosts 条目。
 ///
 /// 摘除动作不在这里写 —— 它归 `CustodyGuard<HostsCustody>`（设计文档 §10）。
 /// 本结构只负责「转发器与 hosts 条目同生共死」：字段顺序即 drop 顺序，
 /// **先摘 hosts 再停转发器**，反过来的话中间那一小段时间里域名已经指向
 /// 一个刚被 abort 的监听口，本机访问该域名会失败。
+///
+/// 持有的是**一批**转发器而非一个：`shard_setup::plan_many` 把多个出站的
+/// hosts 写入合并成一次原子操作（见该模块的文档），因此它们的转发器也必须
+/// 同生共死——都随这一份 hosts 托管一起摘除，而不是各自一份 guard。
 pub struct ShardGuard {
     /// 持有即生效：drop 时摘除 hosts 托管条目。
     _hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
-    /// 持有即保活：drop 时 listener 任务被 abort。
-    _forwarder: Forwarder,
+    /// 持有即保活：drop 时每个 listener 任务被 abort。
+    _forwarders: Vec<Forwarder>,
 }
 
 impl ShardGuard {
     pub fn new(
-        forwarder: Forwarder,
+        forwarders: Vec<Forwarder>,
         hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
     ) -> Self {
         Self {
             _hosts: hosts,
-            _forwarder: forwarder,
+            _forwarders: forwarders,
         }
     }
 }

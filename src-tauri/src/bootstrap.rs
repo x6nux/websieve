@@ -10,9 +10,12 @@ use wsieve_xhttp::DEFAULT_MUX;
 
 #[derive(Clone)]
 pub struct AppConfig {
-    pub server_url: String,
-    pub server_pub: [u8; 32],
-    pub client_priv: [u8; 32],
+    /// `WSIEVE_MUX_PREFS`——Task 3 起不再是出站 mux 偏好的来源（那来自
+    /// `Config.proxies[].mux-prefs`，每个出站各自的一份），因此目前没有
+    /// 任何调用方读取这个字段。按团队要求（见运行时接入 config.yaml 计划
+    /// Task 3）保留这个 env 变量本身不删——只是它暂时没有接线到任何出站
+    /// 构造路径上，留作后续排障/覆盖手段的预留位。
+    #[allow(dead_code)]
     pub mux_prefs: Vec<MuxId>,
     pub socks_listen: String,
     /// 本地条带转发器的起始端口（会话 i 用 base+i）。见 `crate::shard`。
@@ -88,17 +91,20 @@ pub fn parse_dns_upstream(raw: &str) -> anyhow::Result<std::net::SocketAddr> {
     })
 }
 
-fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
+/// 32 字节十六进制解码：出站的 `server-pub`/`client-priv` 与（历史上）
+/// env 引导路径共用同一条纪律——解析失败报错，绝不悄悄给一个全零数组
+/// （那等于用一把错的钥匙悄悄握手，失败现象离病因很远）。
+///
+/// `pub(crate)`：Task 3 起，`runtime_state::build_startup_plan` 用它把
+/// `Config.proxies[].server_pub/client_priv` 解码成 `[u8; 32]`——两处
+/// 解码逻辑必须是同一个函数，而不是各写一份可能悄悄跑偏的拷贝。
+pub(crate) fn hex32(s: &str) -> anyhow::Result<[u8; 32]> {
     let b = hex::decode(s.trim())?;
     b.try_into()
         .map_err(|v: Vec<u8>| anyhow::anyhow!("expected 32 bytes, got {}", v.len()))
 }
 
 pub fn load_cfg() -> anyhow::Result<AppConfig> {
-    let server_url = std::env::var("WSIEVE_SERVER_URL")
-        .unwrap_or_else(|_| "https://example.com/".to_string());
-    let server_pub = hex32(&std::env::var("WSIEVE_SERVER_PUB")?)?;
-    let client_priv = hex32(&std::env::var("WSIEVE_CLIENT_PRIV")?)?;
     let socks_listen =
         std::env::var("WSIEVE_SOCKS").unwrap_or_else(|_| "127.0.0.1:1080".to_string());
     let mux_prefs = match std::env::var("WSIEVE_MUX_PREFS") {
@@ -142,9 +148,6 @@ pub fn load_cfg() -> anyhow::Result<AppConfig> {
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
     Ok(AppConfig {
-        server_url,
-        server_pub,
-        client_priv,
         mux_prefs,
         socks_listen,
         shard_base_port,

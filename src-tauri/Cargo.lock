@@ -6383,6 +6383,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "dirs",
  "futures",
  "glob",
  "hex",

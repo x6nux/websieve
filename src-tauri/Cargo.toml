@@ -65,6 +65,15 @@ hex = "0.4"
 tauri-utils = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 启动阶段（main() 里 Tauri Builder 建好之前）要算 config.yaml 的路径，
+# 而这一刻还没有 AppHandle，用不了 `app.path().app_config_dir()`。
+# `tauri::path::PathResolver::app_config_dir()` 的实现本身就是
+# `dirs::config_dir().join(identifier)`（已读过 tauri 2.11.5 源码确认）——
+# 这里直接用同一个 crate 复刻同一条逻辑，identifier 取自
+# `tauri::generate_context!()` 产出的 `Context::config()`，因此两处
+# 算出来的必然是同一条路径，不会出现「控制台编辑的和运行时读到的是两份
+# 文件」（见 commands/config.rs::config_path 的同款注释）。
+dirs = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

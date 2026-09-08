@@ -212,7 +212,11 @@ fn read_text(p: &Path) -> CmdResult<String> {
 /// 只在错误种类确凿是 `NotFound` 时才动手创建 —— 权限不足、路径被占用之类
 /// 的其他 I/O 错误如实上抛，不能把「这条路径读不了」误判成「这条路径该建
 /// 默认文件」，那会在真正的故障上掩盖诊断信息。
-fn ensure_config_exists(p: &Path) -> CmdResult<()> {
+///
+/// `pub(crate)`：`main.rs` 的启动路径（Task 3）复用它——不依赖 `AppHandle`，
+/// 纯粹「给一个 `&Path`，不存在就写默认配置」，main.rs 只需要自己算好
+/// 与 `config_path` 同一套目录逻辑的路径传进来。
+pub(crate) fn ensure_config_exists(p: &Path) -> CmdResult<()> {
     match std::fs::metadata(p) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => write_0600(p, DEFAULT_CONFIG_YAML),
