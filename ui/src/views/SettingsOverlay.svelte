@@ -66,8 +66,19 @@
    */
   let draft = $state({ ...untrack(() => config) });
 
-  /** 主题偏好——不进 draft：它不是 config 的字段，点选即生效，不受
-   *  「取消」影响。初值只取一次，理由与 draft 的 untrack 注释相同。 */
+  /**
+   * 主题偏好——不进 draft：它不是 config 的字段，点选即生效，不受
+   * 「取消」影响。
+   *
+   * 初值只取一次，用 untrack 消警告，理由与 draft 那处相同（见上）。
+   * 但与 draft 不同的是：这里**没有**对应 `open` 翻转的重新读取——draft
+   * 之所以要在每次打开时重新快照，是因为 config 是父组件传入、随时可能
+   * 被外部改写；而 themePref 之所以现在能只取一次，是因为整个应用里
+   * `setThemePreference`（进而改写 `websieve:theme`）目前只从本组件自己的
+   * onchange 调用。如果哪天再加一个能改主题的入口（比如托盘图标、快捷键），
+   * 这个只读一次的假设就会失效——那时需要照 draft 的 `$effect` 那样，
+   * 在打开的瞬间重新 `getThemePreference()` 一次。
+   */
   let themePref = $state(untrack(() => getThemePreference()));
 
   let error = $state('');
