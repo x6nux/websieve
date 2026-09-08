@@ -56,3 +56,49 @@ describe('设计令牌契约（定义在阶段 4）', () => {
     expect(css).not.toMatch(/fonts\.googleapis\.com|fonts\.gstatic\.com/);
   });
 });
+
+describe('主题切换：浅色变量集 + 显式深色块', () => {
+  it("包含 :root[data-theme='light'] 选择器", () => {
+    expect(css).toMatch(/:root\[data-theme=['"]light['"]\]\s*\{/);
+  });
+
+  it("包含 :root[data-theme='dark'] 选择器", () => {
+    expect(css).toMatch(/:root\[data-theme=['"]dark['"]\]\s*\{/);
+  });
+
+  it('浅色块内定义了表面/边框/文字四级变量', () => {
+    const m = css.match(/:root\[data-theme=['"]light['"]\]\s*\{([^}]*)\}/);
+    expect(m).not.toBeNull();
+    const block = m[1];
+    for (const name of [
+      '--surface-0', '--surface-1', '--surface-2',
+      '--border', '--border-strong',
+      '--text-1', '--text-2', '--text-3', '--text-4',
+      '--heat-min', '--heat-max', '--shadow-overlay',
+    ]) {
+      expect(block).toMatch(new RegExp(`${name}\\s*:`));
+    }
+  });
+
+  it('浅色块不重新定义出站色码与状态色——两个主题共用同一份', () => {
+    const m = css.match(/:root\[data-theme=['"]light['"]\]\s*\{([^}]*)\}/);
+    const block = m[1];
+    expect(block).not.toMatch(/--outbound-\d/);
+    expect(block).not.toMatch(/--state-(live|warn|fail|direct)/);
+  });
+});
+
+describe('滚动条：跟随主题变量，不用系统默认', () => {
+  it('定义了标准 scrollbar-color/-width', () => {
+    expect(css).toMatch(/scrollbar-width\s*:/);
+    expect(css).toMatch(/scrollbar-color\s*:/);
+  });
+
+  it('定义了 WebKit 系滚动条规则，且颜色引用变量而非写死色值', () => {
+    expect(css).toMatch(/::-webkit-scrollbar\s*\{/);
+    expect(css).toMatch(/::-webkit-scrollbar-thumb\s*\{/);
+    const m = css.match(/::-webkit-scrollbar-thumb\s*\{([^}]*)\}/);
+    expect(m[1]).toMatch(/var\(--/);
+    expect(m[1]).not.toMatch(/#[0-9a-fA-F]{3,6}/);
+  });
+});

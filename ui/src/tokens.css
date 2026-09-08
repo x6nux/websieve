@@ -85,6 +85,50 @@
   --radius: 4px;
 }
 
+/* ── 主题：浅色档，仅覆盖与明暗相关的变量 ─────────────────
+ * 出站色码与状态色两个主题共用 :root 里的原值，不在这里重复定义——
+ * 它们是高饱和点缀色，深浅背景下都压得住，重新设计是无意义的重复劳动。 */
+:root[data-theme='light'] {
+  --surface-0: #f4f5f6; /* 画布 */
+  --surface-1: #ffffff; /* 行/面板 */
+  --surface-2: #e8eaec; /* 悬浮/选中 */
+
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.15);
+
+  --text-1: #1b1d1f; /* 主要 */
+  --text-2: #565d64; /* 次要 */
+  --text-3: #868d94; /* 弱化 */
+  --text-4: #aeb4ba; /* 极弱（占位、禁用） */
+
+  --heat-min: rgba(0, 0, 0, 0.02);
+  --heat-max: rgba(0, 0, 0, 0.07);
+
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+/* 深色档显式声明（与上面 :root 的默认值一致）——不只靠「没有 data-theme
+ * 属性」这个隐含状态代表深色，三态里的两态都要有据可查，也方便测试直接
+ * 断言这个选择器存在。 */
+:root[data-theme='dark'] {
+  --surface-0: #16181b;
+  --surface-1: #1c1f23;
+  --surface-2: #23272c;
+
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  --text-1: #e6e8ea;
+  --text-2: #a4abb3;
+  --text-3: #6f777f;
+  --text-4: #4d545b;
+
+  --heat-min: rgba(255, 255, 255, 0.014);
+  --heat-max: rgba(255, 255, 255, 0.052);
+
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -150,4 +194,33 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ── 滚动条：跟随主题，不用系统默认 ───────────────────────
+ * 两套写法都留着：`scrollbar-color`/`scrollbar-width` 是标准 CSS
+ * Scrollbars 规范，现代 Chromium（本项目 Windows 上 WebView2 的内核）已
+ * 支持；`::-webkit-scrollbar-*` 是更早期就有、覆盖面更广的写法。两者不
+ * 冲突，同时写上比只赌一边更稳。颜色用既有的 --border-strong/--text-3
+ * ——滚动条本质是一条更粗的边框，跟着边框/弱化文字色走，两个主题下都已经
+ * 有正确的明暗值，不需要再造一套「滚动条专用」token。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
 }
