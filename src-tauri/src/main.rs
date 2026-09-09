@@ -54,7 +54,36 @@ mod bootstrap;
 ///
 /// 多出站共享同一份（core 对应一个 WebView，不对应一个会话），
 /// request_id 由它统一分配。
-pub struct CurrentCore(pub Arc<bridge::TransportCore>);
+///
+/// **可替换，且只 `manage()` 一次。** 承载代死掉换新一代时要把这里指向新
+/// core——而 Tauri 的 `manage()` 对已注册类型是**空操作**
+/// （`StateManager::set` 里 `if !already_set` 才 insert），靠反复 `manage`
+/// 更新不报错、只是静默无效。这里曾经正是如此：第二代起页面新 emitter 的
+/// 心跳全打到第一代那个已死的 core 上，承载页面死过一次之后应用再也不恢复。
+/// 完整失效链与现象见 `a_generation_swap_routes_heartbeats_to_the_new_core`。
+pub struct CurrentCore(std::sync::RwLock<Arc<bridge::TransportCore>>);
+
+impl CurrentCore {
+    pub fn new(core: Arc<bridge::TransportCore>) -> Self {
+        Self(std::sync::RwLock::new(core))
+    }
+
+    /// 当前这一代的 core。**每个 IPC 帧都会调它**，所以持锁区间只覆盖一次
+    /// `Arc` 克隆（引用计数 +1），锁里绝不做别的事。
+    ///
+    /// 锁中毒时取回内层值继续用，而不是跟着 panic：这里护的只是一个 `Arc`
+    /// 指针，写者持锁期间只做一次赋值，不存在「改了一半」的中间态。让一次
+    /// 无关的 panic 把整条传输通路打死，比中毒本身危险得多（与
+    /// `runtime_state::RuntimeHandle` 同一条理由）。
+    pub fn current(&self) -> Arc<bridge::TransportCore> {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 换代：指向新一代的 core。
+    pub fn set(&self, core: Arc<bridge::TransportCore>) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = core;
+    }
+}
 
 fn main() {
     tracing_subscriber::fmt()
@@ -746,10 +775,12 @@ async fn run_stack(
         bring_up_tun(t, dispatch.clone()).await;
     }
 
+    // **只托管这一次**，之后换代走 `CurrentCore::set`（见该类型的注释：
+    // 反复 `manage()` 是空操作，曾经让应用在承载页面死过一次之后再不恢复）。
+    app.manage(CurrentCore::new(core.clone()));
+
     // 承载代循环：core 死一次就换一代。
     loop {
-        app.manage(CurrentCore(core.clone()));
-
         // 等 emitter 就绪再拉起出站：没有 emitter 就没有 fetch，握手必然
         // 失败并白白吃掉一轮退避。
         if !wait_first_heartbeat(&core, Duration::from_secs(60)).await {
@@ -767,6 +798,25 @@ async fn run_stack(
             manager.statuses()
         );
         manager.stop_all().await;
+
+        // 下一代：换 core、换管理器。**必须排在 reload 之前** —— 页面一重载
+        // 就会立刻开始每 5 秒一拍的心跳，此时 `CurrentCore` 若还指着上一代
+        // 那个已死的 core，最先几拍就白白丢掉，而新 core 那边
+        // `wait_first_heartbeat` 正在空等。
+        core = Arc::new(bridge::TransportCore::new_beat_pending());
+        match app.try_state::<CurrentCore>() {
+            Some(c) => c.set(core.clone()),
+            // 托管发生在循环之前，走到这里说明启动顺序被改坏了。绝不静默：
+            // 后果正是这个 bug 本身——IPC 永远打在上一代的 core 上。
+            None => tracing::error!("CurrentCore 尚未托管，换代后的传输核心无处安放"),
+        }
+        // **只把管理器这一个字段写回运行时快照** —— 这一代跑着的期间用户
+        // 可能保存过配置（`rebuild_and_swap` 已经换掉了 rule_set/router），
+        // 拿本代开头捕获的整份快照去覆盖，会把刚保存的规则悄悄回滚，
+        // 而 UI 上显示的仍是新规则。
+        manager = new_manager(&app, &carrier_windows, &table, &core);
+        runtime_state::swap_outbound_manager(&app, manager.clone());
+
         // core 死才 reload —— 这是两级生命周期里唯一该 reload 的那一级。
         // 但只 reload 承载/传输窗口：control 窗口装着用户正在编辑的
         // Svelte 状态（当前视图、打开的对话框、未提交的表单），它的页面
@@ -780,14 +830,6 @@ async fn run_stack(
         }
         // 给页面一点时间重新加载并把 emitter 注回去。
         tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // 下一代：换 core、换管理器。**只把管理器这一个字段写回快照** ——
-        // 这一代跑着的期间用户可能保存过配置（`rebuild_and_swap` 已经换掉
-        // 了 rule_set/router），拿本代开头捕获的整份快照去覆盖，会把刚保存
-        // 的规则悄悄回滚，而 UI 上显示的仍是新规则。
-        core = Arc::new(bridge::TransportCore::new_beat_pending());
-        manager = new_manager(&app, &carrier_windows, &table, &core);
-        runtime_state::swap_outbound_manager(&app, manager.clone());
     }
 }
 
@@ -1064,7 +1106,7 @@ fn parse_listen(s: &str) -> anyhow::Result<(String, u16)> {
 
 #[tauri::command]
 async fn wsieve_heartbeat(state: tauri::State<'_, CurrentCore>) -> Result<(), String> {
-    state.0.heartbeat();
+    state.current().heartbeat();
     Ok(())
 }
 
@@ -1082,7 +1124,7 @@ async fn wsieve_raw_post(state: tauri::State<'_, CurrentCore>, request: tauri::i
         tauri::ipc::InvokeBody::Raw(b) => b.clone(),
         _ => return Err("raw body required".into()),
     };
-    handle_frame(&state.0, &body).await
+    handle_frame(&state.current(), &body).await
 }
 
 #[tauri::command]
@@ -1091,7 +1133,7 @@ async fn wsieve_raw_stream(state: tauri::State<'_, CurrentCore>, request: tauri:
         tauri::ipc::InvokeBody::Raw(b) => b.clone(),
         _ => return Err("raw body required".into()),
     };
-    handle_frame(&state.0, &body).await
+    handle_frame(&state.current(), &body).await
 }
 
 async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<(), String> {
@@ -1139,6 +1181,45 @@ async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **换代之后，IPC 命令必须打到新一代的 core 上。**
+    ///
+    /// 这条测试守的是一个真实发生过的故障：`CurrentCore` 原本是个不可变
+    /// newtype，靠承载代循环里反复 `app.manage()` 来「更新」——而 Tauri 的
+    /// `manage()` 在类型已注册时是**空操作**（`StateManager::set` 里
+    /// `if !already_set` 才 insert）。于是第二代起，页面新 emitter 的心跳
+    /// 全打到第一代那个已死的 core 上：新 core 永远等不到心跳，
+    /// `wait_first_heartbeat` 空等 60 秒，会话建起来后 POST 挂在新 core 的
+    /// pending 表上，而页面回帧走 `complete_post` 打到旧 core、被静默丢弃
+    /// （那里没有 else 分支），随后 `watch_core` 判新 core 心跳停摆又杀一代
+    /// ——**承载页面死过一次之后应用再也不恢复**，且每轮日志都只说
+    /// 「承载页面已失效」，看着像网络抖动。
+    ///
+    /// 失效后的现象是每轮 60s 空等 + 15s 判死 = 约 75 秒换一代，日志里只有
+    /// 一句「承载页面已失效」，看着像网络抖动。**注意别把这个周期直接当成
+    /// 本 bug 的判据**：承载页面压根没加载成功时（占位服务器、URL 不通）
+    /// 会有一模一样的 75 秒周期，且从第一代起就有。本 bug 的判据是
+    /// 「页面明明加载成功过、第一代工作正常，死过一次之后就再不恢复」。
+    #[test]
+    fn a_generation_swap_routes_heartbeats_to_the_new_core() {
+        let gen1 = Arc::new(bridge::TransportCore::new_beat_pending());
+        let gen2 = Arc::new(bridge::TransportCore::new_beat_pending());
+        let current = CurrentCore::new(gen1.clone());
+
+        // 承载页面死了，换代。
+        current.set(gen2.clone());
+        // 页面重载后新 emitter 的第一拍心跳——IPC 命令读的就是这个。
+        current.current().heartbeat();
+
+        assert!(
+            !gen2.heartbeat_stale(),
+            "换代后的心跳必须落到新一代的 core 上，否则它永远等不到心跳而被判死"
+        );
+        assert!(
+            gen1.heartbeat_stale(),
+            "上一代那个已死的 core 不该再收到心跳"
+        );
+    }
 
     #[test]
     fn listen_addr_splits_host_and_port() {
