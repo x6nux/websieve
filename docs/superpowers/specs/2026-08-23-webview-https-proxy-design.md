@@ -66,7 +66,29 @@ websieve 是一个把网络传输层放进 WebView 执行的代理客户端。�
 | WKWebView 不支持流式上传，且引擎随 OS 不可独立更新 → 存量设备数年内无法使用 | **上行只用 packet-up（多个独立 POST）**。`stream-up` 不实现 |
 | 流式上传强制 HTTP/2 或 HTTP/3 + HTTPS，h1.1 直接 reject（`net::ERR_H2_OR_QUIC_REQUIRED`），不降级 | 即便未来启用 stream-up，也需服务端强制 h2/h3 |
 | Android Chromium timer 节流：后台每秒 1 次 → 10 秒后 0.01s/s 预算 → 5 分钟后每分钟 1 次 | 见 §9.3。**WebSocket/WebRTC 长连接被官方豁免节流**，是可用的规避路径 |
-| Tauri IPC 的 JSON 路径对大数据是官方承认的瓶颈 | 必须走二进制快路径：`Channel<&[u8]>` / 顶层 `Uint8Array`。**切勿把二进制嵌在 object 里**，会退化成数字数组 |
+| Tauri IPC 的 JSON 路径对大数据是官方承认的瓶颈 | ~~必须走二进制快路径：`Channel<&[u8]>` / 顶层 `Uint8Array`~~ **见下方修订：承载页是远程 origin，快路径不可用，改用 base64** |
+
+> **2026-09-09 修订（真机实测）**：上面那条「走顶层 `Uint8Array` 快路径」在
+> 生产形态下**从来没有成立过**。承载 WebView 加载的是远程 origin，而 Tauri 的
+> custom protocol IPC 走 `fetch('ipc://localhost/…')`——WKWebView 禁止 https
+> 页面访问 custom scheme，请求发都发不出去。Tauri 只 `console.warn` 一句就
+> **静默回退**到 postMessage，那条路径把 `Uint8Array` 交给 `JSON.stringify`，
+> replacer 里一句 `Array.from(val)` 正好退化成本条要避免的数字数组（~3.57x）。
+>
+> 症状极具迷惑性：**无 payload 的命令（心跳）照常成功**，所以出站会进入
+> `Connecting`、握手 POST 其实已成功往返，只是回帧那步 invoke 抛
+> `raw body required`、被 emitter 的 `catch` 吞掉，于是永久挂起、零错误日志。
+>
+> 逐一实测排除的绕过方案：`ipc://` 三种请求形态（最简 GET / 简单请求 /
+> 完整模拟，全部 `TypeError: Load failed`，故与 CORS、预检、Content-Type
+> 无关）；`http://127.0.0.1`（被拦，本地探针 server 零日志）；本地 origin 的
+> iframe 桥（连已知存在的 `index.html` 都不触发 onload）；`use_https_scheme`
+> （只作用于 asset protocol）；gzip（加密数据 1.001x，反而变大）。
+>
+> **结论**：唯一通道是 postMessage 的 JSON，二进制改走 base64 字符串。
+> 3.57x → 1.33x，JavaScriptCore 实测 75 → 148 MB/s（对 100Mbps 场景余量 12 倍）。
+> 编码用分块 `btoa`，比手写循环快 2.6 倍。实现见 `ui/emitter.js` 的 `sendFrame`
+> 与 `src-tauri/src/bridge.rs` 的 `bs64_decode`。
 
 Tauri IPC 官方说明：https://v2.tauri.app/develop/calling-rust/
 Chromium 节流：https://developer.chrome.com/blog/timer-throttling-in-chrome-88

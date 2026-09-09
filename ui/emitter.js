@@ -6,9 +6,23 @@
 // Rust 侧的 initialization_script（data: URL 加载本文件，见
 // src-tauri/src/bootstrap.rs）。本文件是单一事实源，build.rs 把它嵌进二进制。
 //
-// IPC 纪律（spec §3.2）：二进制永远走 invoke 的顶层 Uint8Array（raw body
-// 快路径），绝不嵌在 object 里退化成数字数组。标量（requestId/status）
-// 编进 16 字节帧头，与 payload 一起作为唯一顶层参数一次性传给 Rust。
+// IPC 纪律（spec §3.2 已按下述实测结果修订）：**承载页是远程 origin，
+// raw body 快路径在这里根本不可用**——Tauri 的 custom protocol IPC 走
+// `fetch('ipc://localhost/…')`，而 WKWebView 禁止 https 页面访问 custom
+// scheme，请求发都发不出去；Tauri 只 console.warn 一句就静默回退到
+// postMessage，那条路把 Uint8Array 交给 JSON.stringify，replacer 里一句
+// `Array.from(val)` 把每字节变成 "123," 约 4 个字符。
+//
+// 也就是说「绝不退化成数字数组」这条原则在生产形态下**从来没有成立过**，
+// 只是 Rust 侧拒收 JSON（`raw body required`）所以表现为彻底失败而非变慢。
+// 2026-09-09 逐一实测排除了全部绕过方案：ipc:// 三种请求形态、
+// http://127.0.0.1（被 mixed content 拦，本地探针 server 零日志）、
+// 本地 origin 的 iframe 桥（连已知存在的 index.html 都不 onload）、
+// gzip（加密数据 1.001x，反而变大）。唯一通道就是 postMessage 的 JSON。
+//
+// 因此二进制改走 base64 字符串：3.57x → 1.33x，JavaScriptCore 实测吞吐
+// 75 → 148 MB/s。这是**修复**而非妥协。标量（requestId/status）仍编进
+// 16 字节帧头，与 payload 一起作为一个帧编码后传给 Rust。
 // 帧格式见 src-tauri/src/main.rs 的 handle_frame 注释。
 //
 // 下行取消的双杠杆顺序是 spec §6.5 钉死的（Xray dialer.html 血泪注记）：
@@ -45,7 +59,25 @@
     f[9] = (status >>> 8) & 0xff;
     f[10] = status & 0xff;
     if (n) f.set(payload, HEADER);
-    return f; // 顶层 Uint8Array → raw IPC（spec §3.2）
+    return f;
+  }
+
+  // 帧 → base64 → invoke。六个回帧点统一走这里，避免有人漏掉编码那一步
+  // 而悄悄退回数字数组（那条路 Rust 侧会直接拒收，但排查起来极难：
+  // 症状是「心跳正常、传输永远挂着」，且全程零错误日志）。
+  function sendFrame(cmd, kind, requestId, status, payload) {
+    return invoke(cmd, { f: bytesToBase64(frame(kind, requestId, status, payload)) });
+  }
+
+  // 分块 btoa —— 比手写 base64 循环快 2.6 倍（JavaScriptCore 实测
+  // 344 vs 132 MB/s）。分块是必须的：String.fromCharCode.apply 对整个
+  // 大数组会爆栈（参数个数上限），0x8000 是公认安全的块大小。
+  function bytesToBase64(u8) {
+    var s = '';
+    for (var i = 0; i < u8.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
   }
 
   // ---- 上行 POST -------------------------------------------------------
@@ -66,9 +98,9 @@
         headers: { 'Content-Type': 'text/plain' },
       });
       var buf = new Uint8Array(await resp.arrayBuffer());
-      await invoke('wsieve_raw_post', frame(1, requestId, resp.status, buf));
+      await sendFrame('wsieve_raw_post', 1, requestId, resp.status, buf);
     } catch (e) {
-      try { await invoke('wsieve_raw_post', frame(2, requestId, 0, null)); } catch (_) {}
+      try { await sendFrame('wsieve_raw_post', 2, requestId, 0, null); } catch (_) {}
     }
   }
 
@@ -83,7 +115,7 @@
         signal: controller.signal,
       });
       if (!resp.ok) {
-        await invoke('wsieve_raw_stream', frame(5, requestId, resp.status, null));
+        await sendFrame('wsieve_raw_stream', 5, requestId, resp.status, null);
         streams.delete(requestId);
         return;
       }
@@ -106,7 +138,7 @@
         pending = [];
         pendingLen = 0;
         firstAt = 0;
-        await invoke('wsieve_raw_stream', frame(3, requestId, 0, merged));
+        await sendFrame('wsieve_raw_stream', 3, requestId, 0, merged);
       }
 
       while (true) {
@@ -121,10 +153,10 @@
         }
       }
       await flush(); // 收尾残余
-      await invoke('wsieve_raw_stream', frame(4, requestId, 0, null));
+      await sendFrame('wsieve_raw_stream', 4, requestId, 0, null);
     } catch (e) {
       if (!entry.cancelled) {
-        try { await invoke('wsieve_raw_stream', frame(5, requestId, 0, null)); } catch (_) {}
+        try { await sendFrame('wsieve_raw_stream', 5, requestId, 0, null); } catch (_) {}
       }
       // cancelled 时静默：Rust 侧已主动结束该流
     } finally {

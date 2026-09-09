@@ -1111,6 +1111,13 @@ async fn wsieve_heartbeat(state: tauri::State<'_, CurrentCore>) -> Result<(), St
 }
 
 /// 上行 POST 结果与下行 chunk 的统一二进制入口。
+///
+/// **参数是 base64 字符串而不是 raw body**：承载页加载的是远程 origin，
+/// Tauri 的 custom protocol IPC 在 WKWebView 下发不出去（`ipc://` 被禁），
+/// 会静默回退到 postMessage，那条路只能传 JSON。完整实测见 emitter.js
+/// 顶部注释。若改回 `InvokeBody::Raw`，症状是「心跳正常、传输永远挂在
+/// Connecting、零错误日志」——因为 emitter 那侧的 invoke 异常被 catch 吞掉。
+///
 /// 帧格式（16B 头，全大端，与 emitter.js 的 frame() 逐字段对齐）：
 ///   [0..4]  magic "WSIE"
 ///   [4]     kind = 1 post_ok / 2 post_err / 3 chunk / 4 stream_end / 5 stream_err
@@ -1119,20 +1126,14 @@ async fn wsieve_heartbeat(state: tauri::State<'_, CurrentCore>) -> Result<(), St
 ///   [11..16] 保留（填充至 16B）
 /// 之后为原始字节（kind=1 的 body / kind=3 的 chunk，其余无 payload）。
 #[tauri::command]
-async fn wsieve_raw_post(state: tauri::State<'_, CurrentCore>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    let body = match request.body() {
-        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
-        _ => return Err("raw body required".into()),
-    };
+async fn wsieve_raw_post(state: tauri::State<'_, CurrentCore>, f: String) -> Result<(), String> {
+    let body = bridge::bs64_decode(&f)?;
     handle_frame(&state.current(), &body).await
 }
 
 #[tauri::command]
-async fn wsieve_raw_stream(state: tauri::State<'_, CurrentCore>, request: tauri::ipc::Request<'_>) -> Result<(), String> {
-    let body = match request.body() {
-        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
-        _ => return Err("raw body required".into()),
-    };
+async fn wsieve_raw_stream(state: tauri::State<'_, CurrentCore>, f: String) -> Result<(), String> {
+    let body = bridge::bs64_decode(&f)?;
     handle_frame(&state.current(), &body).await
 }
 

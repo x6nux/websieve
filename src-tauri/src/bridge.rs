@@ -288,8 +288,14 @@ impl WebViewTransport {
     }
 }
 
-/// 纯 Rust base64（标准字母表 + padding），避免只为上行引入依赖。
-/// 上行 POST body ≤ 1MB 且每 POST 一次，编码成本可忽略。
+/// 纯 Rust base64（标准字母表 + padding），避免只为这一处引入依赖。
+///
+/// 上行（Rust → JS，经 eval）与下行回帧（JS → Rust，经 IPC）都走它。
+/// 下行改用 base64 的完整理由见 `ui/emitter.js` 顶部：承载页是远程 origin，
+/// raw body 快路径在 WKWebView 下根本不可用。
+///
+/// 手写而不引 crate：实测瓶颈在 JS 侧（JavaScriptCore 编码 + stringify
+/// 约 148 MB/s），Rust 侧无论手写还是 SIMD 都远不是瓶颈，多一个依赖不值。
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn bs64_encode(data: &[u8]) -> String {
@@ -305,9 +311,65 @@ pub fn bs64_encode(data: &[u8]) -> String {
     out
 }
 
+/// `bs64_encode` 的逆，供下行回帧解码（`wsieve_raw_post`/`wsieve_raw_stream`）。
+///
+/// **非法字符报错而不是跳过**：静默忽略会把一个损坏的帧解成一段内容错位
+/// 但长度合法的字节流，那会一路漏进 Noise 解密层，报出来的错离病因极远。
+/// 宁可在这里就拒收。
+pub fn bs64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break; // padding 之后没有有效数据
+        }
+        let v: u8 = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err(format!("非法 base64 字符 {:?}", c as char)),
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 编解码必须严格互逆——这条链路上一个 off-by-one 不会立刻报错，
+    /// 而是变成一段长度合法、内容错位的字节流，一路漏进 Noise 解密层。
+    /// 三种余数（len%3 == 0/1/2）都要覆盖，padding 分支正是在这里分岔。
+    #[test]
+    fn base64_round_trips_including_every_padding_case() {
+        for len in 0..=64usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
+            let enc = bs64_encode(&data);
+            let dec = bs64_decode(&enc).expect("自己编的应当能自己解");
+            assert_eq!(dec, data, "len={len} 未能往返，编码={enc}");
+        }
+        // 全字节值都要能过，别在高位字节上栽跟头
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(bs64_decode(&bs64_encode(&all)).unwrap(), all);
+    }
+
+    /// 非法字符必须报错而不是被跳过（见 bs64_decode 的文档）。
+    #[test]
+    fn base64_rejects_junk_instead_of_silently_skipping() {
+        assert!(bs64_decode("AA*A").is_err(), "* 不在字母表里");
+        assert!(bs64_decode("AA A").is_err(), "空格也不行");
+        let e = bs64_decode("AA#A").unwrap_err();
+        assert!(e.contains('#'), "错误要点名冒犯的字符：{e}");
+    }
 
     #[test]
     fn url_joins_base_and_path() {
