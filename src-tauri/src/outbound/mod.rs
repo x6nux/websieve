@@ -255,8 +255,9 @@ mod tests {
             name: name.into(),
             server_pub: [1u8; 32],
             client_priv: [2u8; 32],
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None; sessions],
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         }
     }
 

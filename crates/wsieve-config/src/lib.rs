@@ -36,6 +36,13 @@ pub enum ConfigError {
     UnsupportedProxyType { name: String, kind: String },
     #[error("出站名重复：{0}。规则用名字引用出站，重名会产生歧义")]
     DuplicateProxyName(String),
+    #[error("hosts 里有一个空的域名键。空键匹配不到任何请求，写它多半是笔误")]
+    EmptyHostsKey,
+    #[error(
+        "hosts 的 {host} 指向「{value}」，这不是一个 IP 字面量。\
+         hosts 的存在意义就是绕开 DNS，值只能写 IP（IPv4 或 IPv6）"
+    )]
+    BadHostsValue { host: String, value: String },
     #[error("代理组名 {0} 重复——组名必须唯一，UI 靠它定位该改写哪个组块")]
     DuplicateProxyGroupName(String),
     #[error("代理组名 {0} 与一个出站名重复——组名与出站名共享同一个命名空间，规则引用时才不会混淆")]
@@ -188,6 +195,21 @@ impl Config {
             "trace / debug / info / warn / error",
         )?;
 
+        // hosts 的值必须是 IP **字面量**。允许写域名的话就成了「用 DNS 解析
+        // 一个本该绕过 DNS 的条目」，一条永远查不明白的循环；而这里挡下来，
+        // 用户在保存时就看到自己写错了什么。
+        for (host, ip) in &self.hosts {
+            if host.trim().is_empty() {
+                return Err(ConfigError::EmptyHostsKey);
+            }
+            if ip.trim().parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::BadHostsValue {
+                    host: host.clone(),
+                    value: ip.clone(),
+                });
+            }
+        }
+
         let mut seen: HashSet<&str> = HashSet::new();
         for p in &self.proxies {
             if p.kind != "websieve" {
@@ -199,6 +221,15 @@ impl Config {
             if !seen.insert(p.name.as_str()) {
                 return Err(ConfigError::DuplicateProxyName(p.name.clone()));
             }
+            // 这四个写法必须与 `wsieve_proto::hello::IpStrategy::parse` 的分支
+            // 逐字一致：这里放行而那边不认，用户就会看到「保存成功，重连时
+            // 却报配置错误」。
+            check_enum(
+                "proxies[].ip-strategy",
+                &p.ip_strategy,
+                &["auto", "v4-only", "v6-only", "prefer-v4"],
+                "auto / v4-only / v6-only / prefer-v4",
+            )?;
         }
         Ok(())
     }
@@ -246,10 +277,12 @@ rules:
         // extra-sessions / mux-prefs 省略时要有值，否则条带数会是 0
         let c = load_str(MINIMAL).unwrap();
         assert_eq!(c.proxies[0].extra_sessions, 3);
-        // MuxId 的线上标识，不是 0-based 序号——本 crate 依赖不到
-        // `wsieve_proto::hello::MuxId`，「这五个值确实全部可转换」由
-        // src-tauri 的 `runtime_state` 测试守着（那边两个 crate 都在）。
-        assert_eq!(c.proxies[0].mux_prefs, vec![2, 1, 3, 4, 5]);
+        // MuxId 的线上标识，不是 0-based 序号。三方 mux 换成自研 wsmux 之后
+        // 只剩 `Wsmux = 0x01` 一个——本 crate 依赖不到
+        // `wsieve_proto::hello::MuxId`，「这个值确实可转换」由 src-tauri 的
+        // `the_crate_default_mux_prefs_are_all_valid_mux_ids` 守着（那边两个
+        // crate 都在）。
+        assert_eq!(c.proxies[0].mux_prefs, vec![1]);
     }
 
     #[test]
@@ -420,6 +453,66 @@ rules:
                 other => panic!("应是语法错，实为 {other:?}"),
             }
         }
+    }
+
+    /// hosts 段能解析出来，且值必须是 IP 字面量。
+    #[test]
+    fn hosts_parses_and_requires_ip_literals() {
+        let c = load_str(&format!(
+            "{MINIMAL}hosts:\n  example.com: 1.2.3.4\n  v6.example: \"2001:db8::1\"\n"
+        ))
+        .unwrap();
+        assert_eq!(c.hosts.len(), 2);
+        assert_eq!(c.hosts["example.com"], "1.2.3.4");
+        c.validate().unwrap();
+
+        // 值写成域名 → 报错。允许的话就成了「用 DNS 解析一个本该绕开 DNS
+        // 的条目」，一条永远查不明白的循环。
+        let c = load_str(&format!("{MINIMAL}hosts:\n  a.com: b.com\n")).unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(matches!(e, ConfigError::BadHostsValue { .. }), "{e:?}");
+        let text = e.to_string();
+        assert!(text.contains("a.com") && text.contains("b.com"), "{text}");
+    }
+
+    /// 省略 hosts 段就是空表——不是错误，也不该有默认条目。
+    #[test]
+    fn omitting_hosts_yields_an_empty_table() {
+        let c = load_str(MINIMAL).unwrap();
+        assert!(c.hosts.is_empty());
+        c.validate().unwrap();
+    }
+
+    /// `ip-strategy` 省略时是 `auto`（改动前的行为），写了就按写的来。
+    #[test]
+    fn ip_strategy_defaults_to_auto_and_round_trips() {
+        assert_eq!(load_str(MINIMAL).unwrap().proxies[0].ip_strategy, "auto");
+        let c = load_str(&MINIMAL.replace(
+            "    client-priv: \"bb\"",
+            "    client-priv: \"bb\"\n    ip-strategy: v4-only",
+        ))
+        .unwrap();
+        assert_eq!(c.proxies[0].ip_strategy, "v4-only");
+        c.validate().unwrap();
+    }
+
+    /// 拼错的写法必须在 validate 就被挡住。这里放行、运行时才报错的话，
+    /// 用户看到的是「保存成功，但一重连就出错」。
+    #[test]
+    fn validate_rejects_a_bogus_ip_strategy() {
+        let c = load_str(&MINIMAL.replace(
+            "    client-priv: \"bb\"",
+            "    client-priv: \"bb\"\n    ip-strategy: ipv4",
+        ))
+        .unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(
+            matches!(e, ConfigError::BadEnumField { field: "proxies[].ip-strategy", .. }),
+            "{e:?}"
+        );
+        let text = e.to_string();
+        assert!(text.contains("ipv4"), "要点名冒犯的值：{text}");
+        assert!(text.contains("prefer-v4"), "要列出合法取值：{text}");
     }
 
     #[test]

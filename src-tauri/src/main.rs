@@ -302,6 +302,11 @@ fn main() {
             }
         }
     };
+    // 判决用的解析器链与转发用的 hosts 表。必须在规则表建好之后——
+    // 降级告警要说清楚「有几条 IP 类规则会因此不命中」，而那个数字只有
+    // 规则表知道。构建失败一律降级，不阻断启动（理由见 `build_resolver`）。
+    let (resolver, hosts) = runtime_state::build_resolver(&config, rules.resolving_rule_count());
+
     // GEO 数据缺失不阻断启动（spec §12）：涉 GEO 的规则跳过并告警。
     let geo = Arc::new(wsieve_geo::GeoDb::new(
         geo_path("WSIEVE_GEOIP", "geoip.dat"),
@@ -399,8 +404,14 @@ fn main() {
             let geo = geo.clone();
             let wins = carrier_windows.clone();
             let tun = tun_setup.take();
+            let resolver = resolver.clone();
+            let hosts = hosts.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = run_stack(handle, bind, wins, obs, proxies, rules, geo, tun).await {
+                if let Err(e) = run_stack(
+                    handle, bind, wins, obs, proxies, rules, geo, resolver, hosts, tun,
+                )
+                .await
+                {
                     tracing::error!("入口/出站栈退出: {e:#}");
                 }
             });
@@ -678,6 +689,10 @@ async fn run_stack(
     proxies: Arc<Vec<wsieve_config::Proxy>>,
     rules: Arc<wsieve_route::RuleSet>,
     geo: Arc<wsieve_geo::GeoDb>,
+    // 判决路径的解析器链与转发用的 hosts 表，由 `runtime_state::build_resolver`
+    // 从 config 装配好传进来——`run_stack` 本身拿不到完整 `Config`。
+    resolver: Arc<dyn wsieve_dns::RoutingResolver>,
+    hosts: Arc<wsieve_dns::Hosts>,
     tun_setup: Option<TunSetup>,
 ) -> anyhow::Result<()> {
     let mut table = BTreeMap::new();
@@ -693,13 +708,13 @@ async fn run_stack(
     // 的话，分派器会永远看到一个空的 dialer 格 —— 表现为「明明连上了却
     // 一直被拒」。
     //
-    // 阶段 2 尚未接入 DNS 解析器，`without_resolver` 会对着规则表里的
-    // IP 类规则条数如实告警 —— 静默的覆盖面缺失比报错更危险。
-    let router = Arc::new(router::Router::without_resolver(
-        rules.clone(),
-        geo,
-        table.clone(),
-    ));
+    // 解析器与 hosts 都在 `build_resolver` 里装配完毕（含降级与告警），
+    // 这里只负责把两半装上：判决那半在 `resolver` 里（`HostsResolver` 包着
+    // 真解析器），转发那半是 `with_hosts`。漏装任何一半都不会报错，只会
+    // 表现为「hosts 只生效了一半」，所以两句必须紧挨着。
+    let router = Arc::new(
+        router::Router::new(rules.clone(), geo, table.clone(), resolver).with_hosts(hosts),
+    );
 
     // 第一代承载核心先建出来：运行时快照要在 `dispatch` 之前就位（下面
     // 每条连接都经它读当前 `Router`），而快照里的 `OutboundManager` 需要
@@ -1126,18 +1141,47 @@ async fn wsieve_heartbeat(state: tauri::State<'_, CurrentCore>) -> Result<(), St
 ///   [11..16] 保留（填充至 16B）
 /// 之后为原始字节（kind=1 的 body / kind=3 的 chunk，其余无 payload）。
 #[tauri::command]
-async fn wsieve_raw_post(state: tauri::State<'_, CurrentCore>, f: String) -> Result<(), String> {
-    let body = bridge::bs64_decode(&f)?;
-    handle_frame(&state.current(), &body).await
+async fn wsieve_raw_post(
+    state: tauri::State<'_, CurrentCore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let body = decode_body(&request)?;
+    handle_frame(&state.current(), body).await
 }
 
 #[tauri::command]
-async fn wsieve_raw_stream(state: tauri::State<'_, CurrentCore>, f: String) -> Result<(), String> {
-    let body = bridge::bs64_decode(&f)?;
-    handle_frame(&state.current(), &body).await
+async fn wsieve_raw_stream(
+    state: tauri::State<'_, CurrentCore>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<(), String> {
+    let body = decode_body(&request)?;
+    handle_frame(&state.current(), body).await
 }
 
-async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<(), String> {
+/// 两种回帧 body 都收：二进制快路径与 base64 兼容路径。
+///
+/// **哪条路可用由 origin 决定，不由我们决定**：`InvokeBody::Raw` 只在
+/// Tauri 的 custom protocol 通路上出现（请求带 `application/octet-stream`），
+/// 而承载页是远程 https origin 时，WKWebView 会把 custom protocol 请求整个
+/// 挡在发出之前，Tauri 静默回退到 postMessage——那条路的 body 只能是 JSON。
+///
+/// 所以这里两条都认，让 emitter 侧按 origin 选最快的那条，而不是二选一
+/// 写死。写死成 raw 会在远程 origin 下变成「握手永远挂起、零错误日志」；
+/// 写死成 base64 则在本地 origin 下白白付出 1.333 倍膨胀与一次全量编码。
+fn decode_body(req: &tauri::ipc::Request<'_>) -> Result<bytes::Bytes, String> {
+    match req.body() {
+        tauri::ipc::InvokeBody::Raw(b) => Ok(bytes::Bytes::copy_from_slice(b)),
+        tauri::ipc::InvokeBody::Json(v) => {
+            let f = v
+                .get("f")
+                .and_then(|x| x.as_str())
+                .ok_or("JSON body 缺少字符串字段 f")?;
+            bridge::bs64_decode(f).map(bytes::Bytes::from)
+        }
+    }
+}
+
+async fn handle_frame(core: &Arc<bridge::TransportCore>, body: bytes::Bytes) -> Result<(), String> {
     const HEADER: usize = 16;
     if body.len() < HEADER {
         return Err("short frame".into());
@@ -1149,14 +1193,21 @@ async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<
     let kind = body[4];
     let request_id = u32::from_be_bytes([body[5], body[6], body[7], body[8]]) as u64;
     let status = u16::from_be_bytes([body[9], body[10]]);
-    let payload = &body[HEADER..];
+    // 第 11..15 字节：下行分片序号（发送侧单调递增）。串行模式下发送侧
+    // 恒写 0 之外的递增值也无妨——重排在有序到达时是恒等操作。
+    let seq = u32::from_be_bytes([body[11], body[12], body[13], body[14]]);
+    // 零拷贝切片：`Bytes` 的 slice 只挪一对指针并加一次引用计数，不复制字节。
+    // 这里曾经是 `&body[HEADER..]` 再配 `Bytes::copy_from_slice`，等于每帧把
+    // 整个 payload 又抄一遍——在 256 KiB 分块下，那是与链路等速的一整条
+    // memcpy 带宽，剖析里 `_platform_memmove` 的大头就是它。
+    let payload = body.slice(HEADER..);
     match kind {
         1 => {
             core.complete_post(
                 request_id,
                 Ok(wsieve_transport::PostReply {
                     status,
-                    body: bytes::Bytes::copy_from_slice(payload),
+                    body: payload,
                 }),
             )
             .await;
@@ -1166,8 +1217,7 @@ async fn handle_frame(core: &Arc<bridge::TransportCore>, body: &[u8]) -> Result<
                 .await;
         }
         3 => {
-            core.push_chunk(request_id, bytes::Bytes::copy_from_slice(payload))
-                .await;
+            core.push_chunk_seq(request_id, seq, payload).await;
         }
         4 => core.complete_stream(request_id, None).await,
         5 => {

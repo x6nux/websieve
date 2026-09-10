@@ -9,6 +9,8 @@
 //! 关掉了 `serialize` feature，本 crate 派生的 `Serialize` 找不到 YAML
 //! 序列化器可用，只能喂给 serde_json 之类。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_saphyr::Spanned;
 
@@ -49,6 +51,16 @@ pub struct Config {
     pub rules: Vec<Spanned<String>>,
 
     // ── 其余 ──
+    /// 静态解析表：域名 → IP 字面量。Clash 的 `hosts` 同名同义。
+    ///
+    /// 只做**精确匹配**，不支持 `*.example.com` 这类通配——通配要定义
+    /// 「多个模式同时命中时谁赢」，而那套优先级规则一旦写下就得永远兼容。
+    /// 没有需求之前不引入。
+    ///
+    /// 用 `BTreeMap` 而非 `HashMap`：送给 UI 的 JSON 与日志里的顺序要稳定，
+    /// 否则每次序列化条目顺序都不一样，diff 全是噪声。
+    #[serde(default)]
+    pub hosts: BTreeMap<String, String>,
     pub dns: Dns,
     pub tun: Tun,
     pub geo_auto_update: bool,
@@ -75,6 +87,7 @@ impl Default for Config {
             proxies: Vec::new(),
             proxy_groups: Vec::new(),
             rules: Vec::new(),
+            hosts: BTreeMap::new(),
             dns: Dns::default(),
             tun: Tun::default(),
             geo_auto_update: true,
@@ -106,25 +119,46 @@ pub struct Proxy {
     pub extra_sessions: usize,
     #[serde(default = "default_mux_prefs")]
     pub mux_prefs: Vec<u8>,
+    /// 服务端解析**域名**目标时用哪个地址族：
+    /// `auto` / `v4-only` / `v6-only` / `prefer-v4`。
+    ///
+    /// 逐出站而非全局：一台服务器的 IPv6 出口被目标站点墙掉时，只该改这一台
+    /// 的行为。这里存字符串、由 `build_startup_plan` 转成
+    /// `wsieve_proto::hello::IpStrategy`——与 `mux_prefs` 存 `Vec<u8>` 同理，
+    /// 配置层不依赖协议层的类型。合法写法在 `Config::validate` 里 `check_enum`
+    /// 复核一遍，两处列表必须与 `IpStrategy::parse` 的分支逐字对齐。
+    #[serde(default = "default_ip_strategy")]
+    pub ip_strategy: String,
 }
 
 fn default_extra_sessions() -> usize {
     3
 }
 
-/// 这里的数字是 **`MuxId` 的线上标识**（`wsieve_proto::hello::MuxId`：
-/// Yamux=0x01 / Smux=0x02 / Muxado=0x03 / Picomux=0x04 / H2mux=0x05），
-/// 不是「第几个」。曾经写成 `[0, 1, 2, 3, 4]`（0-based 序号），而 `0` 根本
-/// 不是合法 `MuxId`——`ProxyForm` 添加服务器时从不写 `mux-prefs`，于是每个
-/// 从界面新建的出站都落到这个默认值上，下次启动 `build_startup_plan` 转换
-/// 失败、进程 `exit(2)`：用户只看到「加完服务器后应用打不开了」。
+/// 默认 `auto` = 交给服务端的系统解析器按 RFC 6724 选，即加这个字段之前的行为。
+fn default_ip_strategy() -> String {
+    "auto".into()
+}
+
+/// 这里的数字是 **`MuxId` 的线上标识**（`wsieve_proto::hello::MuxId`），
+/// 不是「第几个」。三方 mux 全部换成自研 wsmux 之后，合法取值只剩
+/// `Wsmux = 0x01` 一个，因此这份默认值也只能是 `[1]`。
+///
+/// 这个列表里**绝不能出现非法值**：`ProxyForm` 添加服务器时从不写
+/// `mux-prefs`，于是每个从界面新建的出站都落到这个默认值上，下次启动
+/// `build_startup_plan` 转换失败、进程 `exit(2)`——用户只看到「加完服务器
+/// 后应用打不开了」。这个洞踩过两次：先是写成 `[0, 1, 2, 3, 4]`（0-based
+/// 序号，而 `0` 不是合法 `MuxId`），后是 mux 收敛成一种时漏改了这里，留下
+/// `[2, 1, 3, 4, 5]` 里的 2/3/4/5 四个已经不存在的 id。
+/// 守卫是 src-tauri 的 `the_crate_default_mux_prefs_are_all_valid_mux_ids`
+/// ——它是唯一同时看得到两个 crate 的地方。
 ///
 /// 顺序 = 偏好顺序，与 `bootstrap::load_cfg` 里 `WSIEVE_MUX_PREFS` 缺省时
-/// 那份 `[DEFAULT_MUX, Yamux, Muxado, Picomux, H2mux]` 逐项对齐
-/// （`DEFAULT_MUX` 是 `Smux`，见 `wsieve_xhttp`）——两条默认路径给出不同的
-/// 首选 mux，会让「同一份服务端，从配置起和从 env 起协商出的复用器不一样」。
+/// 那份 `[DEFAULT_MUX]` 逐项对齐（`DEFAULT_MUX` 就是 `Wsmux`，见
+/// `wsieve_xhttp`）——两条默认路径给出不同的首选 mux，会让「同一份服务端，
+/// 从配置起和从 env 起协商出的复用器不一样」。
 fn default_mux_prefs() -> Vec<u8> {
-    vec![2, 1, 3, 4, 5]
+    vec![1]
 }
 
 /// 代理组（设计文档「代理组与首页视图」§1）。

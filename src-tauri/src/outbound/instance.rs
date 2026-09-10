@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Notify;
 use wsieve_mux::stripe_runtime::{StripeCfg, StripeDialer};
 use wsieve_mux::{mux_factory, Mux, MuxStream};
-use wsieve_proto::hello::MuxId;
+use wsieve_proto::hello::{IpStrategy, MuxId};
 use wsieve_xhttp::client::{random_group_id, UpstreamCfg, XhttpConn};
 
 use crate::bridge::{TransportCore, WebViewTransport};
@@ -118,6 +118,11 @@ pub struct OutboundCfg {
     /// 才拿得到）；`Some(origin)` = 绝对 URL，跨域名靠服务端 CORS 放宽成立
     /// （见设计文档 §9.1 与 `docs/superpowers/spikes/2026-08-25-*`）。
     pub session_bases: Vec<Option<String>>,
+    /// 本出站的域名解析地址族偏好，随每条会话的 msg1 发给服务端。
+    ///
+    /// 逐出站而非全局：换一台服务器换一套出网环境，v6 出口通不通是**那台**
+    /// 服务器的属性。
+    pub ip_strategy: IpStrategy,
 }
 
 /// 把 JS 送进承载 WebView 的闭包：`(出站名, JS)`。
@@ -310,6 +315,8 @@ impl OutboundInstance {
             match attempt {
                 Ok((dialer, liveness)) => {
                     let sessions = dialer.session_count();
+                    // 先留一份用于观测 mux 死亡——下面要把 dialer 交出去。
+                    let watch = dialer.clone();
                     *self.dialer.write().unwrap() = Some(dialer);
                     self.set_status(&env, Status::Connected { sessions });
                     // 唤醒在 `wait_connected()` 上排队的分派请求。必须在装好
@@ -319,8 +326,28 @@ impl OutboundInstance {
 
                     // 等本出站的会话全部死掉（或被叫停/要求重连）。
                     // 注意不等 core —— core 的死亡由管理器感知并广播。
+                    //
+                    // **两个死亡信号缺一不可**，它们观测的是不同层：
+                    //
+                    // - `liveness.all_dead()` 看的是**传输层**（XhttpConn）。它靠
+                    //   `DeathWatch` 被 poll 到错误、或被 drop 来判定，因此只有
+                    //   当死亡源自 mux **下面**时才看得见。
+                    // - `watch.all_sessions_dead()` 看的是 **mux 自身**。mux 内部
+                    //   死亡时传输层可以完全健康，`DeathWatch` 于是既读不到错误
+                    //   也不会被 drop（mux 只退出了一部分内部循环，仍持有 io 的
+                    //   另一半）。
+                    //
+                    // 少了后者的实测后果：smux 的 keep-alive 超时只退出
+                    // `recv_loop`，`send_loop` 继续持有写半边 —— 出站永久停在
+                    // 「已连接」，全部新连接瞬间失败，而日志里**一个字都没有**。
                     tokio::select! {
                         _ = liveness.all_dead() => {}
+                        _ = watch.all_sessions_dead() => {
+                            tracing::warn!(
+                                "出站 {} 的全部 mux 会话已死（传输层可能仍存活），重建",
+                                self.cfg.name
+                            );
+                        }
                         _ = self.restart.notified() => {
                             tracing::info!("出站 {} 收到重连请求", self.cfg.name);
                         }
@@ -410,6 +437,7 @@ impl OutboundInstance {
                 client_priv: self.cfg.client_priv,
                 mux_prefs: self.cfg.mux_prefs.clone(),
                 group_id,
+                ip_strategy: self.cfg.ip_strategy,
             },
         )
         .await?;
@@ -476,6 +504,10 @@ impl OutboundInstance {
                 // 额外会话必须与主会话同一种 mux，不再重新协商。
                 mux_prefs: vec![mux_id],
                 group_id,
+                // 同一出站的全部会话必须报同一个策略：服务端按**会话**存这个
+                // 值，额外会话报 Auto 就等于同一出站里一半连接走 v6、一半走
+                // v4，故障只在部分请求上出现。
+                ip_strategy: self.cfg.ip_strategy,
             },
         )
         .await?;
@@ -631,8 +663,9 @@ mod tests {
             name: name.into(),
             server_pub: [1u8; 32],
             client_priv: [2u8; 32],
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None],
+            ip_strategy: IpStrategy::Auto,
         }
     }
 

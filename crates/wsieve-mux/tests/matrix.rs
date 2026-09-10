@@ -25,28 +25,8 @@ async fn stream_pair(client: &dyn Mux, server: &dyn Mux) -> (MuxStream, MuxStrea
 }
 
 async fn matrix(name: &str, id: MuxId) {
-    match id {
-        MuxId::Yamux => {
-            let (c, s) = make_pair(id).await;
-            open_and_echo(name, c, s).await;
-        }
-        MuxId::Smux => {
-            let (c, s) = make_pair(id).await;
-            open_and_echo(name, c, s).await;
-        }
-        MuxId::Muxado => {
-            let (c, s) = make_pair(id).await;
-            open_and_echo(name, c, s).await;
-        }
-        MuxId::Picomux => {
-            let (c, s) = make_pair(id).await;
-            open_and_echo(name, c, s).await;
-        }
-        MuxId::H2mux => {
-            let (c, s) = make_pair(id).await;
-            open_and_echo(name, c, s).await;
-        }
-    }
+    let (c, s) = make_pair(id).await;
+    open_and_echo(name, c, s).await;
 }
 
 // ---------- 用例 1：open + echo ----------
@@ -65,28 +45,8 @@ async fn open_and_echo(name: &str, client: Box<dyn Mux>, server: Box<dyn Mux>) {
 }
 
 #[tokio::test]
-async fn yamux_open_and_echo() {
-    matrix("yamux", MuxId::Yamux).await;
-}
-
-#[tokio::test]
-async fn smux_open_and_echo() {
-    matrix("smux", MuxId::Smux).await;
-}
-
-#[tokio::test]
-async fn muxado_open_and_echo() {
-    matrix("muxado", MuxId::Muxado).await;
-}
-
-#[tokio::test]
-async fn picomux_open_and_echo() {
-    matrix("picomux", MuxId::Picomux).await;
-}
-
-#[tokio::test]
-async fn h2mux_open_and_echo() {
-    matrix("h2mux", MuxId::H2mux).await;
+async fn wsmux_open_and_echo() {
+    matrix("wsmux", MuxId::Wsmux).await;
 }
 
 // ---------- 用例 2：32 条并发流，各写 4KB 独立模式 ----------
@@ -149,28 +109,8 @@ async fn concurrent_streams(name: &'static str, id: MuxId) {
 }
 
 #[tokio::test]
-async fn yamux_concurrent_streams() {
-    concurrent_streams("yamux", MuxId::Yamux).await;
-}
-
-#[tokio::test]
-async fn smux_concurrent_streams() {
-    concurrent_streams("smux", MuxId::Smux).await;
-}
-
-#[tokio::test]
-async fn muxado_concurrent_streams() {
-    concurrent_streams("muxado", MuxId::Muxado).await;
-}
-
-#[tokio::test]
-async fn picomux_concurrent_streams() {
-    concurrent_streams("picomux", MuxId::Picomux).await;
-}
-
-#[tokio::test]
-async fn h2mux_concurrent_streams() {
-    concurrent_streams("h2mux", MuxId::H2mux).await;
+async fn wsmux_concurrent_streams() {
+    concurrent_streams("wsmux", MuxId::Wsmux).await;
 }
 
 // ---------- 用例 3：慢流不饿死快流 ----------
@@ -245,28 +185,8 @@ async fn read_all(stream: &mut MuxStream, expect: usize) {
 }
 
 #[tokio::test]
-async fn yamux_slow_stream_does_not_starve_fast() {
-    slow_stream_does_not_starve_fast("yamux", MuxId::Yamux).await;
-}
-
-#[tokio::test]
-async fn smux_slow_stream_does_not_starve_fast() {
-    slow_stream_does_not_starve_fast("smux", MuxId::Smux).await;
-}
-
-#[tokio::test]
-async fn muxado_slow_stream_does_not_starve_fast() {
-    slow_stream_does_not_starve_fast("muxado", MuxId::Muxado).await;
-}
-
-#[tokio::test]
-async fn picomux_slow_stream_does_not_starve_fast() {
-    slow_stream_does_not_starve_fast("picomux", MuxId::Picomux).await;
-}
-
-#[tokio::test]
-async fn h2mux_slow_stream_does_not_starve_fast() {
-    slow_stream_does_not_starve_fast("h2mux", MuxId::H2mux).await;
+async fn wsmux_slow_stream_does_not_starve_fast() {
+    slow_stream_does_not_starve_fast("wsmux", MuxId::Wsmux).await;
 }
 
 // ---------- 用例 4：关闭传播 ----------
@@ -294,67 +214,11 @@ async fn close_propagates(name: &'static str, id: MuxId) {
 }
 
 #[tokio::test]
-async fn yamux_close_propagates() {
-    close_propagates("yamux", MuxId::Yamux).await;
-}
-
-#[tokio::test]
-async fn smux_close_propagates() {
-    close_propagates("smux", MuxId::Smux).await;
-}
-
-#[tokio::test]
-async fn muxado_close_propagates() {
-    close_propagates("muxado", MuxId::Muxado).await;
-}
-
-#[tokio::test]
-async fn picomux_close_propagates() {
-    close_propagates("picomux", MuxId::Picomux).await;
-}
-
-#[tokio::test]
-async fn h2mux_close_propagates() {
-    close_propagates("h2mux", MuxId::H2mux).await;
+async fn wsmux_close_propagates() {
+    close_propagates("wsmux", MuxId::Wsmux).await;
 }
 
 // ---------- h2mux 专项：发送窗口耗尽应挂起而非报错 ----------
 // 客户端写超过初始流控窗口的数据且服务端暂不读：write 必须挂起而非报错，
 // 窗口释放后数据完整到达。
 
-#[tokio::test]
-async fn h2mux_capacity_exhaustion_blocks_not_errors() {
-    use std::time::Duration;
-
-    let (client, server) = make_pair(MuxId::H2mux).await;
-    let (mut c, mut s) = stream_pair(client.as_ref(), server.as_ref()).await;
-
-    const LEN: usize = 512 * 1024; // 远超初始流控窗口
-    let data = pattern_for(7, LEN);
-
-    let writer = tokio::spawn(async move {
-        c.write_all(&data)
-            .await
-            .expect("write should block, not error");
-        c.shutdown().await.ok();
-    });
-
-    // 服务端先睡 300ms 再读——期间 writer 不应出错退出
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !writer.is_finished(),
-        "writer must still be pending on full window"
-    );
-
-    let mut got = 0usize;
-    let mut chunk = [0u8; 8192];
-    while got < LEN {
-        match s.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => got += n,
-            Err(e) => panic!("read error: {e}"),
-        }
-    }
-    assert_eq!(got, LEN, "all data after window release");
-    writer.await.expect("writer join");
-}

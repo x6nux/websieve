@@ -126,13 +126,13 @@ fn load_whitelist(path: &str) -> Result<HashSet<[u8; 32]>> {
 }
 
 fn enabled_mux() -> Vec<MuxId> {
-    // 全家桶启用（含 picomux：矩阵已验证互通）。
+    // 只剩一种 mux：wsmux。
     vec![
-        MuxId::Yamux,
-        MuxId::Smux,
-        MuxId::Muxado,
-        MuxId::Picomux,
-        MuxId::H2mux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
     ]
 }
 

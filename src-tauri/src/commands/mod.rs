@@ -110,7 +110,9 @@ impl From<wsieve_config::ConfigError> for CmdError {
             | wsieve_config::ConfigError::GroupNameCollidesWithOutbound(_)
             | wsieve_config::ConfigError::UnknownGroupMember { .. }
             | wsieve_config::ConfigError::SelectedNotAMember { .. }
-            | wsieve_config::ConfigError::BadEnumField { .. } => Self::ConfigInvalid {
+            | wsieve_config::ConfigError::BadEnumField { .. }
+            | wsieve_config::ConfigError::EmptyHostsKey
+            | wsieve_config::ConfigError::BadHostsValue { .. } => Self::ConfigInvalid {
                 message: e.to_string(),
             },
         }

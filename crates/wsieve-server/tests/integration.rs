@@ -65,11 +65,11 @@ async fn start_server() -> TestRig {
             whitelist,
         },
         vec![
-            MuxId::Yamux,
-            MuxId::Smux,
-            MuxId::Muxado,
-            MuxId::Picomux,
-            MuxId::H2mux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
         ],
         KeepaliveRange::default(),
         SEEN_CACHE_CAPACITY,
@@ -101,6 +101,7 @@ async fn connect_mux(
             client_priv: rig.client_priv,
             mux_prefs: prefs,
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await
@@ -149,14 +150,14 @@ async fn echo_roundtrip(
 }
 
 /// 服务端会话栈单元化诊断：握手后直接向 SessionStore 推一个手工加密的
-/// yamux 客户端首包，观察 mux factory 是否消费。
+/// 客户端首包，观察 mux factory 是否消费。
 /// 1. 完整握手 + mux 协商 + 开流 + 服务端拨号到本地 echo + 双向数据。
 #[tokio::test]
 async fn full_chain_echo() {
     let rig = start_server().await;
     let echo = echo_server().await;
-    let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
-    assert_eq!(chosen, MuxId::Yamux);
+    let (mux, chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
+    assert_eq!(chosen, MuxId::Wsmux);
     let got = echo_roundtrip(mux, echo, b"ping-over-full-chain").await;
     assert_eq!(got, b"ping-over-full-chain");
 }
@@ -166,11 +167,11 @@ async fn full_chain_echo() {
 async fn all_mux_matrix() {
     // 每种 mux 独立 rig：不同 mux 库的全局/后台任务行为互不干扰
     for id in [
-        MuxId::Yamux,
-        MuxId::Smux,
-        MuxId::Muxado,
-        MuxId::Picomux,
-        MuxId::H2mux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
     ] {
         let rig = start_server().await;
         run_one_mux(&rig, id).await;
@@ -191,7 +192,7 @@ async fn run_one_mux(rig: &TestRig, id: MuxId) {
 async fn upstream_64k_integrity() {
     let rig = start_server().await;
     let echo = echo_server().await;
-    let (mux, _chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
+    let (mux, _chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
     let payload: Vec<u8> = (0..80_000u32).map(|i| (i % 253) as u8).collect();
     let got = echo_roundtrip(mux, echo, &payload).await;
     assert_eq!(got.len(), payload.len());
@@ -209,8 +210,9 @@ async fn dead_session_detection() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await
@@ -294,15 +296,16 @@ async fn out_of_order_reorder() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await
     .unwrap();
-    assert_eq!(neg.mux_id, MuxId::Yamux);
+    assert_eq!(neg.mux_id, MuxId::Wsmux);
     let io: MuxStream = Box::new(conn);
-    let mux: std::sync::Arc<dyn Mux> = std::sync::Arc::from(mux_factory(MuxId::Yamux, io).await.unwrap());
+    let mux: std::sync::Arc<dyn Mux> = std::sync::Arc::from(mux_factory(MuxId::Wsmux, io).await.unwrap());
 
     // 连续多段写：聚合层会切成多个 POST（seq 递增），奇数延迟后到达序打乱
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 249) as u8).collect();
@@ -334,7 +337,8 @@ async fn probing_equivalence() {
             .unwrap()
             .as_millis() as u64,
         wsieve_xhttp::client::random_group_id(),
-        &[MuxId::Yamux],
+        &[MuxId::Wsmux],
+        wsieve_proto::hello::IpStrategy::Auto,
     );
     let mut buf = vec![0u8; 65535];
     let n = client.write_message(&hello, &mut buf).unwrap();
@@ -398,8 +402,8 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
     // notify_one 被无关会话读者抢走、目标会话永久沉睡的窗口。
     let mut sessions = Vec::new();
     for _ in 0..N {
-        let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
-        assert_eq!(chosen, MuxId::Yamux);
+        let (mux, chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
+        assert_eq!(chosen, MuxId::Wsmux);
         sessions.push(mux);
     }
     // 等待所有服务端读任务挂起（attach 完成、无数据可读）
@@ -483,8 +487,9 @@ async fn cors_headers_only_on_authenticated_responses() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Smux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await

@@ -133,17 +133,18 @@ pub fn load_cfg(config: &wsieve_config::Config) -> anyhow::Result<AppConfig> {
         Ok(s) => s
             .split(',')
             .map(|p| {
-                let id: u8 = p.trim().parse().expect("mux id 0-4");
-                MuxId::from_u8(id).expect("mux id 0-4")
+                let id: u8 = p.trim().parse().expect("mux id 必须是 MuxId 的线上标识");
+                MuxId::from_u8(id).expect("mux id 必须是 MuxId 的线上标识")
             })
             .collect(),
-        Err(_) => vec![
-            DEFAULT_MUX,
-            MuxId::Yamux,
-            MuxId::Muxado,
-            MuxId::Picomux,
-            MuxId::H2mux,
-        ],
+        // 三方 mux 全部换成自研 wsmux 之后偏好列表只剩一项。这里曾经是
+        // `[DEFAULT_MUX, Wsmux, Wsmux, Wsmux, Wsmux]` —— 批量替换留下的
+        // 五份同一个 id，协商时等于把同一个偏好重复发五遍。
+        //
+        // 与 `wsieve_config` 的 `default_mux_prefs`（`[1]`）逐项对齐：两条
+        // 默认路径给出不同的首选 mux，会让「同一份服务端，从配置起和从 env
+        // 起协商出的复用器不一样」。
+        Err(_) => vec![DEFAULT_MUX],
     };
     // 高端口：绑定 <1024 需要 root，而 hosts 已经要一次管理员权限了，
     // 不该再多要一个。对外仍然只走 :443，本地端口不出网。
@@ -210,10 +211,40 @@ pub fn inbound_bind_addr(listen: &str, allow_lan: bool) -> anyhow::Result<String
 pub fn loader_js() -> String {
     let b64 = crate::bridge::bs64_encode(EMITTER_JS.as_bytes());
     let b64_b64 = crate::bridge::bs64_encode(b64.as_bytes());
-    let js = format!(
-        r#"(function(){{var t=document.createElement('script');t.textContent=window.atob(window.atob('{b64_b64}'));(document.head||document.documentElement).appendChild(t);}})();"#
-    );
-    js
+    // 调优参数在 emitter **之前**注入。emitter 读不到就用自己的默认值，
+    // 所以这几个 env 不设时行为与改动前完全一致。
+    //
+    // 为什么走注入而不是改 emitter.js 里的常数：这些值需要按链路扫描
+    // （局域网 0.5ms RTT 与跨洲 66ms 的最优值差一个数量级），每扫一个点
+    // 都重编一次 release 要三分多钟，扫不动。
+    let tune = tune_js();
+    format!(
+        r#"(function(){{{tune}var t=document.createElement('script');t.textContent=window.atob(window.atob('{b64_b64}'));(document.head||document.documentElement).appendChild(t);}})();"#
+    )
+}
+
+/// 把 `WSIEVE_EMIT_*` 环境变量变成一段 `window.__wsieveTune = {...}`。
+fn tune_js() -> String {
+    let mut fields: Vec<String> = Vec::new();
+    for (env, key) in [
+        ("WSIEVE_EMIT_CHUNK", "chunkTarget"),
+        ("WSIEVE_EMIT_FLUSH_MS", "flushMs"),
+        ("WSIEVE_EMIT_IDLE_MS", "idleMs"),
+        ("WSIEVE_EMIT_PROBE_BELOW", "probeBelow"),
+        ("WSIEVE_EMIT_RAW", "raw"),
+        ("WSIEVE_EMIT_PIPELINE", "pipeline"),
+    ] {
+        if let Ok(v) = std::env::var(env) {
+            if let Ok(n) = v.parse::<u64>() {
+                fields.push(format!("{key}:{n}"));
+            }
+        }
+    }
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!("window.__wsieveTune={{{}}};", fields.join(","))
+    }
 }
 
 #[cfg(test)]

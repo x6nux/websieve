@@ -23,7 +23,7 @@
 //! （>15s 无 `wsieve_heartbeat`）→ 标记死亡 → 所有 pending waiter 立即
 //! 失败 → XhttpConn 会话死 → proxy.rs 重载页面重建（spec §9.1）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,6 +40,15 @@ type PendingPosts = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<anyhow::Result<P
 /// pending 流：request_id -> chunk 通道发送端。
 type PendingStreams = Arc<AsyncMutex<HashMap<u64, mpsc::Sender<anyhow::Result<Bytes>>>>>;
 
+/// 单条下行流的重排状态：下一个该下推的 seq，以及提前到达、正等缺口补齐的分片。
+///
+/// `BTreeMap` 而非 `HashMap`：重排只关心「最小的那个是不是我要的」，
+/// 有序容器让这个判断是 O(1) 而不用每次扫全表。
+struct StreamOrder {
+    next: u32,
+    held: BTreeMap<u32, Bytes>,
+}
+
 pub struct WebViewTransport {
     inner: Arc<TransportInner>,
 }
@@ -51,6 +60,9 @@ pub struct TransportCore {
     pending_streams: PendingStreams,
     dead: AtomicBool,
     last_heartbeat: Mutex<Instant>,
+    /// 下行分片重排状态（仅流水线模式用到；串行模式下 seq 恒为递增，
+    /// 走的是同一条路径，只是永远不会真的攒住东西）。
+    stream_order: AsyncMutex<HashMap<u64, StreamOrder>>,
 }
 
 impl TransportCore {
@@ -72,6 +84,7 @@ impl TransportCore {
             pending_streams: Arc::new(AsyncMutex::new(HashMap::new())),
             dead: AtomicBool::new(false),
             last_heartbeat: Mutex::new(at),
+            stream_order: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -119,8 +132,43 @@ impl TransportCore {
         }
     }
 
+    /// 带序号的分片：按 `seq` 还原成发送顺序后再下推。
+    ///
+    /// **为什么需要它**：emitter 侧串行 `await invoke()` 时，吞吐上限就是
+    /// 「批大小 ÷ IPC 往返」，与批里装什么无关——实测客户端 CPU 死死压在
+    /// 一个核上，正是这条串行链。放开成多个 invoke 同时在途能把往返的等待
+    /// 时间用起来，但 Tauri 不保证并发 invoke 的**完成顺序**，而下行是字节流，
+    /// 错一个位置整条 TLS 连接就废了。
+    ///
+    /// 所以顺序必须由我们自己保证：发送侧在帧头写单调递增的 seq，这里按
+    /// seq 重排。乱序到达的分片先攒着，等缺口补齐再一起下推。
+    pub async fn push_chunk_seq(&self, id: u64, seq: u32, chunk: Bytes) {
+        let mut ready: Vec<Bytes> = Vec::new();
+        {
+            let mut ord = self.stream_order.lock().await;
+            let st = ord.entry(id).or_insert_with(|| StreamOrder {
+                next: 0,
+                held: BTreeMap::new(),
+            });
+            if seq < st.next {
+                // 重复/过期分片：丢弃。发送侧不重发，走到这里说明帧被复制了。
+                return;
+            }
+            st.held.insert(seq, chunk);
+            while let Some(c) = st.held.remove(&st.next) {
+                ready.push(c);
+                st.next += 1;
+            }
+        }
+        for c in ready {
+            self.push_chunk(id, c).await;
+        }
+    }
+
     /// 流结束（Ok(None) 语义）或出错。
     pub async fn complete_stream(&self, id: u64, err: Option<anyhow::Error>) {
+        // 重排状态跟着流一起销毁：不清的话每条流都留一份，长跑必然泄漏。
+        self.stream_order.lock().await.remove(&id);
         let tx = self.pending_streams.lock().await.remove(&id);
         if let Some(tx) = tx {
             if let Some(e) = err {

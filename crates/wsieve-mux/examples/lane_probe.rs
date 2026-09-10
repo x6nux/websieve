@@ -1,4 +1,4 @@
-//! 诊断：内存 delay 管道上直接对比 yamux 单流 vs 多流吞吐。
+//! 诊断：内存 delay 管道上直接对比 wsmux 单流 vs 多流吞吐。
 //! 排除 XHTTP/Noise 层，隔离 mux 层车道并行度。
 
 use std::sync::Arc;
@@ -46,8 +46,8 @@ fn delay_pipe(rtt_ms: u64) -> (tokio::io::DuplexStream, tokio::io::DuplexStream)
 async fn main() -> anyhow::Result<()> {
     for n_streams in [1usize, 4] {
         let (ca, sa) = delay_pipe(80);
-        let client = Arc::new(mux_factory(wsieve_proto::hello::MuxId::Yamux, Box::new(ca)).await?);
-        let server = mux_server_factory(wsieve_proto::hello::MuxId::Yamux, Box::new(sa)).await?;
+        let client = Arc::new(mux_factory(wsieve_proto::hello::MuxId::Wsmux, Box::new(ca)).await?);
+        let server = mux_server_factory(wsieve_proto::hello::MuxId::Wsmux, Box::new(sa)).await?;
 
         tokio::spawn(async move {
             loop {
@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         }
         let elapsed = start.elapsed().as_secs_f64();
         let mbps = (total_per_stream * n_streams as u64) as f64 / elapsed / 1048576.0;
-        println!("yamux {n_streams} 流 × 8MB (echo): {mbps:.1} MB/s");
+        println!("wsmux {n_streams} 流 × 8MB (echo): {mbps:.1} MB/s");
     }
     Ok(())
 }

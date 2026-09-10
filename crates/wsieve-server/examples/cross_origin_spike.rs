@@ -389,7 +389,7 @@ async fn spawn_server(
 ) -> anyhow::Result<Arc<AppState>> {
     let state = AppState::new(
         keys,
-        vec![MuxId::Yamux, MuxId::Smux],
+        vec![MuxId::Wsmux, MuxId::Wsmux],
         KeepaliveRange::default(),
         SEEN_CACHE_CAPACITY,
     );
@@ -424,8 +424,9 @@ async fn connect_session(
         &UpstreamCfg {
             server_pub,
             client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id,
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await

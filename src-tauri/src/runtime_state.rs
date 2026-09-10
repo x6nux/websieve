@@ -327,6 +327,84 @@ fn rule_lines_with_reject_fallback(config: &wsieve_config::Config) -> Vec<String
     }
 }
 
+/// 判决路径的解析器链 + 供转发改写用的 hosts 表。
+///
+/// 链的形状固定是 `HostsResolver(DnsResolver | NoResolver)`：hosts 永远叠在
+/// 最外层，命中就不查 DNS——用户写这张表就是不想让这个域名走解析器。
+///
+/// **不返回 `Result`**：DNS 配错了不该让整个应用起不来。上游非法、列表为空
+/// 之类一律降级成 `NoResolver` 并告警，此时 IP 类规则对域名目标不命中
+/// （§6.2 的既有语义），代理照常可用。反过来让启动失败的话，用户改坏一行
+/// `nameserver` 就再也打不开应用，连改回去的界面都进不去。
+///
+/// hosts 表即使为空也照样返回：`Router::with_hosts` 拿到空表是无操作，
+/// 而调用方不必写分支。
+pub fn build_resolver(
+    config: &wsieve_config::Config,
+    resolving_rule_count: usize,
+) -> (
+    std::sync::Arc<dyn wsieve_dns::RoutingResolver>,
+    std::sync::Arc<wsieve_dns::Hosts>,
+) {
+    let (hosts, rejected) = wsieve_dns::Hosts::build(
+        config
+            .hosts
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+    );
+    for r in &rejected {
+        // Config::validate 已经拦过一道，走到这里说明两处对「什么算合法」
+        // 的看法不一致——那是 bug，不能静默跳过。
+        tracing::warn!("hosts 条目被丢弃：{r}");
+    }
+    if !hosts.is_empty() {
+        tracing::info!("hosts 静态解析表已装载：{} 条", hosts.len());
+    }
+
+    let base: std::sync::Arc<dyn wsieve_dns::RoutingResolver> = if !config.dns.enable {
+        // 用户显式关的，不必告警成「故障」，但覆盖面缺失仍要说清楚。
+        if resolving_rule_count > 0 {
+            tracing::warn!(
+                "dns.enable 为 false：{resolving_rule_count} 条 IP 类规则（GEOIP / IP-CIDR）\
+                 对**域名**目标不会命中，这类流量会落到后续规则或 MATCH 兜底。"
+            );
+        }
+        std::sync::Arc::new(crate::router::NoResolver)
+    } else {
+        match wsieve_dns::DnsResolver::new(
+            &config.dns.nameserver,
+            std::time::Duration::from_millis(config.dns.timeout_ms),
+            config.dns.cache.max as u64,
+            std::time::Duration::from_secs(config.dns.cache.negative_ttl_s),
+        ) {
+            Ok(r) => {
+                tracing::info!(
+                    "内部 DNS 解析器就绪：{} 个上游，超时 {}ms",
+                    config.dns.nameserver.len(),
+                    config.dns.timeout_ms
+                );
+                std::sync::Arc::new(r)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "DNS 解析器构建失败（{e}），降级为不解析：\
+                     {resolving_rule_count} 条 IP 类规则对域名目标不会命中。代理本身不受影响。"
+                );
+                std::sync::Arc::new(crate::router::NoResolver)
+            }
+        }
+    };
+
+    let hosts = std::sync::Arc::new(hosts);
+    let resolver: std::sync::Arc<dyn wsieve_dns::RoutingResolver> = if hosts.is_empty() {
+        // 空表就不套壳：多一层间接调用换不来任何行为。
+        base
+    } else {
+        std::sync::Arc::new(wsieve_dns::HostsResolver::new(hosts.clone(), base))
+    };
+    (resolver, hosts)
+}
+
 /// `shard` 必须与 `config.proxies` **按下标一一对应**（`plan_many` 的契约
 /// 就是这样，见 `ShardManyPlan::entries`）。长度对不上时报错而非按短的那个
 /// 截断：截断意味着有出站会拿到别人的会话基址，流量发去另一台服务器
@@ -399,12 +477,24 @@ pub fn build_startup_plan(
             .base_for(&p.name)
             .ok_or_else(|| anyhow::anyhow!("承载计划里没有出站「{}」", p.name))?;
 
+        // 未知写法必须报错。悄悄退回 auto 的话，用户配了 v4-only、流量照旧
+        // 走 IPv6，而两端日志都显示一切正常——这正是 §6.4 要挡的静默改道。
+        let ip_strategy = wsieve_proto::hello::IpStrategy::parse(&p.ip_strategy)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "出站「{}」的 ip-strategy「{}」无法识别，合法取值：auto / v4-only / v6-only / prefer-v4",
+                    p.name,
+                    p.ip_strategy
+                )
+            })?;
+
         outbound_cfgs.push(crate::outbound::instance::OutboundCfg {
             name: p.name.clone(),
             server_pub,
             client_priv,
             mux_prefs,
             session_bases,
+            ip_strategy,
         });
     }
 
@@ -467,7 +557,8 @@ mod next_state_tests {
             server_pub: "11".repeat(32),
             client_priv: "22".repeat(32),
             extra_sessions: 0,
-            mux_prefs: vec![1, 2, 3, 4, 5],
+            mux_prefs: vec![1],
+            ip_strategy: "auto".to_string(),
         }
     }
 
@@ -629,11 +720,13 @@ mod startup_plan_tests {
             server_pub: server_pub.to_string(),
             client_priv: client_priv.to_string(),
             extra_sessions: 0,
-            // 有效的 MuxId 取值（0x01..=0x05），不是 wsieve-config 的
-            // `default_mux_prefs()`——见下面
-            // `a_proxy_using_the_crate_default_mux_prefs_currently_fails_to_convert`
-            // 里对那个默认值的单独记录。
-            mux_prefs: vec![1, 2, 3, 4, 5],
+            // 有效的 MuxId 取值。三方 mux 换成自研 wsmux 之后只剩
+            // `Wsmux = 0x01` 一个，因此这里与 wsieve-config 的
+            // `default_mux_prefs()` 恰好同值——但两者仍是**各写各的**：
+            // 默认值本身归 `the_crate_default_mux_prefs_are_all_valid_mux_ids`
+            // 守，这里只是给这些测试一份合法输入。
+            mux_prefs: vec![1],
+            ip_strategy: "auto".to_string(),
         }
     }
 
@@ -680,6 +773,91 @@ mod startup_plan_tests {
         assert!(plan.carrier.is_none(), "空出站不该调 CarrierPlan::build");
     }
 
+    /// 坏掉的 DNS 配置**不能让应用起不来**。用户改坏一行 `nameserver` 就
+    /// 再也打不开界面的话，他连改回去的地方都进不去。
+    ///
+    /// 这里逐个喂进真实会被 `parse_nameserver` 拒掉的写法，断言全部降级
+    /// 而非 panic/退出。
+    #[test]
+    fn a_broken_dns_config_degrades_instead_of_failing_startup() {
+        for bad in [
+            vec![],                                    // 空列表
+            vec!["not a url".to_string()],             // 语法垃圾
+            vec!["https://example.com/dns-query".to_string()], // 域名而非 IP（纪律②）
+        ] {
+            let mut cfg = wsieve_config::Config::default();
+            cfg.dns.nameserver = bad.clone();
+            let (_resolver, hosts) = build_resolver(&cfg, 3);
+            assert!(hosts.is_empty(), "没配 hosts 就该是空表");
+            // 走到这里没 panic 即通过——降级本身在日志里，不在返回值里。
+        }
+    }
+
+    /// `dns.enable: false` 是用户显式关掉，同样降级而不是报错。
+    #[test]
+    fn disabling_dns_is_honoured() {
+        let mut cfg = wsieve_config::Config::default();
+        cfg.dns.enable = false;
+        let (_r, hosts) = build_resolver(&cfg, 0);
+        assert!(hosts.is_empty());
+    }
+
+    /// hosts 表要真的从配置装进来，并且**同一张表**既回给调用方（转发用）
+    /// 又叠进解析器（判决用）。
+    #[tokio::test]
+    async fn hosts_feed_both_the_forwarding_table_and_the_resolver() {
+        let mut cfg = wsieve_config::Config::default();
+        cfg.hosts
+            .insert("Pinned.Example".into(), "1.2.3.4".into());
+        // 上游故意配坏，逼底层降级成 NoResolver——这样解析器返回的任何
+        // 非空结果都只可能来自 hosts，断言才有意义。
+        cfg.dns.nameserver = vec![];
+        let (resolver, hosts) = build_resolver(&cfg, 0);
+
+        // 转发那一半：大小写归一后能查到。
+        assert_eq!(
+            hosts.lookup("pinned.example"),
+            Some("1.2.3.4".parse().unwrap())
+        );
+        // 判决那一半：解析器直接吐出 hosts 里的值。
+        assert_eq!(
+            resolver.resolve("pinned.example").await,
+            vec!["1.2.3.4".parse::<std::net::IpAddr>().unwrap()]
+        );
+        // 未命中的仍走下游（此处是 NoResolver）→ 空。
+        assert!(resolver.resolve("other.example").await.is_empty());
+    }
+
+    /// 配置里的 `ip-strategy` 要真的落到 `OutboundCfg` 上，而且是**逐出站**
+    /// 的——两个出站配不同策略，各拿各的。共用一个值的话，用户给某一台配
+    /// v4-only 会把所有服务器一起改掉。
+    #[test]
+    fn ip_strategy_is_parsed_per_outbound() {
+        let mut a = proxy("A", &valid_pub(), &valid_priv());
+        a.ip_strategy = "v4-only".into();
+        let mut b = proxy("B", &valid_pub(), &valid_priv());
+        b.ip_strategy = "prefer-v4".into();
+        let plan = plan_of(&config_with(vec![a, b])).unwrap();
+        use wsieve_proto::hello::IpStrategy;
+        assert_eq!(plan.outbound_cfgs[0].ip_strategy, IpStrategy::V4Only);
+        assert_eq!(plan.outbound_cfgs[1].ip_strategy, IpStrategy::PreferV4);
+        // 省略时是 auto，即加这个字段之前的行为。
+        let plan = plan_of(&config_with(vec![proxy("C", &valid_pub(), &valid_priv())])).unwrap();
+        assert_eq!(plan.outbound_cfgs[0].ip_strategy, IpStrategy::Auto);
+    }
+
+    /// 拼错要报错并点名出站，**不能静默退回 auto**：那样用户配的 v4-only
+    /// 不生效而流量照旧走 IPv6，两端日志都显示一切正常。
+    #[test]
+    fn an_unknown_ip_strategy_is_an_error_naming_the_outbound() {
+        let mut p = proxy("日本节点", &valid_pub(), &valid_priv());
+        p.ip_strategy = "ipv4".into();
+        let e = plan_of(&config_with(vec![p])).unwrap_err().to_string();
+        assert!(e.contains("日本节点"), "要点名是哪个出站：{e}");
+        assert!(e.contains("ipv4"), "要点名冒犯的值：{e}");
+        assert!(e.contains("v4-only"), "要列出合法取值：{e}");
+    }
+
     #[test]
     fn a_single_proxy_is_hex_decoded_into_the_outbound_cfg() {
         let cfg = config_with(vec![proxy("A", &valid_pub(), &valid_priv())]);
@@ -689,7 +867,7 @@ mod startup_plan_tests {
         assert_eq!(ob.name, "A");
         assert_eq!(ob.server_pub, [0x11u8; 32]);
         assert_eq!(ob.client_priv, [0x22u8; 32]);
-        assert_eq!(ob.mux_prefs.len(), 5);
+        assert_eq!(ob.mux_prefs.len(), 1, "mux 收敛成 wsmux 一种后偏好列表只有一项");
         // extra_sessions 默认 0 ⇒ 只有主会话
         assert_eq!(ob.session_bases, vec![None]);
     }
@@ -883,7 +1061,7 @@ mod startup_plan_tests {
              \x20\x20\x20\x20url: https://a.example/\n\
              \x20\x20\x20\x20server-pub: \"{}\"\n\
              \x20\x20\x20\x20client-priv: \"{}\"\n\
-             \x20\x20\x20\x20mux-prefs: [1, 2, 3, 4, 5]\n\
+             \x20\x20\x20\x20mux-prefs: [1]\n\
              rules:\n\
              \x20\x20- DOMAIN,a.com,A\n\
              \x20\x20- MATCH,A\n",
@@ -937,8 +1115,9 @@ mod tests {
             name: name.into(),
             server_pub: [1u8; 32],
             client_priv: [2u8; 32],
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None],
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         }
     }
 

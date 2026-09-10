@@ -609,8 +609,9 @@ mod tests {
             name: "宿主".into(),
             server_pub: [7u8; 32],
             client_priv: [9u8; 32],
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![plan.base_for("宿主").unwrap()],
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         });
         let a2 = a.clone();
         let core2 = core.clone();

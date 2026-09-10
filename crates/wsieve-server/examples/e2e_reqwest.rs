@@ -45,10 +45,10 @@ async fn main() -> anyhow::Result<()> {
     let mux_prefs = std::env::var("WSIEVE_E2E_MUX")
         .ok()
         .and_then(|m| wsieve_proto::hello::MuxId::from_u8(match m.as_str() {
-            "smux" => 0x02, "muxado" => 0x03, "picomux" => 0x04, "h2mux" => 0x05, _ => 0x01,
+            _ => 0x01, // 只剩 wsmux 一种
         }))
         .map(|m| vec![m])
-        .unwrap_or_else(|| vec![wsieve_proto::hello::MuxId::Yamux]);
+        .unwrap_or_else(|| vec![wsieve_proto::hello::MuxId::Wsmux]);
     let (conn, neg) = XhttpConn::connect(
         transport,
         &UpstreamCfg {
@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
             client_priv,
             mux_prefs: mux_prefs.clone(),
             group_id,
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         },
     )
     .await?;
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
                 client_priv,
                 mux_prefs: mux_prefs.clone(),
                 group_id,
+                ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
             },
         )
         .await?;

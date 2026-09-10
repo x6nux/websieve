@@ -7,6 +7,10 @@ edition = "2021"
 wsieve-proto = { path = "../wsieve-proto" }
 wsieve-transport = { path = "../wsieve-transport" }
 tokio = { workspace = true }
+# 只为 `sync::PollSender`：`AsyncWrite::poll_write` 必须在通道满时注册 waker，
+# 而 `mpsc::Sender` 只给得出 `try_send`（不注册）或 `reserve()`（async，
+# 在 poll 上下文里用不了）。已在 lock 里（传递依赖），不新增下载。
+tokio-util = "0.7"
 bytes = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

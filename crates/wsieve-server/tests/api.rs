@@ -11,7 +11,7 @@ use base64::Engine;
 use futures::StreamExt;
 use rand::RngCore;
 use wsieve_proto::crypto::{build_client, gen_keypair};
-use wsieve_proto::hello::{decode_msg2, encode_msg1, MuxId};
+use wsieve_proto::hello::{IpStrategy, decode_msg2, encode_msg1, MuxId};
 use wsieve_proto::tu::{decode_frame, Frame};
 use wsieve_server::{AppState, KeepaliveRange, ServerKeys, SEEN_CACHE_CAPACITY};
 use wsieve_xhttp::server::Sid;
@@ -33,7 +33,7 @@ async fn start_server(seen_capacity: usize, keepalive: KeepaliveRange) -> TestSe
             priv_key: server_priv,
             whitelist,
         },
-        vec![MuxId::Yamux, MuxId::Smux],
+        vec![MuxId::Wsmux, MuxId::Wsmux],
         keepalive,
         seen_capacity,
     );
@@ -72,7 +72,7 @@ fn make_msg1(
     ts_ms: u64,
 ) -> (Vec<u8>, snow::HandshakeState, Sid, String) {
     let mut client = build_client(&ts.server_pub, &ts.client_priv).unwrap();
-    let hello = encode_msg1(ts_ms, wsieve_xhttp::client::random_group_id(), &[MuxId::Smux, MuxId::Yamux]);
+    let hello = encode_msg1(ts_ms, wsieve_xhttp::client::random_group_id(), &[MuxId::Wsmux, MuxId::Wsmux], IpStrategy::Auto);
     let mut buf = vec![0u8; 65535];
     let n = client.write_message(&hello, &mut buf).unwrap();
     let mut tu = Vec::with_capacity(2 + n);
@@ -137,7 +137,7 @@ async fn valid_handshake_returns_msg2() {
     let mut plain = vec![0u8; 65535];
     let n = client.read_message(msg2_cipher, &mut plain).unwrap();
     let msg2 = decode_msg2(&plain[..n]).unwrap();
-    assert_eq!(msg2.chosen_mux_id, MuxId::Smux);
+    assert_eq!(msg2.chosen_mux_id, MuxId::Wsmux);
     assert!(!msg2.fallback);
 }
 

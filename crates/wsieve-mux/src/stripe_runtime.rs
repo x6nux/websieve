@@ -23,6 +23,7 @@ use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::Sender;
+use tokio::sync::Notify;
 
 use crate::{Mux, MuxStream};
 use wsieve_proto::addr::{decode_addr, AddrPort};
@@ -457,7 +458,6 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
             b.extend_from_slice(&e);
         }
     }
-    let mut chunk = vec![0u8; CHUNK + 64];
     loop {
         // 解析缓冲内所有完整帧
         loop {
@@ -479,8 +479,14 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
                             let _ = b.split_to(HEADER_LEN + 9);
                             let mut st = inner.recv.lock().unwrap();
                             apply_close(&mut st, final_off, reason);
+                            // CLOSE 只是宣告总长度，**不等于** conn 结束：别的
+                            // lane 上可能还有分片在路上，甚至还有中途加入的
+                            // lane 没登记进来。这里就终结的话，注册表清理任务
+                            // 会立刻把 conn 摘掉，那些 lane 回来时无处认领，
+                            // 它们携带的数据就永久丢了。数据到齐才是收尾时机。
+                            maybe_finish(&inner, &mut st);
+                            wake_reader(&mut st);
                             drop(st);
-                            inner.mark_recv_terminal();
                             continue; // 其它 lane 可能还有数据；本 lane 读到 EOF 为止
                         }
                         break;
@@ -494,9 +500,18 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
             }
             match decode_frame(&b) {
                 Ok(Some((off, payload, used))) => {
-                    let payload = Bytes::copy_from_slice(payload);
-                    let _ = b.split_to(used);
-                    feed(&inner, off, payload);
+                    // `decode_frame` 返回的 payload 是 `b` 的一段借用视图。旧代码
+                    // 在这里 `Bytes::copy_from_slice` 把它整个抄一遍——满速下这是
+                    // 一条与链路等速的 memcpy 带宽，剖析里 `_platform_memmove`
+                    // 的大头。改成先量出它在 `b` 里的位置，再把整帧 `split_to`
+                    // 走、`freeze` 成 `Bytes` 后切片：切片只加一次引用计数，零拷贝。
+                    //
+                    // 注意 `off` 是**流内逻辑偏移**（重组用），跟 payload 在缓冲里
+                    // 的位置是两回事，不能混用。
+                    let at = payload.as_ptr() as usize - b.as_ptr() as usize;
+                    let len = payload.len();
+                    let frame = b.split_to(used).freeze();
+                    feed(&inner, off, frame.slice(at..at + len));
                 }
                 Ok(None) => break,
                 Err(e) => {
@@ -513,39 +528,82 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
                 }
             }
         }
-        // 补充字节
-        match r.read(&mut chunk).await {
+        // 补充字节。
+        //
+        // 直接读进重组缓冲，不经中转数组。旧代码是 `read(&mut chunk)` 再
+        // `extend_from_slice(&chunk[..n])`——那等于给每一个过路字节都加了一次
+        // 完整的 memcpy，满速下就是一条与链路等宽的额外拷贝带宽。`read_buf`
+        // 直接写进 `BytesMut` 的未初始化尾部，省掉的正是这一次。
+        b.reserve(CHUNK + 64);
+        match r.read_buf(&mut b).await {
             Ok(0) | Err(_) => {
                 lane_eof(&inner);
                 return;
             }
-            Ok(n) => b.extend_from_slice(&chunk[..n]),
+            Ok(_) => {}
         }
     }
 }
 
-/// 一条入站 lane 结束；最后一条 lane 结束时终结整条接收方向状态。
+/// 一条中途加入的 DOWN lane，从被 accept 到走完 `join_inbound` 登记进
+/// `live_lanes`，中间有一段它还"不存在"的窗口。这个常量就是留给那段窗口的。
+const LANE_JOIN_GRACE: Duration = Duration::from_millis(300);
+
+/// 一条入站 lane 结束。
+///
+/// 注意终结判据不是"所有 lane 都 EOF"——那只说明**已知的** lane 没数据了，
+/// 不说明数据不会再来。条带允许对端中途加 lane，那条 lane 携带的分片完全可能
+/// 在现有 lane 全部收尾之后才落地。判据是"数据到齐"，够不着时才退回到
+/// "等一个宽限窗口仍然没有进展"。
 fn lane_eof(inner: &Arc<ConnInner>) {
     let mut st = inner.recv.lock().unwrap();
     st.live_lanes = st.live_lanes.saturating_sub(1);
-    if st.live_lanes == 0 {
-        inner.mark_recv_terminal();
-        if let Some((final_off, _)) = st.closed {
-            if st.contig < final_off && st.failed.is_none() {
-                st.failed = Some(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "stripe conn ended with gap: delivered {}, final {}",
-                        st.contig, final_off
-                    ),
-                ));
-            }
-        } else if st.failed.is_none() {
-            // 对端没发 CLOSE 就全断了：已交付的内容按 EOF 处理（尽力而为）
-            st.closed = Some((st.contig, CloseReason::TargetEof));
-        }
+    if st.live_lanes > 0 {
+        wake_reader(&mut st);
+        return;
     }
-    wake_reader(&mut st);
+    // 数据已齐，或对端压根没告诉过我们总长度：都可以当场收尾。
+    let gap = matches!(st.closed, Some((final_off, _)) if st.contig < final_off);
+    if !gap {
+        finish_recv(inner, &mut st);
+        wake_reader(&mut st);
+        return;
+    }
+    drop(st);
+
+    let inner = inner.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(LANE_JOIN_GRACE).await;
+        let mut st = inner.recv.lock().unwrap();
+        if st.live_lanes > 0 {
+            // 宽限期内真的有新 lane 加进来了，终结判定交给它结束时那一轮。
+            return;
+        }
+        finish_recv(&inner, &mut st);
+        wake_reader(&mut st);
+    });
+}
+
+/// 收尾接收方向：要么认定 EOF，要么认定缺口错误。
+fn finish_recv(inner: &Arc<ConnInner>, st: &mut RecvState) {
+    // 这里不去看 `recv_terminated` 提前返回：那个标志别处也会置，一旦提前返回，
+    // 下面的缺口判定就永远不会执行，读者既等不到数据也等不到错误，只能挂死。
+    // 幂等性由各分支自己的 `failed.is_none()` / `closed` 判断保证。
+    inner.mark_recv_terminal();
+    if let Some((final_off, _)) = st.closed {
+        if st.contig < final_off && st.failed.is_none() {
+            st.failed = Some(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "stripe conn ended with gap: delivered {}, final {}",
+                    st.contig, final_off
+                ),
+            ));
+        }
+    } else if st.failed.is_none() {
+        // 对端没发 CLOSE 就全断了：已交付的内容按 EOF 处理（尽力而为）。
+        st.closed = Some((st.contig, CloseReason::TargetEof));
+    }
 }
 
 /// 重组喂入：空洞缓存 + 连续推进；重叠帧按已有内容优先。
@@ -578,7 +636,19 @@ fn feed(inner: &Arc<ConnInner>, off: u64, payload: Bytes) {
         let _ = payload;
     }
     // off < contig && end <= contig：完全重复，丢弃
+    // CLOSE 可能早于最后一批数据到达，补齐的这一刻就是收尾时机——
+    // 走到这里就不必再等 lane EOF 和宽限窗口了。
+    maybe_finish(inner, &mut st);
     wake_reader(&mut st);
+}
+
+/// 数据已达对端宣告的总长度时收尾接收方向。未收到 CLOSE 或仍有缺口则什么都不做。
+fn maybe_finish(inner: &Arc<ConnInner>, st: &mut RecvState) {
+    if let Some((final_off, _)) = st.closed {
+        if st.contig >= final_off {
+            finish_recv(inner, st);
+        }
+    }
 }
 
 // ---------------- 发送任务 ----------------
@@ -634,6 +704,19 @@ async fn send_task(
                 mark_dead(&inner);
                 return;
             }
+            // 升级判定必须在分发**之前**。已经写出去的字节没法回收重分，等一批
+            // 发完再加 lane，只会得到几条永远分不到数据的空 lane——上游一次
+            // `write_all` 就可能把整段流量变成一个队列项，那一项发完时"已发送
+            // 字节"才第一次越过阈值，而此时已经无货可分了。判据因此用**含这一批
+            // 在内**的累计量。
+            maybe_upgrade(
+                &mut lanes,
+                &inner,
+                send_dir,
+                sent + bytes.len() as u64,
+                start,
+            )
+            .await;
             let mut off = up_off;
             // 并行分发：每条 lane 攒好自己的帧批次，然后各 lane 的写入并发执行
             // （join_all + 每批次 move 进独立 future）。串行 await 会让窗口满的
@@ -694,14 +777,10 @@ async fn send_task(
             }
             up_off = off;
             sent += bytes.len() as u64;
-            maybe_upgrade(
-                &mut lanes,
-                &inner,
-                send_dir,
-                sent,
-                start,
-            )
-            .await;
+            // 批后再查一次。批前那次可能因为 `upgrade_window` 还没跨过而放弃，
+            // 而窗口往往正是在发这一批的过程中跨过的；少了这次兜底，升级会被
+            // 推迟到下一批到来，短流量下就等于永不升级。`maybe_upgrade` 幂等。
+            maybe_upgrade(&mut lanes, &inner, send_dir, sent, start).await;
         }
         // 2. 判断是否收尾
         let (closing, _reason) = {
@@ -1036,9 +1115,44 @@ pub struct StripeDialer {
     cfg: StripeCfg,
     next_conn_id: Arc<AtomicU64>,
     registry: Arc<ConnRegistry>,
+    /// 还活着的会话数。**必须与 `sessions` 的长度分开记**：`sessions` 刻意
+    /// 保留最后一个死条目（好让 `connect` 干净失败而不是对空 vec 取模 panic），
+    /// 所以它的长度永远 ≥ 1，读不出「全死了」。
+    live_sessions: AtomicUsize,
+    /// 最后一条会话死亡时触发一次。
+    all_dead: Notify,
 }
 
 impl StripeDialer {
+    /// 等到本拨号器的**全部** mux 会话都死掉。
+    ///
+    /// 这是 `prune_session` 注释里那句「由外层代理重连循环负责重建会话」
+    /// 缺失的另一半：会话死亡此前只被记在 `sessions` 表里，没有任何出口
+    /// 通知外层，于是 mux 内部死亡（如 smux 的 keep-alive 超时只退出
+    /// `recv_loop`、`send_loop` 仍持有写半边）时，代理层的 `DeathWatch`
+    /// 既不会被 poll 到错误、也不会被 drop——出站永久停在「已连接」，
+    /// 全部新连接瞬间失败，且**一条日志都没有**。
+    pub async fn all_sessions_dead(&self) {
+        loop {
+            // 先登记再检查：反过来的话，两步之间到来的通知会被永久错过。
+            let notified = self.all_dead.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.live_sessions.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 一条会话的 accept 循环退出即为该会话死亡。只减一次由调用方保证
+    /// （每个 accept 循环只会走到 `Err` 分支一次，随后 `return`）。
+    fn mark_session_dead(&self) {
+        if self.live_sessions.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.all_dead.notify_waiters();
+        }
+    }
+
     pub fn dbg_conn(&self, id: u64) -> Option<Arc<StripeConn>> {
         self.registry.get(id)
     }
@@ -1120,6 +1234,8 @@ impl StripeDialer {
             }
             s.push(mux.clone());
         }
+        // 挂载成功才计数，与下面 accept 循环退出时的减一严格配对。
+        self.live_sessions.fetch_add(1, Ordering::AcqRel);
         let d = self.clone();
         tokio::spawn(async move {
             loop {
@@ -1129,6 +1245,7 @@ impl StripeDialer {
                     // 继续把 lane 往死会话上开。
                     Err(_) => {
                         d.prune_session(&mux);
+                        d.mark_session_dead();
                         return;
                     }
                 };
@@ -1155,6 +1272,9 @@ impl StripeDialer {
                 (rand::random::<u32>() as u64) << 32 | 1,
             )),
             registry: Arc::new(ConnRegistry::new()),
+            // 主会话即第一条存活会话。
+            live_sessions: AtomicUsize::new(1),
+            all_dead: Notify::new(),
         });
         // 后台 accept：服务端发起的 DOWN lane 归并；未知 conn / 非 OPEN → 丢流
         let d = dialer.clone();
@@ -1167,6 +1287,7 @@ impl StripeDialer {
                     Err(_) => {
                         let primary = d.mux.clone();
                         d.prune_session(&primary);
+                        d.mark_session_dead();
                         return;
                     }
                 };

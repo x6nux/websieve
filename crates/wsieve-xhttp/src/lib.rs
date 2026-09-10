@@ -13,4 +13,4 @@ use wsieve_proto::hello::MuxId;
 /// 极差更小，且全程零失败。yamux 仍是无交集时的协商回退基线（§7.5，
 /// 线格式跨语言），两者职责不同：DEFAULT_MUX 是偏好列表首位，回退基线
 /// 是协议底线。
-pub const DEFAULT_MUX: MuxId = MuxId::Smux;
+pub const DEFAULT_MUX: MuxId = MuxId::Wsmux;

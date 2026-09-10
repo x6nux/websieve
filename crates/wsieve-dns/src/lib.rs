@@ -9,11 +9,13 @@
 //! 这类规则对域名目标生效。那是内部查询，不是对外服务。
 
 pub mod decide;
+pub mod hosts;
 pub mod inject;
 pub mod resolver;
 pub mod upstream;
 
 pub use decide::{decide, Outcome};
+pub use hosts::{Hosts, HostsResolver};
 pub use inject::RoutingResolver;
 pub use resolver::{bootstrap, bootstrap_with, DnsResolver, ResolverError};
 pub use upstream::{parse_nameserver, UpstreamError};

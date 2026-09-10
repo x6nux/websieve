@@ -91,6 +91,12 @@ pub struct Router {
     /// 出站名 → 实例。BTreeMap 让诊断输出的顺序稳定。
     outbounds: BTreeMap<String, Arc<OutboundInstance>>,
     resolver: Arc<dyn RoutingResolver>,
+    /// 静态解析表。判决那一半已经叠在 `resolver` 里（`HostsResolver`），
+    /// 这份是给**转发**用的：判决完成后把域名目标换成 IP 字面量。
+    ///
+    /// 两处必须是同一张表。各持一份的话，用户改了 hosts 后可能出现
+    /// 「规则按新 IP 判、连接却发去旧 IP」这种只在改配置那一瞬间存在的错位。
+    hosts: Arc<wsieve_dns::Hosts>,
     start_wait: Duration,
 }
 
@@ -106,8 +112,21 @@ impl Router {
             geo,
             outbounds,
             resolver,
+            hosts: Arc::new(wsieve_dns::Hosts::default()),
             start_wait: DEFAULT_START_WAIT,
         }
+    }
+
+    /// 装上静态解析表，供**转发**改写用。
+    ///
+    /// 判决那一半不在这里——它靠把 `HostsResolver` 传给 `new` 的 `resolver`
+    /// 参数完成。做成两步而不是一个参数，是因为这两半的接线点本就不同：
+    /// 判决那半要包在解析器链里，转发这半只是查表。硬塞进一个构造参数会让
+    /// 调用方以为「传了就两边都生效」，而实际上漏掉哪一半都不会报错。
+    /// 唯一的生产接线点是 `runtime_state::build_router`，它两半一起装。
+    pub fn with_hosts(mut self, hosts: Arc<wsieve_dns::Hosts>) -> Self {
+        self.hosts = hosts;
+        self
     }
 
     /// 用 `NoResolver` 构造，并如实告警覆盖面。
@@ -121,6 +140,12 @@ impl Router {
     /// 启动配置目前是环境变量式的，没有 `dns.nameserver` 可读，硬编一个
     /// 上游等于替用户决定他的 DNS 走谁。等阶段 4 接入配置文件后，这里改成
     /// `Self::new(.., Arc::new(DnsResolver::new(&cfg.dns.nameserver, ..)?))`。
+    /// 逐项 `allow(dead_code)`：上面那段「等阶段 4 接入配置文件」已经发生了
+    /// ——生产路径现在走的是真实 `DnsResolver`，只剩 `runtime_state` 的测试
+    /// 辅助 `snapshot` 还在用它。保留而不删：它承载的「没有解析器时必须把
+    /// 覆盖面缺失说出来」那条纪律仍然有效，将来任何一条重新走无解析器的
+    /// 路径都该从这里进。整模块 allow 会连真正的死代码一起盖住，所以逐项标。
+    #[allow(dead_code)]
     pub fn without_resolver(
         rules: Arc<RuleSet>,
         geo: Arc<GeoDb>,
@@ -151,6 +176,7 @@ impl Router {
             geo: self.geo.clone(),
             outbounds: self.outbounds.clone(),
             resolver: self.resolver.clone(),
+            hosts: self.hosts.clone(),
             start_wait: self.start_wait,
         }
     }
@@ -195,15 +221,60 @@ impl Router {
         target: AddrPort,
     ) -> io::Result<(DuplexStream, Outcome)> {
         let routed = self.decide(&target).await;
+        // **判决之后**才改写。反过来的话目标已是 IP，DOMAIN-SUFFIX /
+        // DOMAIN-KEYWORD 这类规则会集体不命中，而配置两边看着都对。
+        //
+        // 拒绝分支的错误信息仍用原始 `target`：用户写的是域名，报「1.2.3.4
+        // 被规则拒绝」他根本对不上是哪个请求。
+        let dialed = self.apply_hosts(&target);
+        // 建连耗时按判决分开记：卡在这里说明是「开隧道」慢，卡在别处说明是
+        // 隧道建好之后的数据搬运慢。两者的排查方向完全不同。
+        let t0 = std::time::Instant::now();
         let stream = match &routed.decision {
             Decision::Reject => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 format!("{} 被规则拒绝", target.display()),
             )),
-            Decision::Direct => direct_connect(&target).await,
-            Decision::Outbound(name) => self.via_outbound(name, &target).await,
-        }?;
-        Ok((stream, routed))
+            Decision::Direct => direct_connect(&dialed).await,
+            Decision::Outbound(name) => self.via_outbound(name, &dialed).await,
+        };
+        let took = t0.elapsed();
+        match &stream {
+            Ok(_) if took > std::time::Duration::from_secs(1) => tracing::warn!(
+                target = %target.display(), decision = ?routed.decision, ?took,
+                "建连异常慢"
+            ),
+            Ok(_) => tracing::debug!(
+                target = %target.display(), decision = ?routed.decision, ?took, "建连"
+            ),
+            Err(e) => tracing::warn!(
+                target = %target.display(), decision = ?routed.decision, ?took,
+                error = %e, "建连失败"
+            ),
+        }
+        Ok((stream?, routed))
+    }
+
+    /// 命中 hosts 的域名目标换成 IP 字面量；其余原样返回。
+    ///
+    /// 端口不动——hosts 是「这个名字对应哪个地址」，与端口无关。
+    fn apply_hosts(&self, target: &AddrPort) -> AddrPort {
+        let TargetAddr::Domain(d) = &target.addr else {
+            // 目标本来就是 IP：hosts 无从插手。按表里的某条把它换掉就是
+            // 改掉调用方明确指定的地址（§6.4 的静默改道）。
+            return target.clone();
+        };
+        let Some(ip) = self.hosts.lookup(d) else {
+            return target.clone();
+        };
+        tracing::debug!("hosts 命中：{d} → {ip}");
+        AddrPort {
+            addr: match ip {
+                std::net::IpAddr::V4(v4) => TargetAddr::V4(v4.octets()),
+                std::net::IpAddr::V6(v6) => TargetAddr::V6(v6.octets()),
+            },
+            port: target.port,
+        }
     }
 
     /// §6.4 的落地点。这个函数里**没有**、也绝不能有「换一个出站」的分支。
@@ -347,8 +418,9 @@ mod tests {
             name: name.into(),
             server_pub: [1u8; 32],
             client_priv: [2u8; 32],
-            mux_prefs: vec![wsieve_proto::hello::MuxId::Yamux],
+            mux_prefs: vec![wsieve_proto::hello::MuxId::Wsmux],
             session_bases: vec![None],
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         })
     }
 
@@ -360,6 +432,71 @@ mod tests {
             BTreeMap::new(),
             Arc::new(NoResolver),
         )
+    }
+
+    fn hosts_of(pairs: &[(&str, &str)]) -> Arc<wsieve_dns::Hosts> {
+        let (h, rejected) = wsieve_dns::Hosts::build(pairs.iter().copied());
+        assert!(rejected.is_empty(), "测试数据本身写错了：{rejected:?}");
+        Arc::new(h)
+    }
+
+    /// 命中 hosts 的域名目标在**建连前**被换成 IP 字面量；端口不动。
+    #[test]
+    fn apply_hosts_rewrites_a_hit_and_keeps_the_port() {
+        let r = test_router(&["MATCH,DIRECT"]).with_hosts(hosts_of(&[("pinned.example", "1.2.3.4")]));
+        let got = r.apply_hosts(&domain("pinned.example", 8443));
+        assert_eq!(got.addr, TargetAddr::V4([1, 2, 3, 4]));
+        assert_eq!(got.port, 8443, "hosts 管的是名字对应哪个地址，与端口无关");
+    }
+
+    #[test]
+    fn apply_hosts_handles_ipv6_values() {
+        let r = test_router(&["MATCH,DIRECT"]).with_hosts(hosts_of(&[("v6.example", "2001:db8::1")]));
+        let got = r.apply_hosts(&domain("v6.example", 443));
+        let expected: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert_eq!(got.addr, TargetAddr::V6(expected.octets()));
+    }
+
+    #[test]
+    fn apply_hosts_leaves_a_miss_untouched() {
+        let r = test_router(&["MATCH,DIRECT"]).with_hosts(hosts_of(&[("pinned.example", "1.2.3.4")]));
+        let t = domain("other.example", 443);
+        assert_eq!(r.apply_hosts(&t).addr, t.addr);
+    }
+
+    /// 目标本来就是 IP 时 hosts 不插手——按表里的某条把它换掉就是改掉
+    /// 调用方明确指定的地址（§6.4 的静默改道）。
+    #[test]
+    fn apply_hosts_never_touches_a_literal_ip_target() {
+        let r = test_router(&["MATCH,DIRECT"]).with_hosts(hosts_of(&[("1.2.3.4", "9.9.9.9")]));
+        let t = AddrPort {
+            addr: TargetAddr::V4([1, 2, 3, 4]),
+            port: 443,
+        };
+        assert_eq!(r.apply_hosts(&t).addr, TargetAddr::V4([1, 2, 3, 4]));
+    }
+
+    /// **判决必须在改写之前**。这条是整个 hosts 设计的支点：反过来的话
+    /// 目标已是 IP，DOMAIN 类规则会集体不命中，而两边配置各自看着都对。
+    ///
+    /// 这里直接对 `decide()` 断言——它拿的是原始域名目标，与 hosts 无关。
+    #[tokio::test]
+    async fn domain_rules_still_match_when_hosts_would_rewrite_the_target() {
+        let r = test_router(&["DOMAIN-SUFFIX,example.com,REJECT", "MATCH,DIRECT"])
+            .with_hosts(hosts_of(&[("www.example.com", "1.2.3.4")]));
+        let t = domain("www.example.com", 443);
+        assert!(
+            matches!(r.decide(&t).await.decision, Decision::Reject),
+            "判决要看域名；若先改写成 1.2.3.4，这条 DOMAIN-SUFFIX 规则就不命中了"
+        );
+    }
+
+    /// 没配 hosts 时 `apply_hosts` 是纯粹的恒等——空表不该有任何行为。
+    #[test]
+    fn an_empty_hosts_table_is_the_identity() {
+        let r = test_router(&["MATCH,DIRECT"]);
+        let t = domain("anything.example", 80);
+        assert_eq!(r.apply_hosts(&t).addr, t.addr);
     }
 
     /// 规则指向一个**存在但停着**的出站。

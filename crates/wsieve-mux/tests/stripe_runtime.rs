@@ -125,7 +125,7 @@ fn pattern(len: usize) -> Vec<u8> {
 /// 1. 单 lane（不升级）双向 echo。
 #[tokio::test]
 async fn single_lane_roundtrip() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     start_server_side(server, test_cfg()).await;
     let dialer = StripeDialer::new(client, test_cfg());
     let port = echo_server().await.unwrap();
@@ -152,10 +152,15 @@ async fn multi_lane_striped_8mb() {
         target_lanes: 4,
         upgrade_bytes: 64 * 1024,
         upgrade_rate_bps: 1,
-        upgrade_window: Duration::from_millis(1),
+        // 窗口设 0，本例才测得到它真正要测的东西——字节的**分布**。
+        // 用非零窗口会让结果取决于"发完 8MB 有没有比窗口慢"：内存 duplex 上
+        // 一毫秒就能发完，于是永远不升级，分布退化成 [8MB, 0, 0, 0]，
+        // 看起来像分布坏了，实际只是快到不需要加 lane。窗口计时本身由
+        // `upgrade_to_target_lanes` 覆盖。
+        upgrade_window: Duration::ZERO,
         extra_sessions: 0,
     };
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     start_server_side(server, cfg.clone()).await;
     let dialer = StripeDialer::new(client, cfg.clone());
     let port = echo_server().await.unwrap();
@@ -204,7 +209,7 @@ async fn read_exact_timeout(
 /// mux 流以乱序 offset 发帧，读取方应得到顺序流）。
 #[tokio::test]
 async fn out_of_order_reassembly() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
 
     // 手工服务端：accept 首 lane（OPEN+addr），读出 addr，然后乱序发两个
     // DataFrame：offset=CHUNK 的分片先发，offset=0 的后发，再发 CLOSE。
@@ -263,7 +268,7 @@ async fn out_of_order_reassembly() {
 /// 继续发（无 CLOSE），重组仍连续。
 #[tokio::test]
 async fn lane_join_mid_stream() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let server = Arc::new(server);
 
     let sv = server.clone();
@@ -325,7 +330,7 @@ async fn lane_join_mid_stream() {
 /// 5. CLOSE 缺口：final_offset 超过实际交付 → 读取方报错而非挂死。
 #[tokio::test]
 async fn close_with_gap_errors() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let server_task = tokio::spawn(async move {
         use wsieve_proto::stripe::*;
         let mut lane1 = server.accept().await.unwrap();
@@ -385,7 +390,7 @@ async fn close_with_gap_errors() {
 /// 6. 未知 conn_id 的入站流 → 客户端丢弃（不 panic，不影响既有 conn）。
 #[tokio::test]
 async fn unknown_conn_inbound_dropped() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let dialer = StripeDialer::new(client.clone(), test_cfg());
     let port = echo_server().await.unwrap();
     // conn 保持存活即可（本例断言的是 ghost 流不影响它），无需读写
@@ -393,7 +398,9 @@ async fn unknown_conn_inbound_dropped() {
 
     // 服务端先 accept 我们的 lane（保持 conn 活跃），再主动开一条未知
     // conn_id 的流
-    let sv = Arc::new(server);
+    // mux 句柄必须活过整个用例：最后一个 `Arc<dyn Mux>` 消失时会话就会收摊，
+    // 把句柄 move 进一个写完就结束的任务，等于让会话在断言之前先自杀。
+    let sv = server.clone();
     let t = tokio::spawn(async move {
         let mut lane = sv.accept().await.unwrap();
         // 只挂着不动（echo 服务器端由前几个测试的路径负责；这里无需泵）
@@ -427,7 +434,7 @@ async fn unknown_conn_inbound_dropped() {
 async fn join_inbound_routes_and_drops() {
     let registry = Arc::new(ConnRegistry::new());
     // 构造一条手工 lane：OPEN conn_id=7
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let c = Arc::new(client);
     let writer = tokio::spawn({
         let c = c.clone();
@@ -454,8 +461,10 @@ async fn join_inbound_routes_and_drops() {
 /// 8. 服务端 route_inbound：非 OPEN 首帧（DATA）→ 丢弃。
 #[tokio::test]
 async fn server_rejects_non_open_first_frame() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
-    let c = Arc::new(client);
+    let (client, server) = make_pair(MuxId::Wsmux).await;
+    // mux 句柄必须活过整个用例：最后一个 `Arc<dyn Mux>` 消失时会话就会收摊，
+    // 把句柄 move 进一个写完就结束的任务，等于让会话在断言之前先自杀。
+    let c = client.clone();
     let writer = tokio::spawn(async move {
         let mut stream: MuxStream = c.open().await.unwrap();
         let hdr = wsieve_proto::stripe::encode_header(&wsieve_proto::stripe::ConnHeader {
@@ -493,7 +502,7 @@ async fn upgrade_to_target_lanes() {
         extra_sessions: 0,
     };
     // 双端都开自动升级：客户端上行触发其侧 add lane；这里只验证客户端侧。
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     start_server_side(server, cfg.clone()).await;
     let dialer = StripeDialer::new(client, cfg.clone());
     let port = echo_server().await.unwrap();
@@ -593,8 +602,8 @@ async fn multi_session_striping() {
         upgrade_window: Duration::from_millis(1),
         extra_sessions: 0,
     };
-    let (c1, s1) = make_pair(MuxId::Yamux).await;
-    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let (c1, s1) = make_pair(MuxId::Wsmux).await;
+    let (c2, s2) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
     tokio::spawn(serve_session(s2, cfg.clone(), registry.clone()));
@@ -627,8 +636,8 @@ fn dialer_pick(d: &Arc<StripeDialer>) -> Arc<dyn Mux> {
 #[tokio::test]
 async fn session_death_conn_survives_via_other_session() {
     let cfg = test_cfg();
-    let (c1, s1) = make_pair(MuxId::Yamux).await;
-    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let (c1, s1) = make_pair(MuxId::Wsmux).await;
+    let (c2, s2) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
     // 死会话：服务端不开 accept 泵 → 该会话空闲即断
@@ -659,8 +668,8 @@ async fn multi_session_lane_distribution() {
         upgrade_window: Duration::from_millis(1),
         extra_sessions: 0,
     };
-    let (c1, s1) = make_pair(MuxId::Yamux).await;
-    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let (c1, s1) = make_pair(MuxId::Wsmux).await;
+    let (c2, s2) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     let n1 = Arc::new(AtomicUsize::new(0));
     let n2 = Arc::new(AtomicUsize::new(0));
@@ -700,7 +709,7 @@ async fn dead_mux(id: MuxId) -> Arc<dyn Mux> {
 /// 改为 AppState 级全局表，没有显式清理 = 每条 conn 永久泄漏。
 #[tokio::test]
 async fn server_registry_drains_after_conn_ends() {
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     let cfg = test_cfg();
     tokio::spawn(serve_session(server, cfg.clone(), registry.clone()));
@@ -742,10 +751,10 @@ async fn server_registry_drains_after_conn_ends() {
 #[tokio::test]
 async fn connect_retries_past_dead_session() {
     let cfg = test_cfg();
-    let (c1, s1) = make_pair(MuxId::Yamux).await;
+    let (c1, s1) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     tokio::spawn(serve_session(s1, cfg.clone(), registry.clone()));
-    let c2 = dead_mux(MuxId::Yamux).await;
+    let c2 = dead_mux(MuxId::Wsmux).await;
 
     let dialer = StripeDialer::new(c1, cfg);
     assert!(dialer.attach_session(c2));
@@ -804,8 +813,8 @@ async fn group_opener_spreads_down_lanes_across_sessions() {
         upgrade_window: Duration::from_millis(1),
         extra_sessions: 0,
     };
-    let (c1, s1) = make_pair(MuxId::Yamux).await;
-    let (c2, s2) = make_pair(MuxId::Yamux).await;
+    let (c1, s1) = make_pair(MuxId::Wsmux).await;
+    let (c2, s2) = make_pair(MuxId::Wsmux).await;
 
     // 服务端：两个会话共享 registry，且同属一个会话组。
     let registry = Arc::new(ConnRegistry::new());
@@ -863,8 +872,8 @@ async fn group_opener_spreads_down_lanes_across_sessions() {
 #[tokio::test]
 async fn session_group_lifecycle() {
     let groups = SessionGroups::new();
-    let (_c1, s1) = make_pair(MuxId::Yamux).await;
-    let (_c2, s2) = make_pair(MuxId::Yamux).await;
+    let (_c1, s1) = make_pair(MuxId::Wsmux).await;
+    let (_c2, s2) = make_pair(MuxId::Wsmux).await;
     let gid = 42u128;
     let g = groups.join(gid, &s1);
     groups.join(gid, &s2);
@@ -882,7 +891,7 @@ async fn session_group_lifecycle() {
     assert_eq!(groups.len(), 0, "组空后条目必须删除，否则表无限增长");
 
     // Weak 语义：不 leave 而直接释放 mux，成员也应自动失效
-    let (_c3, s3) = make_pair(MuxId::Yamux).await;
+    let (_c3, s3) = make_pair(MuxId::Wsmux).await;
     let g2 = groups.join(7, &s3);
     assert_eq!(g2.len(), 1);
     drop(s3);
@@ -899,7 +908,7 @@ async fn group_of_one_behaves_like_single_session() {
         upgrade_window: Duration::from_millis(1),
         extra_sessions: 0,
     };
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
     let registry = Arc::new(ConnRegistry::new());
     let groups = SessionGroups::new();
     let g = groups.join(1, &server);
@@ -938,7 +947,7 @@ async fn upload_bytes_spread_across_lanes() {
         upgrade_window: Duration::from_millis(1),
         extra_sessions: 0,
     };
-    let (client, server) = make_pair(MuxId::Yamux).await;
+    let (client, server) = make_pair(MuxId::Wsmux).await;
 
     // 每条 lane 一个计数器：accept 到就一直读到 EOF，累计字节数。
     let per_lane: Arc<std::sync::Mutex<Vec<Arc<AtomicU64>>>> =
@@ -1003,4 +1012,97 @@ async fn upload_bytes_spread_across_lanes() {
         "升级后各 lane 应大致均分（非首 lane min={rmin} max={rmax}），\
          total={total} 实际分布 {counts:?}"
     );
+}
+
+// ---------------- mux 自身死亡的外泄信号 ----------------
+
+/// accept 可控失败的假 mux：模拟「mux 内部死了，但底下的传输完全健康」。
+///
+/// 这不是为了方便才造的假件——真实里这正是 smux 的 keep-alive 超时形态：
+/// 它只退出 `recv_loop`，`send_loop` 仍持有 io 的写半边，于是代理层套在 io
+/// 外面的 `DeathWatch` 既读不到错误、也不会被 drop。用真 mux 复现不了这个
+/// 形态，因为 duplex 两端一断两边都塌。
+struct AcceptDiesOnCue {
+    die: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Mux for AcceptDiesOnCue {
+    async fn open(&self) -> anyhow::Result<MuxStream> {
+        anyhow::bail!("本假件不用于 open")
+    }
+    async fn accept(&self) -> anyhow::Result<MuxStream> {
+        self.die.notified().await;
+        anyhow::bail!("mux 已死")
+    }
+}
+
+fn dying_mux() -> (Arc<dyn Mux>, Arc<tokio::sync::Notify>) {
+    let die = Arc::new(tokio::sync::Notify::new());
+    (
+        Arc::new(AcceptDiesOnCue { die: die.clone() }) as Arc<dyn Mux>,
+        die,
+    )
+}
+
+/// 主会话死亡必须外泄成一个**可等待**的信号。
+///
+/// 少了它，代理的重连循环永远等不到死亡通知，出站停在「已连接」而全部新
+/// 连接瞬间失败，且没有任何日志——实测过的真实故障。
+#[tokio::test]
+async fn a_dead_primary_session_surfaces_as_an_awaitable_signal() {
+    let (mux, die) = dying_mux();
+    let dialer = StripeDialer::new(mux, test_cfg());
+
+    // 还活着时绝不能触发：误报会让健康的会话被反复重建。
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), dialer.all_sessions_dead())
+            .await
+            .is_err(),
+        "会话还活着就报了死亡"
+    );
+
+    die.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), dialer.all_sessions_dead())
+        .await
+        .expect("主会话死了，信号必须在有限时间内触发");
+}
+
+/// **死一条不算死**：多会话下只有最后一条也死了才触发。
+/// 早触发会把还能用的会话一起拆掉重建。
+#[tokio::test]
+async fn one_dead_session_out_of_two_does_not_fire_the_signal() {
+    let (primary, die_primary) = dying_mux();
+    let (extra, die_extra) = dying_mux();
+    let dialer = StripeDialer::new(primary, test_cfg());
+    assert!(dialer.attach_session(extra), "额外会话应当挂载成功");
+    assert_eq!(dialer.session_count(), 2);
+
+    die_primary.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), dialer.all_sessions_dead())
+            .await
+            .is_err(),
+        "还剩一条活会话就报了全死"
+    );
+
+    die_extra.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), dialer.all_sessions_dead())
+        .await
+        .expect("最后一条也死了，信号必须触发");
+}
+
+/// 信号已经触发之后再等，必须**立即**返回而不是挂住。
+/// `Notify::notify_waiters` 只唤醒当时已在等的人，先检查后等待的写法会在
+/// 这里永久挂起——而重连循环恰好是「先干别的、再回来等」的模式。
+#[tokio::test]
+async fn the_signal_is_level_triggered_not_edge_triggered() {
+    let (mux, die) = dying_mux();
+    let dialer = StripeDialer::new(mux, test_cfg());
+    die.notify_one();
+    // 先让死亡发生且无人等待
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(2), dialer.all_sessions_dead())
+        .await
+        .expect("死亡已成事实，事后再等必须立刻返回");
 }

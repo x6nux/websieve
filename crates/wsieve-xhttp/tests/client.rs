@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use wsieve_proto::crypto::{build_server, gen_keypair};
-use wsieve_proto::hello::{encode_msg2, Msg2, MuxId};
+use wsieve_proto::hello::{IpStrategy, encode_msg2, Msg2, MuxId};
 use wsieve_proto::tu::{Frame, MAX_PAYLOAD};
 use wsieve_transport::{HttpTransport, PostReply};
 use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
@@ -100,7 +100,7 @@ impl HttpTransport for FakeTransport {
             server.read_message(&msg1_cipher, &mut buf)?;
 
             let msg2 = encode_msg2(&Msg2 {
-                chosen_mux_id: MuxId::Yamux,
+                chosen_mux_id: MuxId::Wsmux,
                 fallback: false,
             });
             let mut out = vec![0u8; 65535];
@@ -170,8 +170,9 @@ async fn make_pair(
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
     };
     let (conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
     (t, conn)
@@ -229,8 +230,9 @@ async fn handshake_garbage_reply_kills() {
         &UpstreamCfg {
             server_pub,
             client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
         },
     )
     .await;
@@ -289,7 +291,7 @@ async fn write_frames_become_tus() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -327,8 +329,9 @@ async fn write_frames_become_tus() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
     };
     let (mut conn, _neg) = XhttpConn::connect(rt.clone(), &cfg).await.unwrap();
 
@@ -391,7 +394,7 @@ async fn window_capped_at_8() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -437,8 +440,9 @@ async fn window_capped_at_8() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
     };
     let (mut conn, _neg) = XhttpConn::connect(st.clone(), &cfg).await.unwrap();
 
@@ -537,7 +541,7 @@ async fn downlink_frames_flow() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -596,8 +600,9 @@ async fn downlink_frames_flow() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
     };
     let (mut conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
 
@@ -636,7 +641,7 @@ async fn idle_heartbeat_sends_padding() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -674,8 +679,9 @@ async fn idle_heartbeat_sends_padding() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
     };
     let (conn, _neg) = XhttpConn::connect(ht.clone(), &cfg).await.unwrap();
 
@@ -699,3 +705,4 @@ async fn idle_heartbeat_sends_padding() {
     assert!(saw_padding, "at least one PADDING TU in idle heartbeat");
     drop(conn);
 }
+

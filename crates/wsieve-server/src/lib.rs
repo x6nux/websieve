@@ -32,7 +32,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 use wsieve_proto::crypto::build_server;
-use wsieve_proto::hello::{decode_msg1, encode_msg2, ts_in_window, MuxId, Msg2, TS_WINDOW_MS};
+use wsieve_proto::hello::{IpStrategy, decode_msg1, encode_msg2, ts_in_window, MuxId, Msg2, TS_WINDOW_MS};
 use wsieve_xhttp::server::{SessionStore, Sid};
 
 /// spec §6.3：已见 msg1 缓存默认容量 4096，条目寿命 = ts 窗口时长。
@@ -407,7 +407,7 @@ async fn handshake(
     let (dl_tx, dl_rx) = mpsc::channel::<Bytes>(256);
     state.downlink_tx.lock().await.insert(sid, dl_tx.clone());
     state.downlink_rx.lock().await.insert(sid, dl_rx);
-    spawn_session(state.clone(), sid, chosen, transport, msg1.group_id);
+    spawn_session(state.clone(), sid, chosen, transport, msg1.group_id, msg1.ip_strategy);
 
     // 200 + TU(msg2)。
     let mut resp_body = Vec::with_capacity(2 + msg2_cipher.len());
@@ -458,6 +458,170 @@ async fn attach(state: &Arc<AppState>, sid: Sid, method: &str, path: &str) -> Re
         .unwrap()
 }
 
+/// 下行合并的效果计数：发出的 HTTP chunk 数、这些 chunk 由多少次 read 拼成、
+/// 总字节。`WSIEVE_DL_STATS=<n>` 时每 n 个 chunk 往 stderr 打一行。
+///
+/// 存在的理由是「合并率不能靠猜」：reads/chunks 这个比值直接就是平均每个
+/// chunk 并进了几次 read，1.0 就是压根没合并上。
+static DL_CHUNKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DL_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static DL_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn dl_stats_every() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WSIEVE_DL_STATS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// 下行泵单次 read 的上限，等于 dl duplex 的缓冲大小。
+const DL_READ_CHUNK: usize = 65536;
+/// 合并后单个 HTTP chunk 的字节上限。取值等于 [`DL_READ_CHUNK`]，于是批量
+/// 下载（一次 read 就填满）走不进合并分支，半点额外调度都不加。
+const DL_MERGE_MAX: usize = DL_READ_CHUNK;
+
+/// 合并最多让出几轮调度。`WSIEVE_DL_MERGE_ROUNDS`，0 = 关闭合并。
+///
+/// 用「让出轮次」而不是「等多少微秒」当旋钮，是因为定时窗口对**孤立**小包
+/// 是纯亏：那种场景下续读必然空手而归，等的每一微秒都原样计进 P50。让出一
+/// 轮的代价只有一次任务重排（微秒级），而且空手就立刻收手——爆发期自动多攒
+/// 几轮，安静期一轮都不多花，不需要任何时钟。
+const DL_MERGE_ROUNDS_DEFAULT: usize = 4;
+
+/// 硬等待窗口，`WSIEVE_DL_MERGE_US`，默认 0（不等）。
+///
+/// 让出轮次拿不到的那部分 TU，只能靠真的等。这条路拿延迟换 CPU：实测 400µs
+/// 能把两端 CPU 各砍三成，代价是并发 P50 涨 1ms。默认关，留给 CPU 吃紧的
+/// 部署自己开。
+fn dl_merge_cfg() -> (usize, u64) {
+    static V: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let rounds = std::env::var("WSIEVE_DL_MERGE_ROUNDS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DL_MERGE_ROUNDS_DEFAULT);
+        let us = std::env::var("WSIEVE_DL_MERGE_US")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        (rounds, us)
+    })
+}
+
+/// 非阻塞地把 duplex 里此刻**已有**的字节续读进 `agg`。返回续读成功的次数。
+///
+/// 用 `poll_fn` 手动 poll 一次而不是 `read().await`：后者没数据就会挂起，
+/// 那正是要避开的——这里要的是"有就拿，没有立刻走"。
+async fn drain_ready(
+    src: &mut tokio::io::DuplexStream,
+    agg: &mut bytes::BytesMut,
+    scratch: &mut [u8],
+) -> usize {
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::io::{AsyncRead, ReadBuf};
+    std::future::poll_fn(move |cx| {
+        let mut got = 0usize;
+        while agg.len() < DL_MERGE_MAX {
+            let cap = scratch.len().min(DL_MERGE_MAX - agg.len());
+            let mut rb = ReadBuf::new(&mut scratch[..cap]);
+            match Pin::new(&mut *src).poll_read(cx, &mut rb) {
+                Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    if n == 0 {
+                        break; // EOF：留给下一轮阻塞 read 去发现并收尾
+                    }
+                    agg.extend_from_slice(rb.filled());
+                    got += 1;
+                }
+                // 出错同样交给下一轮阻塞 read 处理，这里只管别把已攒的丢了
+                Poll::Ready(Err(_)) | Poll::Pending => break,
+            }
+        }
+        Poll::Ready(got)
+    })
+    .await
+}
+
+/// 把「此刻前后几十微秒内的多个下行 TU」收进同一个 HTTP chunk。返回续读次数。
+///
+/// 不合并的话，并发小包时每个响应的 TU 各自成一个 chunk：客户端要多一次
+/// WebKit 分片交付、多走一轮 emitter 循环、多一次 IPC。客户端 emitter 已有
+/// 一个"让出一轮问问还有没有下一片"的探测，但让出一轮之后 WebKit 往往还
+/// 没来得及交付——在服务端合并才是治本的位置。
+///
+/// TU 自带 2 字节长度前缀，客户端 `TuDecoder` 本来就按前缀拆，一个 body 里
+/// 塞多少个 TU 都认（上行早就这么干了），所以协议侧零改动。
+async fn merge_downlink(
+    src: &mut tokio::io::DuplexStream,
+    agg: &mut bytes::BytesMut,
+    scratch: &mut [u8],
+) -> usize {
+    let (rounds, window_us) = dl_merge_cfg();
+    // 批量下载：首次 read 已填满，合并无从谈起，直接走。
+    if rounds == 0 || agg.len() >= DL_MERGE_MAX {
+        return 0;
+    }
+    // 让出一轮，给同 runtime 上已就绪的 mux/noise 任务一个把各自 TU 写进
+    // duplex 的机会——它们和本任务往往只差几十微秒。还有货就再让一轮：
+    // 「还在出货就继续攒」本身就是自适应，空手一轮立刻收手。
+    let mut extra = 0;
+    for _ in 0..rounds {
+        tokio::task::yield_now().await;
+        let got = drain_ready(src, agg, scratch).await;
+        extra += got;
+        if got == 0 || agg.len() >= DL_MERGE_MAX {
+            break;
+        }
+    }
+    // 让出轮次够不着的那批，只能真的等。默认关（window_us = 0）。
+    if extra > 0 && window_us > 0 && agg.len() < DL_MERGE_MAX {
+        tokio::time::sleep(Duration::from_micros(window_us)).await;
+        extra += drain_ready(src, agg, scratch).await;
+    }
+    extra
+}
+
+/// 下行泵：dl 管道的密文 TU 字节 → GET 响应通道，一次 send 就是一个 HTTP
+/// chunk。通道满 = 背压 = mux 写停滞，这是有意的。
+///
+/// 字节流语义必须原样保持：TU 靠 2 字节长度前缀自定界，合并只改变「多少
+/// 字节挤进同一个 chunk」，绝不能丢字节、乱序或重复。
+async fn downlink_pump(mut src: tokio::io::DuplexStream, tx: mpsc::Sender<Bytes>) {
+    use tokio::io::AsyncReadExt as _;
+    let mut scratch = vec![0u8; DL_READ_CHUNK];
+    let mut agg = bytes::BytesMut::with_capacity(DL_MERGE_MAX);
+    loop {
+        let n = match src.read(&mut scratch).await {
+            Ok(0) | Err(_) => break, // 会话任务退出（mux 关闭）
+            Ok(n) => n,
+        };
+        agg.extend_from_slice(&scratch[..n]);
+        let merged = merge_downlink(&mut src, &mut agg, &mut scratch).await;
+        let every = dl_stats_every();
+        if every > 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            DL_READS.fetch_add(1 + merged, Relaxed);
+            DL_BYTES.fetch_add(agg.len(), Relaxed);
+            let c = DL_CHUNKS.fetch_add(1, Relaxed) + 1;
+            if c % every == 0 {
+                eprintln!(
+                    "dl_stats chunks={c} reads={} bytes={} reads_per_chunk={:.2}",
+                    DL_READS.load(Relaxed),
+                    DL_BYTES.load(Relaxed),
+                    DL_READS.load(Relaxed) as f64 / c as f64,
+                );
+            }
+        }
+        if tx.send(agg.split().freeze()).await.is_err() {
+            return; // GET 断开
+        }
+    }
+}
+
 /// 会话任务（Task 15 全栈接线）：SessionStore 上行（重排后的 TU 字节）↔
 /// NoiseStream ↔ mux ↔ remote 拨号泵。
 ///
@@ -475,6 +639,7 @@ fn spawn_session(
     chosen: MuxId,
     transport: TransportState,
     group_id: u128,
+    ip_strategy: IpStrategy,
 ) {
     tokio::spawn(async move {
         let (up_pump_side, up_noise_side) = tokio::io::duplex(65536);
@@ -516,21 +681,7 @@ fn spawn_session(
         // 下行泵：dl 管道密文 TU → GET 响应通道。通道满 = 背压 = mux 写停滞。
         {
             let tx = dl_tx_clone(&state, &sid).await;
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt as _;
-                let mut src = dl_pump_side;
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    match src.read(&mut buf).await {
-                        Ok(0) | Err(_) => break, // 会话任务退出（mux 关闭）
-                        Ok(n) => {
-                            if tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                                return; // GET 断开
-                            }
-                        }
-                    }
-                }
-            });
+            tokio::spawn(downlink_pump(dl_pump_side, tx));
         }
 
         // mux + remote：NoiseStream 即 mux 的底层流。
@@ -543,7 +694,8 @@ fn spawn_session(
             let group = state.session_groups.join(group_id, &mux);
             // 注意：会话死亡不清理 stripe_registry——conn 由自身 lane
             // EOF/CLOSE 机制终结，跨会话存活的 conn 不得被会话拆除带走。
-            remote::session_loop(mux.clone(), state.stripe_registry.clone(), group).await;
+            remote::session_loop(mux.clone(), state.stripe_registry.clone(), group, ip_strategy)
+                .await;
             // 会话拆除：退出会话组（组空则删组条目）。
             state.session_groups.leave(group_id, &mux);
         }
@@ -627,7 +779,7 @@ fn spawn_keepalive(
     });
 }
 
-/// spec §7.4：按客户端偏好顺序取第一个服务端也支持的；无交集 → yamux + fallback=true。
+/// spec §7.4：按客户端偏好顺序取第一个服务端也支持的；无交集 → 基线 + fallback=true。
 /// 永不失败——任何情况下连接都要建起来。
 pub fn pick_mux(client_prefs: &[MuxId], server_enabled: &[MuxId]) -> (MuxId, bool) {
     for &c in client_prefs {
@@ -635,7 +787,7 @@ pub fn pick_mux(client_prefs: &[MuxId], server_enabled: &[MuxId]) -> (MuxId, boo
             return (c, false);
         }
     }
-    (MuxId::Yamux, true) // 基线回退
+    (MuxId::Wsmux, true) // 基线回退
 }
 
 #[cfg(test)]
@@ -646,26 +798,29 @@ mod tests {
     #[test]
     fn intersection_takes_first_client_pref() {
         let (chosen, fb) = pick_mux(
-            &[MuxId::H2mux, MuxId::Smux],
-            &[MuxId::Smux, MuxId::Yamux, MuxId::H2mux],
+            &[MuxId::Wsmux, MuxId::Wsmux],
+            &[MuxId::Wsmux, MuxId::Wsmux, MuxId::Wsmux],
         );
-        assert_eq!(chosen, MuxId::H2mux);
+        assert_eq!(chosen, MuxId::Wsmux);
         assert!(!fb);
     }
 
-    /// 无交集 → yamux + fallback。
+    /// 无交集 → 回退到基线。
+    ///
+    /// 只剩一种 mux 之后，"无交集"没法再拿两个非空列表构造了；服务端启用列表
+    /// 为空是仅存的一种，语义与原来一致。
     #[test]
-    fn no_intersection_falls_back_to_yamux() {
-        let (chosen, fb) = pick_mux(&[MuxId::Picomux], &[MuxId::Smux, MuxId::H2mux]);
-        assert_eq!(chosen, MuxId::Yamux);
+    fn no_intersection_falls_back_to_the_baseline() {
+        let (chosen, fb) = pick_mux(&[MuxId::Wsmux], &[]);
+        assert_eq!(chosen, MuxId::Wsmux);
         assert!(fb);
     }
 
     /// 客户端偏好为空 → 直接回退。
     #[test]
     fn empty_client_prefs_fall_back() {
-        let (chosen, fb) = pick_mux(&[], &[MuxId::Smux]);
-        assert_eq!(chosen, MuxId::Yamux);
+        let (chosen, fb) = pick_mux(&[], &[MuxId::Wsmux]);
+        assert_eq!(chosen, MuxId::Wsmux);
         assert!(fb);
     }
 
@@ -673,16 +828,135 @@ mod tests {
     #[test]
     fn dedup_and_odd_inputs_sane() {
         let (chosen, fb) = pick_mux(
-            &[MuxId::Smux, MuxId::Smux, MuxId::Yamux],
-            &[MuxId::Yamux, MuxId::Yamux, MuxId::Smux],
+            &[MuxId::Wsmux, MuxId::Wsmux, MuxId::Wsmux],
+            &[MuxId::Wsmux, MuxId::Wsmux, MuxId::Wsmux],
         );
-        assert_eq!(chosen, MuxId::Smux);
+        assert_eq!(chosen, MuxId::Wsmux);
         assert!(!fb);
 
         // 服务端全空也算无交集
-        let (chosen, fb) = pick_mux(&[MuxId::Yamux], &[]);
-        assert_eq!(chosen, MuxId::Yamux);
-        assert!(fb); // 注意：即使客户端要的就是 yamux，服务端未启用也算 fallback
+        let (chosen, fb) = pick_mux(&[MuxId::Wsmux], &[]);
+        assert_eq!(chosen, MuxId::Wsmux);
+        assert!(fb); // 注意：即使客户端要的就是基线那种，服务端未启用也算 fallback
+    }
+}
+
+#[cfg(test)]
+mod downlink_merge_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt as _;
+
+    /// 把 `n` 个带序号的小块写进 duplex，收集泵吐出来的所有 chunk。
+    /// 返回 (拼接结果, chunk 数)。
+    async fn pump_roundtrip(chunks: &[Vec<u8>]) -> (Vec<u8>, usize) {
+        let (mut writer, reader) = tokio::io::duplex(DL_READ_CHUNK);
+        let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
+        let pump = tokio::spawn(downlink_pump(reader, tx));
+
+        let owned: Vec<Vec<u8>> = chunks.to_vec();
+        let feeder = tokio::spawn(async move {
+            for c in &owned {
+                writer.write_all(c).await.unwrap();
+                // 让出一轮，模拟「多个 TU 前后脚落地」——泵有机会合并，也有
+                // 机会不合并，两种都必须给出同样的字节流。
+                tokio::task::yield_now().await;
+            }
+            writer.shutdown().await.unwrap();
+        });
+
+        let mut out = Vec::new();
+        let mut count = 0usize;
+        while let Some(b) = rx.recv().await {
+            assert!(
+                b.len() <= DL_MERGE_MAX,
+                "chunk {} 超出合并上限 {}",
+                b.len(),
+                DL_MERGE_MAX
+            );
+            assert!(!b.is_empty(), "不该发出空 chunk");
+            out.extend_from_slice(&b);
+            count += 1;
+        }
+        feeder.await.unwrap();
+        pump.await.unwrap();
+        (out, count)
+    }
+
+    /// 合并只改分块边界，不改字节流——一个字节都不能丢、不能乱、不能重。
+    ///
+    /// 这是整套合并逻辑唯一不可妥协的性质：TU 靠 2 字节长度前缀自定界，
+    /// 边界错一个字节，客户端 `TuDecoder` 就会把密文当成长度去解析，
+    /// 整条会话当场跑飞。
+    #[tokio::test]
+    async fn merging_preserves_byte_stream_exactly() {
+        let chunks: Vec<Vec<u8>> = (0u16..200)
+            .map(|i| {
+                let mut v = i.to_be_bytes().to_vec();
+                v.extend(std::iter::repeat(i as u8).take(60));
+                v
+            })
+            .collect();
+        let expect: Vec<u8> = chunks.iter().flatten().copied().collect();
+
+        let (got, count) = pump_roundtrip(&chunks).await;
+        assert_eq!(got, expect, "字节流被合并改动了");
+        assert!(count >= 1 && count <= chunks.len());
+    }
+
+    /// 写入端关闭后泵必须退出，通道随之关闭——否则 GET 响应流永远不结束。
+    #[tokio::test]
+    async fn pump_exits_on_writer_eof() {
+        let (got, _) = pump_roundtrip(&[b"hello".to_vec()]).await;
+        assert_eq!(got, b"hello");
+    }
+
+    /// 合并确实在减少 chunk 数——否则整套逻辑就是白跑一趟调度。
+    ///
+    /// 不走 [`downlink_pump`] 而直接驱动 [`merge_downlink`]：泵里那次
+    /// `tx.send().await` 会改变 current_thread 上的任务排队顺序，让写入方
+    /// 每次都恰好抢在合并窗口之前把上一块交付完，于是一块都并不上。这里要
+    /// 钉的是合并循环本身，把那个干扰项摘掉。
+    #[tokio::test]
+    async fn merge_loop_actually_coalesces() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const WRITES: usize = 10;
+        let (mut w, mut r) = tokio::io::duplex(DL_READ_CHUNK);
+        let feeder = tokio::spawn(async move {
+            for i in 0..WRITES as u8 {
+                w.write_all(&[i; 32]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            w.shutdown().await.unwrap();
+        });
+
+        let mut scratch = vec![0u8; DL_READ_CHUNK];
+        let mut agg = bytes::BytesMut::new();
+        let (mut out, mut chunks) = (Vec::new(), 0usize);
+        loop {
+            let n = match r.read(&mut scratch).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            agg.extend_from_slice(&scratch[..n]);
+            merge_downlink(&mut r, &mut agg, &mut scratch).await;
+            out.extend_from_slice(&agg);
+            agg.clear();
+            chunks += 1;
+        }
+        feeder.await.unwrap();
+
+        let expect: Vec<u8> = (0..WRITES as u8).flat_map(|i| [i; 32]).collect();
+        assert_eq!(out, expect, "合并把字节流改了");
+        assert!(chunks < WRITES, "{WRITES} 次写入并出 {chunks} 个 chunk，没合并上");
+    }
+
+    /// 单块就超过合并上限时照常整块转发，不被截断。
+    #[tokio::test]
+    async fn oversized_single_write_is_not_truncated() {
+        let big = vec![0xABu8; DL_MERGE_MAX + 4096];
+        let (got, _) = pump_roundtrip(&[big.clone()]).await;
+        assert_eq!(got.len(), big.len());
+        assert_eq!(got, big);
     }
 }
 
@@ -729,3 +1003,4 @@ mod cors_tests {
         assert!(super::cors_origin(&r).is_none());
     }
 }
+
