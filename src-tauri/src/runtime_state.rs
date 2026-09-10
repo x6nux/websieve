@@ -961,13 +961,27 @@ mod startup_plan_tests {
     /// 因此接手了这道校验，复用 `shard_setup::origin_of`——非法 URL 必须在
     /// 启动时就报错并点名是哪个出站，而不是被 `ShardPlanEntry::degraded` 悄悄
     /// 退回原始字符串、一路滑到运行时才在握手阶段炸给用户一个不知所云的错误。
+    ///
+    /// 四种畸形形状照抄被删掉的 `outbound::carrier::tests::
+    /// malformed_url_is_an_error_not_an_empty_base`——那条测试连同它守的
+    /// `carrier::origin_of` 一起被删，覆盖不能跟着丢：`shard_setup::origin_of`
+    /// 复用的是同一份四条规则（缺 scheme / 不支持的 scheme / 缺主机 /
+    /// 带 userinfo），四种都要在启动时被拒，而不是只剩「缺 scheme」这一种。
     #[test]
     fn a_malformed_proxy_url_is_rejected_with_the_outbound_name() {
-        let mut p = proxy("A", &valid_pub(), &valid_priv());
-        p.url = "not-a-url".to_string();
-        let cfg = config_with(vec![p]);
-        let err = plan_of(&cfg).unwrap_err().to_string();
-        assert!(err.contains('A'), "错误要点名是哪个出站：{err}");
+        for bad in [
+            "a.com",              // 缺 scheme
+            "ftp://a.com/",       // 不支持的 scheme
+            "https:///path",      // 缺主机
+            "https://u:p@a.com/", // 带凭据
+        ] {
+            let mut p = proxy("A", &valid_pub(), &valid_priv());
+            p.url = bad.to_string();
+            let cfg = config_with(vec![p]);
+            let err = plan_of(&cfg).unwrap_err().to_string();
+            assert!(err.contains('A'), "{bad}: 错误要点名是哪个出站：{err}");
+            assert!(err.contains("URL"), "{bad}: 错误要说明是 URL 不合法：{err}");
+        }
     }
 
     #[test]

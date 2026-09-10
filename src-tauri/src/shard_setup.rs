@@ -164,9 +164,17 @@ pub(crate) fn origin_of(url: &str) -> anyhow::Result<String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow::anyhow!("URL 缺少 scheme: {url}"))?;
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!("不支持的 scheme: {scheme}");
+    }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
     if authority.is_empty() {
         anyhow::bail!("URL 缺少主机: {url}");
+    }
+    // 用户名密码写进 origin 会让它不再是合法 origin，也会把凭据泄进
+    // session_bases 与 tracing 日志。
+    if authority.contains('@') {
+        anyhow::bail!("URL 不接受 userinfo: {url}");
     }
     Ok(format!("{scheme}://{authority}"))
 }
