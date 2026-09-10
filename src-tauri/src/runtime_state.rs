@@ -756,14 +756,15 @@ mod startup_plan_tests {
         }
     }
 
-    /// 一份「hosts 劫持没生效」的条带结果：页面就是原始 URL，会话数按
-    /// `extra_sessions + 1` 排开但都还没有各自的端口。这正是没有管理员
-    /// 权限时的真实形态，也是这些测试唯一关心的输入形状。
+    /// 一份「hosts 劫持没生效」的条带结果：各会话仍拿到各自的绝对 origin
+    /// （承载页现在总是本机 http 壳，条带不可能给出 `None`），只是没有各自
+    /// 的端口、退化成共用同一个地址。会话数按 `extra_sessions + 1` 排开，
+    /// 这正是没有管理员权限时的真实形态，也是这些测试唯一关心的输入形状。
     fn shard_for(cfg: &wsieve_config::Config) -> Vec<crate::shard_setup::ShardPlanEntry> {
         cfg.proxies
             .iter()
             .map(|p| crate::shard_setup::ShardPlanEntry {
-                session_bases: vec![None; p.extra_sessions + 1],
+                session_bases: vec![Some("https://example.com".to_string()); p.extra_sessions + 1],
                 upstream: None,
                 bypass_error: None,
             })
@@ -881,7 +882,7 @@ mod startup_plan_tests {
         assert_eq!(ob.client_priv, [0x22u8; 32]);
         assert_eq!(ob.mux_prefs.len(), 1, "mux 收敛成 wsmux 一种后偏好列表只有一项");
         // extra_sessions 默认 0 ⇒ 只有主会话
-        assert_eq!(ob.session_bases, vec![None]);
+        assert_eq!(ob.session_bases, vec![Some("https://example.com".to_string())]);
     }
 
     #[test]

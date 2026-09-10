@@ -338,9 +338,10 @@ impl WebViewTransport {
 
 /// 纯 Rust base64（标准字母表 + padding），避免只为这一处引入依赖。
 ///
-/// 上行（Rust → JS，经 eval）与下行回帧（JS → Rust，经 IPC）都走它。
-/// 下行改用 base64 的完整理由见 `ui/emitter.js` 顶部：承载页是远程 origin，
-/// raw body 快路径在 WKWebView 下根本不可用。
+/// 上行（Rust → JS，经 eval）恒走它——eval 只能吃字符串，无可替代。
+/// 下行回帧（JS → Rust，经 IPC）现在以 raw body 快路径为主，这里的
+/// base64 只是 custom protocol 粘性回退到 postMessage 后的兼容路径，
+/// 完整理由见 `ui/emitter.js` 顶部。
 ///
 /// 手写而不引 crate：实测瓶颈在 JS 侧（JavaScriptCore 编码 + stringify
 /// 约 148 MB/s），Rust 侧无论手写还是 SIMD 都远不是瓶颈，多一个依赖不值。

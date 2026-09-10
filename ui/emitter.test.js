@@ -62,3 +62,41 @@ describe('IPC 通路判据', () => {
     expect(window.__wsieve.raw).toBe(true);
   });
 });
+
+// 上面那组只钉住了判据（raw 该是 true 还是 false），没钉住后果：
+// 真正与 Rust 侧 decode_body 构成契约的是「invoke 实际收到的 body 长什么样」。
+// 判据算对了、但 sendFrame 没跟着切分支，一样会复现 2026-09-09 那次故障
+// （心跳正常、传输永久挂起、零错误日志）——这组测试就是防这个。
+//
+// 触发点选 `window.__wsieve.post`：它是 emitter 对外暴露的三个函数之一，
+// 内部会 fetch 再回帧调用 invoke。fetch 用 vi.stubGlobal 挡掉，不碰真实网络。
+describe('IPC 通路契约：invoke 实际收到的 body 形状', () => {
+  it('RAW=true 时 invoke 收到 Uint8Array（custom protocol 快路径）', async () => {
+    var emitter = loadEmitter('http:', '127.0.0.1');
+    expect(emitter.raw).toBe(true);
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      status: 200,
+      arrayBuffer: () => Promise.resolve(new Uint8Array([9, 8, 7]).buffer),
+    })));
+    await emitter.post(1, '/x', btoa('abc'));
+    var call = window.__TAURI__.core.invoke.mock.calls.find(
+      function (c) { return c[0] === 'wsieve_raw_post'; }
+    );
+    expect(call[1]).toBeInstanceOf(Uint8Array);
+  });
+
+  it('RAW=false 时 invoke 收到 { f: string }（base64 回退路径）', async () => {
+    var emitter = loadEmitter('https:', 'a.example');
+    expect(emitter.raw).toBe(false);
+    vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({
+      status: 200,
+      arrayBuffer: () => Promise.resolve(new Uint8Array([9, 8, 7]).buffer),
+    })));
+    await emitter.post(1, '/x', btoa('abc'));
+    var call = window.__TAURI__.core.invoke.mock.calls.find(
+      function (c) { return c[0] === 'wsieve_raw_post'; }
+    );
+    expect(call[1]).not.toBeInstanceOf(Uint8Array);
+    expect(typeof call[1].f).toBe('string');
+  });
+});

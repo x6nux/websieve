@@ -1,8 +1,9 @@
 // websieve emitter —— 传输层 JS 半边（spec §4/§6.5/§6.7）。
 //
-// 同源关键决策（spec §6.7）：WebView 直接加载服务端真实首页（nginx 页），
-// 所有代理 fetch 天然 same-origin、Cookie/Sec-Fetch-Site/Referer 全部由
-// 浏览器内核正确生成。首页是服务器的页面，加不进 <script>，唯一注入点是
+// 承载页决策（spec §6.7，2026-09-10 改）：WebView 加载的是本机 http 壳
+// （`http://127.0.0.1:{随机端口}/`），不是服务端首页，所有代理 fetch 都是
+// 跨源——Cookie/Sec-Fetch-Site/Referer 靠服务端 CORS 放宽成立，不再是
+// same-origin 天然免配置。承载页加不进 <script>，唯一注入点是
 // Rust 侧的 initialization_script（data: URL 加载本文件，见
 // src-tauri/src/bootstrap.rs）。本文件是单一事实源，build.rs 把它嵌进二进制。
 //

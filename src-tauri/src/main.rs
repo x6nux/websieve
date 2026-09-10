@@ -1153,11 +1153,10 @@ async fn wsieve_heartbeat(state: tauri::State<'_, CurrentCore>) -> Result<(), St
 
 /// 上行 POST 结果与下行 chunk 的统一二进制入口。
 ///
-/// **参数是 base64 字符串而不是 raw body**：承载页加载的是远程 origin，
-/// Tauri 的 custom protocol IPC 在 WKWebView 下发不出去（`ipc://` 被禁），
-/// 会静默回退到 postMessage，那条路只能传 JSON。完整实测见 emitter.js
-/// 顶部注释。若改回 `InvokeBody::Raw`，症状是「心跳正常、传输永远挂在
-/// Connecting、零错误日志」——因为 emitter 那侧的 invoke 异常被 catch 吞掉。
+/// 参数两种形状都收（见下方 `decode_body`）：承载页现在是本机 http 壳，
+/// 主路径是 `InvokeBody::Raw`（custom protocol 快路径）；`InvokeBody::Json`
+/// 是 custom protocol 一旦失败后 Tauri 粘性回退用的兼容路径。完整实测见
+/// emitter.js 顶部注释。
 ///
 /// 帧格式（16B 头，全大端，与 emitter.js 的 frame() 逐字段对齐）：
 ///   [0..4]  magic "WSIE"
@@ -1186,18 +1185,36 @@ async fn wsieve_raw_stream(
 
 /// 两种回帧 body 都收：二进制快路径与 base64 兼容路径。
 ///
-/// **哪条路可用由 origin 决定，不由我们决定**：`InvokeBody::Raw` 只在
-/// Tauri 的 custom protocol 通路上出现（请求带 `application/octet-stream`），
-/// 而承载页是远程 https origin 时，WKWebView 会把 custom protocol 请求整个
-/// 挡在发出之前，Tauri 静默回退到 postMessage——那条路的 body 只能是 JSON。
+/// **哪条路可用由 scheme 决定，不由我们决定**：`InvokeBody::Raw` 只在
+/// Tauri 的 custom protocol 通路上出现，承载页现在是本机 http 壳，这条通路
+/// 应当是主路径。`InvokeBody::Json` 走的是 postMessage 回退——不是选择，
+/// 是 Tauri 探测到 custom protocol 失败后的**粘性**降级（一旦失败，该页面
+/// 此后永久走这条路，见 `tauri-2.11.5/scripts/ipc-protocol.js:21,63-70`）。
 ///
-/// 所以这里两条都认，让 emitter 侧按 origin 选最快的那条，而不是二选一
-/// 写死。写死成 raw 会在远程 origin 下变成「握手永远挂起、零错误日志」；
-/// 写死成 base64 则在本地 origin 下白白付出 1.333 倍膨胀与一次全量编码。
+/// 所以这里两条都认，不写死一条：写死成 raw 会在粘性回退触发后变成「握手
+/// 永远挂起、零错误日志」；写死成 base64 则白白付出 1.333 倍膨胀与一次
+/// 全量编码。但两条都认也意味着「实际走的是哪条」不会自己暴露出来——
+/// 而 JSON 分支的错误只会作为命令 `Err` 回给 JS，又被 emitter 侧的
+/// `catch (_) {}` 吞掉（见 ui/emitter.js 的 `sendFrame` 调用点），所以
+/// 下面用 `Once` 在首帧各打一条日志，让通路选择在 `tracing` 里可观察，
+/// 而不是只能靠「验收清单里那条日志没出现」这种无法证伪的判据去推断。
 fn decode_body(req: &tauri::ipc::Request<'_>) -> Result<bytes::Bytes, String> {
+    static LOG_RAW: std::sync::Once = std::sync::Once::new();
+    static LOG_JSON: std::sync::Once = std::sync::Once::new();
     match req.body() {
-        tauri::ipc::InvokeBody::Raw(b) => Ok(bytes::Bytes::copy_from_slice(b)),
+        tauri::ipc::InvokeBody::Raw(b) => {
+            LOG_RAW.call_once(|| {
+                tracing::info!("回帧通路: raw (custom protocol)");
+            });
+            Ok(bytes::Bytes::copy_from_slice(b))
+        }
         tauri::ipc::InvokeBody::Json(v) => {
+            LOG_JSON.call_once(|| {
+                tracing::info!(
+                    "回帧通路: base64 (postMessage 回退)——若承载页是 http origin 却走到这里，\
+                     说明 custom protocol 曾失败并已粘性回退"
+                );
+            });
             let f = v
                 .get("f")
                 .and_then(|x| x.as_str())

@@ -114,9 +114,9 @@ pub struct OutboundCfg {
     pub mux_prefs: Vec<MuxId>,
     /// 本出站各会话的请求基址，长度即会话数（至少 1）。
     ///
-    /// `None` = 相对路径（与承载页面同源；只有宿主出站或 `isolated` 模式
-    /// 才拿得到）；`Some(origin)` = 绝对 URL，跨域名靠服务端 CORS 放宽成立
-    /// （见设计文档 §9.1 与 `docs/superpowers/spikes/2026-08-25-*`）。
+    /// 承载页现在总是本机 http 壳，任何出站的会话基址都不再与它同源，
+    /// 因此这里现在总是 `Some(origin)`（绝对 https URL）——跨域名靠服务端
+    /// CORS 放宽成立（见设计文档 §9.1 与 `docs/superpowers/spikes/2026-08-25-*`）。
     pub session_bases: Vec<Option<String>>,
     /// 本出站的域名解析地址族偏好，随每条会话的 msg1 发给服务端。
     ///
