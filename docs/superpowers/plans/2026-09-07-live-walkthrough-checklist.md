@@ -77,6 +77,54 @@ Part 1 之后，启动**不再需要** `WSIEVE_SERVER_PUB` / `WSIEVE_CLIENT_PRIV
 | 25 | 混合端口跟随配置 | 在设置里把混合端口从 `25500` 改成别的（比如 `7891`），重启应用 | 日志「混合端口入口就绪」显示的是新端口；经新端口的代理请求能通，旧端口连不上。（Part 1 之前这个字段**没有任何调用方**，改了永远不生效） |
 | 26 | 界面上的开关跟随配置 | 分别切换「系统代理」与「虚拟网卡(TUN)」开关并重启 | 开关状态在重启后真正作用于运行时（TUN 开启且无管理员权限时，应看到一条**可操作的**错误日志并明确不启用，绝不静默降级） |
 
+## 承载页 http 化（2026-09-10 改动）的走查
+
+对应设计 `docs/superpowers/specs/2026-09-10-http-carrier-origin-design.md`、
+实现计划 `docs/superpowers/plans/2026-09-10-http-carrier-origin.md`。
+
+**为什么这一节必须人工走查**：本次改动的核心主张是「承载页换成本机 http
+origin 之后，Tauri 的 IPC raw body 快路径重新可用」。spike
+（`scripts/spike-ipc-origin.sh`）只证明了**手写 fetch** 能走通 custom scheme，
+而 Tauri 真实的 `__TAURI_INTERNALS__.invoke` 还会多带 `Tauri-Callback` /
+`Tauri-Invoke-Key` 等头。静态分析（最终审查逐条核到了 Tauri 库源码：
+`ipc/protocol.rs` 对预检回 `Access-Control-Allow-Headers: *`、`acl/mod.rs` 会把
+`http://127.0.0.1:*` 匹配到实际端口）全部指向它成立，但**没有真机证据**——而
+这类失败恰好是静默的。
+
+**前置条件**：`scripts/e2e.sh` **不能**用来自举这次走查。
+- 阶段 A 在**本次改动之前就已失败**（在 `33dc7a1` 建独立 worktree 复跑，报错
+  逐字相同：`/api/sync?n=0` 被 `Connection reset by peer (os error 54)`），
+  所以需要一个真实可用的服务端。
+- 阶段 B（`--with-app`）已过时：它用 `WSIEVE_SERVER_URL` / `WSIEVE_SERVER_PUB`
+  驱动 app，而 `bb767ef`（启动改读 config.yaml）之后这些变量只剩注释、代码已
+  不读。要跑真实 app 得手写 config.yaml 指向服务端。
+
+| # | 区域 | 操作步骤 | 期望结果 |
+|---|---|---|---|
+| 27 | 承载页 origin | `WSIEVE_SHOW_WINDOW=1` 启动，看承载窗口 | 地址栏/devtools 显示 `http://127.0.0.1:{某个高端口}/`；日志有「承载页 server 就绪: http://127.0.0.1:{port}/」 |
+| 28 | **回帧通路真的是 raw** | 启动后跑一点代理流量，看 Rust 日志 | 出现「**回帧通路: raw (custom protocol)**」。若出现「回帧通路: base64 (postMessage 回退)」，本次改动的收益为零，按第 29 条排查 |
+| 29 | 粘性回退未发生 | 承载窗口 devtools 的 console | `window.__wsieve.raw` 为 `true`，且 console 里**没有** Tauri 那句 `IPC custom protocol failed, Tauri will now use the postMessage interface instead`。⚠️ **不要**用「Rust 日志里没有 `JSON body 缺少字符串字段 f`」当判据——那句话**永远不会出现**（它作为命令 `Err` 返给 JS，又被 emitter 的 `catch` 吞掉），是个无法证伪的假判据。Tauri 的 `customProtocolIpcFailed` 是**粘性**的：失败一次即永久回退，而 emitter 侧 `RAW` 仍为 `true`，症状是心跳照常、传输永久挂起 |
+| 30 | 数据面端到端 | 出站连上后 `curl -x socks5h://127.0.0.1:{混合端口} https://ifconfig.me` | 出站进入 `Connected`；返回**服务端出口 IP**，与直连对照不同 |
+| 31 | 数据面仍是 TLS | 跑代理流量的同时 `sudo tcpdump -i any -n 'tcp port 80' -c 20` | **离开本机的流量里没有任何 80 端口**。回环上出现 `127.0.0.1:{carrier_port}` 是正常的（那就是承载页自己） |
+| 32 | 劫持腿的会话基址 | 给某个出站设 `extra-sessions: 2` 并重启，看该出站的会话基址 | 形如 `https://<域名>:<本地端口>`——不是 `http://`、不是 `127.0.0.1`。**这条腿没有任何自动化覆盖**：单测走的是 `extra_sessions: 0`（配置默认）的降级路径，劫持路径要真实 DNS 解析 + 真起转发器 |
+| 33 | CPU 改善（本次动机） | 跑一次大流量下载，看进程 CPU | 较改动前明显下降。设计文档记录的基线是 base64 48.8 MB/s @CPU 86% → raw 114.9 MB/s @CPU 34%。**如实记录实际数字**，与基线不符也照写——那说明还有别的瓶颈，是下一步的输入 |
+
+### 本次改动已知延后的项（走查时若撞上，是已知的，不是新发现）
+
+- `session_bases` 的类型仍是 `Vec<Option<String>>`，而 `instance.rs` 里两处
+  `unwrap_or_default()` 会把 `None` 静默变成相对路径（→ 打到承载页那张空
+  HTML）。**当前没有生产路径能产出 `None`**，由测试
+  `session_bases_come_from_the_shard_verbatim` 钉住。但出站热替换
+  （`diff_outbounds`，现为 dead code）将是第二个生产者——**必须在它落地之前
+  把类型收成 `Vec<String>`**，让编译器接管这条不变量。
+- 全局约束「会话基址必须留在 https」没有任何代码强制：用户把 `url` 写成
+  `http://server/` 会得到 http 基址，TLS 指纹当场归零。改动前即如此，非本次
+  回归；且不能简单封死（本机 `wsieve-server` 形态用的正是 http）。正解是一条
+  醒目的 warn。
+- `capabilities/transport.json` 的 `https://**:*` 这条 remote 授权现在**结构上
+  不可达**（没有任何窗口再加载远端页面），可以在下一轮收窄。本次受「urls 一个
+  字都不改」约束未动。
+
 ## 如果发现问题
 
 按第 4、6 两条这次的做法来：先写一条能复现问题的失败测试，再修，再让测试转绿，
