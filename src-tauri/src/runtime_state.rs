@@ -235,8 +235,8 @@ pub struct OutboundDiff {
 /// 纯函数：给定旧的出站实例表与新的 `Proxy` 列表，算出增量。
 ///
 /// "未变"的判定标准是 `OutboundCfg` 的全部字段相等（`name`/`server_pub`/
-/// `client_priv`/`mux_prefs`/`session_bases`）——`session_bases` 由承载
-/// 计划算出、不来自 `Proxy` 本身，所以调用方要在算出新的 `session_bases`
+/// `client_priv`/`mux_prefs`/`session_bases`）——`session_bases` 由条带
+/// 算出、不来自 `Proxy` 本身，所以调用方要在算出新的 `session_bases`
 /// 之后才能调这个函数；本函数只管"给定两份完整 `OutboundCfg`，谁跟谁一样"，
 /// 不负责计算 `session_bases`。
 ///

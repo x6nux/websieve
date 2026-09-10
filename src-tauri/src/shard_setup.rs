@@ -79,8 +79,11 @@ impl ShardPlanEntry {
             // 就是它的 origin」——承载页挪到本机 http 壳之后这个前提没了。
             //
             // 取不出 origin 时退回原样：走到这条路径的 URL 有一部分正是因为
-            // `split_url` 失败才降级的，此处再制造一个失败点没有意义。坏 URL
-            // 会在 fetch 时报错，那是能看见的失败。
+            // `split_url` 失败才降级的，此处再制造一个失败点没有意义。真正
+            // 挡住这种坏 URL 的安全网是 `carrier::validate`——它会对同一个
+            // 字符串再跑一遍 `origin_of` 并拒绝非法 URL。这道网立在另一个
+            // 模块里，两边一旦失步，这里退回原样就会悄悄拼出一个指向承载页
+            // origin 的相对 URL——脆，但今天真实拦截它的就是这道网。
             session_bases: vec![Some(
                 origin_of(server_url).unwrap_or_else(|_| server_url.to_string()),
             )],

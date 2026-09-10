@@ -1,7 +1,7 @@
 //! WebView 承载器（设计文档 §4.2 纪律③、§9.1）。
 //!
 //! 纪律③：**承载方式对出站层透明**。出站只声明「我要一个 transport」，由
-//! 本模块决定它落在哪个 WebView、用相对路径还是绝对 URL。`CarrierPlan` 是
+//! 本模块决定它落在哪个 WebView。`CarrierPlan` 是
 //! 纯数据决策（因此可穷举单测）；实际建窗（`spawn_carrier_windows`）也放
 //! 在本模块——因为只有它知道 `CarrierPlan` 的内部结构，把"决定建什么"和
 //! "怎么建"拆到两个模块没有实际收益，代价是 Task 4 的运行时重建要跨模块
@@ -64,7 +64,7 @@ struct Slot {
     page_url: String,
 }
 
-/// 承载计划：谁住哪个窗口、用什么基址发请求。
+/// 承载计划：谁住哪个窗口。
 #[derive(Debug, Clone)]
 pub struct CarrierPlan {
     mode: CarrierMode,
@@ -277,8 +277,8 @@ fn validate(outbounds: &[(&str, &str)]) -> anyhow::Result<Vec<(String, String)>>
                 i + 1
             );
         }
-        // 这里就把 URL 验一遍：宿主虽然用相对路径不需要 origin，但它的 URL
-        // 仍要拿去导航，坏 URL 早报比等到建窗时再报好。
+        // 这里就把 URL 验一遍：现在每条出站的会话基址（含宿主）都要从这个
+        // URL 取 origin，坏 URL 早报比等到条带建连接时再报好。
         origin_of(url).map_err(|e| anyhow::anyhow!("出站 {name:?} 的 url 无效：{e}"))?;
         out.push((name.to_string(), url.to_string()));
     }
