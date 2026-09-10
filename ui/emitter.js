@@ -6,12 +6,16 @@
 // Rust 侧的 initialization_script（data: URL 加载本文件，见
 // src-tauri/src/bootstrap.rs）。本文件是单一事实源，build.rs 把它嵌进二进制。
 //
-// IPC 纪律（spec §3.2 已按下述实测结果修订）：**承载页是远程 origin，
+// IPC 纪律（spec §3.2 已按下述实测结果修订）：**承载页若是 https origin，
 // raw body 快路径在这里根本不可用**——Tauri 的 custom protocol IPC 走
 // `fetch('ipc://localhost/…')`，而 WKWebView 禁止 https 页面访问 custom
 // scheme，请求发都发不出去；Tauri 只 console.warn 一句就静默回退到
 // postMessage，那条路把 Uint8Array 交给 JSON.stringify，replacer 里一句
 // `Array.from(val)` 把每字节变成 "123," 约 4 个字符。
+//
+// 2026-09-10 补测确证：决定因素是 **scheme** 而非 origin 是否本地
+// （四格对照见 scripts/spike-ipc-origin.sh）。承载页因此改为本机的
+// http://127.0.0.1:{随机端口}，raw 快路径恢复可用。
 //
 // 也就是说「绝不退化成数字数组」这条原则在生产形态下**从来没有成立过**，
 // 只是 Rust 侧拒收 JSON（`raw body required`）所以表现为彻底失败而非变慢。
@@ -38,12 +42,19 @@
   // 读不到就用这里的默认值，因此不设时行为与改动前一致。
   var TUNE = (window.__wsieveTune || {});
 
-  // 承载页是不是本地 origin。这一条决定下面两个默认值，见 RAW 处的长注释。
-  function isLocalOrigin() {
-    var h = location.hostname;
-    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  // raw（custom protocol）通路可用性完全由**承载页的 scheme** 决定：
+  // WKWebView 禁止 https 页面访问 custom scheme，与 origin 是不是本地无关。
+  // 四格实测（scripts/spike-ipc-origin.sh）：
+  //   http://127.0.0.1  ✅    http://localtest.me  ✅
+  //   https://127.0.0.1 ❌    https://example.com  ❌
+  //
+  // 这里曾经判的是 hostname 是不是回环。那个判据只是**碰巧**与真判据重合，
+  // 而它错的方向最危险：https://127.0.0.1 会被判成「可以走 raw」，于是开了
+  // RAW 却发不出去 —— 症状是心跳正常、传输永久挂起、零错误日志。
+  function canUseRawIpc() {
+    return location.protocol === 'http:';
   }
-  var LOCAL = isLocalOrigin();
+  var FAST_IPC = canUseRawIpc();
 
   // 攒够多少再 invoke，减少 IPC 次数。最优值随 IPC 通路而变，实测（局域网
   // 千兆、单流下载）：
@@ -68,7 +79,7 @@
   var CHUNK_MS_MAX = 4;
   var CHUNK_MS = TUNE.chunkMs || CHUNK_MS_MIN;
   var CHUNK_MIN = 32 * 1024;
-  var CHUNK_MAX = LOCAL ? 256 * 1024 : 64 * 1024;
+  var CHUNK_MAX = FAST_IPC ? 256 * 1024 : 64 * 1024;
   var CHUNK_TARGET = TUNE.chunkTarget || CHUNK_MIN;
 
   // 攒批的两条截止线，缺一不可：
@@ -229,18 +240,18 @@
   // RAW 模式：直接把 Uint8Array 交给 invoke，走 Tauri 的 custom protocol
   // 快路径，省掉 base64 的 CPU 与 1.333 倍膨胀。
   //
-  // **只在本地 origin 下成立**。承载页是远程 https origin 时，custom protocol
+  // **只在 http origin 下成立**。承载页是 https origin 时，custom protocol
   // 请求会被 WKWebView 整体拦下，Tauri 静默回退到 postMessage，而那条路的
   // body 只能是 JSON——Uint8Array 会被 replacer 摊成数字数组（实测约 3.5 倍
   // 膨胀），Rust 侧则直接拒收 `raw body required`。
   //
-  // 可用性完全由 origin 决定，那就直接按 origin 判，不必让宿主记得去开：本地
-  // origin 一定能走 raw，远程 origin 一定不能。这不是偏好而是能力检测，所以
+  // 可用性完全由 scheme 决定，那就直接按 scheme 判，不必让宿主记得去开：http
+  // origin 一定能走 raw，https origin 一定不能。这不是偏好而是能力检测，所以
   // 默认就该是自动的。宿主仍可用 `__wsieveTune.raw` 显式覆盖（排障用）。
   //
   // 差距很大，值得自动化：局域网千兆单流下载，base64 48.8 MB/s @CPU 86%，
   // raw 114.9 MB/s @CPU 34% —— 2.4 倍吞吐、四成 CPU。
-  var RAW = TUNE.raw !== undefined ? !!TUNE.raw : LOCAL;
+  var RAW = TUNE.raw !== undefined ? !!TUNE.raw : FAST_IPC;
   function sendFrame(cmd, kind, requestId, status, payload, seq) {
     var f = frame(kind, requestId, status, payload, seq || 0);
     return RAW ? invoke(cmd, f) : invoke(cmd, { f: bytesToBase64(f) });
@@ -493,5 +504,8 @@
     post: post,
     openStream: openStream,
     cancelStream: cancelStream,
+    // 当前用的是哪条 IPC 通路。排障时在 console 里一眼可见；也是这个判据
+    // 唯一的观察点 —— emitter 是 IIFE，不暴露就没法测。
+    raw: RAW,
   };
 })();
