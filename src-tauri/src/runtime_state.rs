@@ -421,10 +421,9 @@ pub fn build_startup_plan(
         );
     }
 
-    // 承载计划先算：**会话 0 的基址由它决定**，不是由条带决定。条带只知道
-    // 额外会话各自用哪个本地端口，而「这个出站相对承载页面是同源还是跨域名」
-    // 只有承载计划知道。而承载计划自己要的页面 URL 又来自条带（劫持成功时
-    // 是本地端口），所以顺序只能是条带 → 承载 → 会话基址。
+    // 承载计划先算：它要的页面 URL 来自条带（劫持成功时是本地端口）。
+    // **会话基址不再经过它**——每条会话的基址都由条带全权给出（含会话 0），
+    // 承载计划只负责「谁落在哪个窗口、那个窗口加载什么」。
     let carrier = if config.proxies.is_empty() {
         None
     } else {
@@ -463,18 +462,19 @@ pub fn build_startup_plan(
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        // 条带给出的会话基址（会话 0 之外的每一项都是它分到的本地端口），
-        // 会话 0 那一项由承载计划改写。
-        let mut session_bases = entry.session_bases.clone();
+        // 条带给出的会话基址：**每一项都是绝对 URL，含会话 0**。承载页已经
+        // 不是任何出站的 origin（它是本机的 http 壳），因此没有任何一条会话
+        // 还能吃相对路径。
+        let session_bases = entry.session_bases.clone();
         if session_bases.is_empty() {
             anyhow::bail!("出站「{}」的条带结果没有任何会话基址", p.name);
         }
-        // 两层 Option 的**外层** `None` 是「承载计划不认识这个出站」——必须
-        // 当错误处理。悄悄给个默认基址就等于把流量发去了另一台服务器（§6.4）。
-        session_bases[0] = carrier
+        // §6.4 的防线原样保留，只是换了个不涉及基址推导的方法来守：认不出
+        // 的出站必须报错，绝不能套一个默认基址把流量发去另一台服务器。
+        carrier
             .as_ref()
             .expect("出站非空时承载计划必然已构建")
-            .base_for(&p.name)
+            .window_label(&p.name)
             .ok_or_else(|| anyhow::anyhow!("承载计划里没有出站「{}」", p.name))?;
 
         // 未知写法必须报错。悄悄退回 auto 的话，用户配了 v4-only、流量照旧
@@ -981,7 +981,10 @@ mod startup_plan_tests {
         let cfg = config_with(vec![proxy("A", &valid_pub(), &valid_priv())]);
         let shard = vec![crate::shard_setup::ShardPlanEntry {
             page_url: "https://a.example:18443/".to_string(),
-            session_bases: vec![None, Some("https://a.example:18444".to_string())],
+            session_bases: vec![
+                Some("https://a.example:18443".to_string()),
+                Some("https://a.example:18444".to_string()),
+            ],
             upstream: None,
             bypass_error: None,
         }];
@@ -992,10 +995,14 @@ mod startup_plan_tests {
             vec![("main".to_string(), "https://a.example:18443/".to_string())],
             "承载窗口该加载条带给出的本地端口页面"
         );
-        // 额外会话的基址原样保留，会话 0 由承载计划改写成「相对路径」。
+        // 整份 session_bases 原样透传——会话 0 也是条带给的绝对 URL，
+        // 不再被承载计划改写成「相对路径」。
         assert_eq!(
             plan.outbound_cfgs[0].session_bases,
-            vec![None, Some("https://a.example:18444".to_string())]
+            vec![
+                Some("https://a.example:18443".to_string()),
+                Some("https://a.example:18444".to_string()),
+            ]
         );
     }
 
@@ -1010,24 +1017,68 @@ mod startup_plan_tests {
         let shard = vec![
             crate::shard_setup::ShardPlanEntry {
                 page_url: "https://a.example:18443/".to_string(),
-                session_bases: vec![None],
+                session_bases: vec![Some("https://a.example:18443".to_string())],
                 upstream: None,
                 bypass_error: None,
             },
             crate::shard_setup::ShardPlanEntry {
                 page_url: "https://b.example:18450/".to_string(),
-                session_bases: vec![None],
+                session_bases: vec![Some("https://b.example:18450".to_string())],
                 upstream: None,
                 bypass_error: None,
             },
         ];
         let plan = build_startup_plan(&cfg, &shard).unwrap();
-        assert_eq!(plan.outbound_cfgs[0].session_bases, vec![None], "宿主同源");
+        // 宿主的会话 0 也是条带给的绝对 origin——承载计划不再把它改写成
+        // 相对路径，两个出站在这一点上待遇完全一致。
+        assert_eq!(
+            plan.outbound_cfgs[0].session_bases,
+            vec![Some("https://a.example:18443".to_string())],
+            "宿主同样原样透传"
+        );
         assert_eq!(
             plan.outbound_cfgs[1].session_bases,
             vec![Some("https://b.example:18450".to_string())],
             "非宿主要走自己那份被劫持的 origin"
         );
+    }
+
+    /// 会话基址必须**逐字**来自条带，一项都不能被承载计划改写。
+    ///
+    /// 改写回来的后果不是「基址不好看」：承载页是本机那张空 HTML，被改写
+    /// 的会话会把 Noise 握手发给它，握手拿到一段 HTML 后解析失败。
+    #[test]
+    fn session_bases_come_from_the_shard_verbatim() {
+        let cfg = config_with(vec![
+            proxy("A", &valid_pub(), &valid_priv()),
+            proxy("B", &valid_pub(), &valid_priv()),
+        ]);
+        let shard = vec![
+            crate::shard_setup::ShardPlanEntry {
+                page_url: "https://a.example:18443/".to_string(),
+                session_bases: vec![
+                    Some("https://a.example:18443".to_string()),
+                    Some("https://a.example:18444".to_string()),
+                ],
+                upstream: None,
+                bypass_error: None,
+            },
+            crate::shard_setup::ShardPlanEntry {
+                page_url: "https://b.example:18450/".to_string(),
+                session_bases: vec![Some("https://b.example:18450".to_string())],
+                upstream: None,
+                bypass_error: None,
+            },
+        ];
+        let plan = build_startup_plan(&cfg, &shard).unwrap();
+        assert_eq!(plan.outbound_cfgs[0].session_bases, shard[0].session_bases);
+        assert_eq!(plan.outbound_cfgs[1].session_bases, shard[1].session_bases);
+        for cfg in &plan.outbound_cfgs {
+            for b in &cfg.session_bases {
+                let b = b.as_ref().expect("没有任何会话还能吃相对路径");
+                assert!(b.starts_with("https://"), "数据面必须留在 https：{b}");
+            }
+        }
     }
 
     /// 下标错位就是把流量发去另一台服务器，必须报错而不是按短的那个截断。

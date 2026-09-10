@@ -62,9 +62,6 @@ struct Slot {
     window: String,
     /// 该窗口应加载的页面 URL。
     page_url: String,
-    /// 请求基址：`None` = 相对路径（与承载页面同源）；
-    /// `Some(origin)` = 绝对 URL（跨域名）。
-    base: Option<String>,
 }
 
 /// 承载计划：谁住哪个窗口、用什么基址发请求。
@@ -109,20 +106,12 @@ impl CarrierPlan {
             .expect("resolve_host 已保证宿主在表内");
 
         let mut slots = BTreeMap::new();
-        for (name, url) in &entries {
-            let base = if *name == host {
-                // 宿主用相对路径 → 完全同源，连 CORS 都不经过。
-                None
-            } else {
-                // 其余用绝对 URL → 跨域名，靠 CORS 放宽（Task 1）。
-                Some(origin_of(url)?)
-            };
+        for (name, _url) in &entries {
             slots.insert(
                 name.clone(),
                 Slot {
                     window: SHARED_WINDOW.to_string(),
                     page_url: host_page.clone(),
-                    base,
                 },
             );
         }
@@ -144,8 +133,6 @@ impl CarrierPlan {
                 Slot {
                     window: format!("{ISOLATED_WINDOW_PREFIX}{name}"),
                     page_url: url.clone(),
-                    // 自己的窗口加载自己的页面 ⇒ 同源 ⇒ 相对路径。
-                    base: None,
                 },
             );
         }
@@ -177,18 +164,12 @@ impl CarrierPlan {
         &self.host
     }
 
-    /// 该出站的请求基址。
-    ///
-    /// 两层 `Option` 各有含义，不要压扁：
-    /// - 外层 `None` = **不认识这个出站**。调用方必须当错误处理 ——
-    ///   悄悄给个默认基址就等于把流量发去了另一台服务器。
-    /// - 内层 `None` = 用相对路径（与承载页面同源）。
-    /// - 内层 `Some(origin)` = 用绝对 URL（跨域名）。
-    pub fn base_for(&self, name: &str) -> Option<Option<String>> {
-        self.slots.get(name).map(|s| s.base.clone())
-    }
-
     /// 该出站落在哪个窗口。未知出站返回 `None`。
+    ///
+    /// **`None` 必须当错误处理**：认不出这个出站，说明承载计划与出站表不
+    /// 同步，悄悄放过去就等于让一个没有窗口承载的出站去发请求——与 §6.4
+    /// 「绝不给一个默认值把流量发去别处」同源。这条防线原本立在 `base_for`
+    /// 上，数据面基址的职责搬去条带之后挪到了这里。
     pub fn window_label(&self, name: &str) -> Option<String> {
         self.slots.get(name).map(|s| s.window.clone())
     }
@@ -272,7 +253,7 @@ pub fn spawn_carrier_windows(
 /// 校验出站表：非空、无重名、名字非空、URL 可解析出 origin。
 ///
 /// 这四条全都**报错而非兜底**：
-/// - 重名会让 `base_for` / `window_label` 变成「看谁后写入」，在 `isolated` 下
+/// - 重名会让 `window_label` 变成「看谁后写入」，在 `isolated` 下
 ///   还会撞窗口标签（Tauri 建第二个同标签窗口直接失败），是个会拖到运行期才
 ///   炸的隐蔽错误；
 /// - 空名字在 `isolated` 下生成 `wsieve-transport-` 这种标签，而且规则根本
@@ -353,23 +334,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shared_carrier_gives_host_relative_path_and_others_absolute() {
-        let c = CarrierPlan::shared(
-            "日本节点",
-            &[("日本节点", "https://a.com/"), ("新加坡", "https://b.net/")],
-        )
-        .unwrap();
-        // 宿主用相对路径 → 完全同源
-        assert_eq!(c.base_for("日本节点"), Some(None));
-        // 其余用绝对 URL → 跨域名，靠 CORS 放宽（Task 1）
-        assert_eq!(c.base_for("新加坡"), Some(Some("https://b.net".to_string())));
-    }
-
-    #[test]
     fn host_defaults_to_first_enabled_when_unspecified() {
         let c = CarrierPlan::shared("", &[("A", "https://a.com/"), ("B", "https://b.net/")]).unwrap();
         assert_eq!(c.host_name(), "A");
-        assert_eq!(c.base_for("A"), Some(None));
     }
 
     #[test]
@@ -385,9 +352,6 @@ mod tests {
         let c = CarrierPlan::isolated(&[("A", "https://a.com/"), ("B", "https://b.net/")]).unwrap();
         assert_eq!(c.window_label("A"), Some("wsieve-transport-A".to_string()));
         assert_eq!(c.window_label("B"), Some("wsieve-transport-B".to_string()));
-        // 各自加载自己的页面，全部同源，都用相对路径
-        assert_eq!(c.base_for("A"), Some(None));
-        assert_eq!(c.base_for("B"), Some(None));
         assert_eq!(c.page_url_for("A").as_deref(), Some("https://a.com/"));
         assert_eq!(c.page_url_for("B").as_deref(), Some("https://b.net/"));
     }
@@ -416,38 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outbound_yields_none_never_a_default_base() {
-        // §6.4：认不出的出站必须让调用方拿到 None 去拒绝，
-        // 而不是拿到一个「默认」基址把流量发去别处。
+    fn unknown_outbound_yields_none_never_a_default_window() {
+        // §6.4：认不出的出站必须让调用方拿到 None 去拒绝。这条防线原本
+        // 立在 base_for 上，基址职责搬走之后由 window_label 承担。
         let c = CarrierPlan::shared("A", &[("A", "https://a.com/")]).unwrap();
-        assert_eq!(c.base_for("不存在的节点"), None);
         assert_eq!(c.window_label("不存在的节点"), None);
         assert_eq!(c.page_url_for("不存在的节点"), None);
     }
 
     #[test]
-    fn host_going_down_does_not_change_anyone_elses_base() {
-        // shared 的全部风险都在这里：宿主挂了，其他出站还能不能发请求。
-        // 结构上的答案是「能」—— 非宿主的基址是绝对 URL，与宿主的存活
-        // 无关；页面已经加载完毕，emitter 在页面上下文里继续跑。
-        // 这个测试锁住的是：非宿主的基址里**不含**任何指向宿主的东西。
-        let c = CarrierPlan::shared(
-            "宿主",
-            &[("宿主", "https://host.example/"), ("邻居", "https://peer.example/")],
-        )
-        .unwrap();
-        let peer = c.base_for("邻居").unwrap().unwrap();
-        assert_eq!(peer, "https://peer.example");
-        assert!(
-            !peer.contains("host.example"),
-            "非宿主出站的请求基址一旦掺进宿主域名，宿主下线就会连累它：{peer}"
-        );
-    }
-
-    #[test]
     fn duplicate_outbound_names_are_an_error() {
         // 重名在 isolated 下会撞窗口标签（Tauri 建第二个同标签窗口直接失败），
-        // 在 shared 下会让 base_for 变成「看谁后写入」。必须早报。
+        // 在 shared 下会让 window_label 变成「看谁后写入」。必须早报。
         let e = CarrierPlan::shared("", &[("A", "https://a.com/"), ("A", "https://b.net/")])
             .unwrap_err()
             .to_string();
@@ -504,9 +448,9 @@ mod tests {
         let obs = [("A", "https://a.com/"), ("B", "https://b.net/")];
         let s = CarrierPlan::build(CarrierMode::Shared, "B", &obs).unwrap();
         assert_eq!(s.host_name(), "B");
-        assert_eq!(s.base_for("A"), Some(Some("https://a.com".into())));
+        assert_eq!(s.window_label("A"), Some(SHARED_WINDOW.to_string()));
         let i = CarrierPlan::build(CarrierMode::Isolated, "B", &obs).unwrap();
-        assert_eq!(i.base_for("A"), Some(None));
+        assert_eq!(i.window_label("A"), Some("wsieve-transport-A".to_string()));
         assert_eq!(i.outbounds(), vec!["A".to_string(), "B".to_string()]);
     }
 
@@ -574,12 +518,10 @@ mod tests {
         use wsieve_proto::hello::MuxId;
         use wsieve_transport::{HttpTransport, PostReply};
 
-        let plan = CarrierPlan::shared(
-            "宿主",
-            &[("宿主", "https://host.example/"), ("邻居", "https://peer.example/")],
-        )
-        .unwrap();
         // 一个 core 对应一个 WebView，两个出站共用 —— 这正是 shared 的定义。
+        // session_bases 不再从 CarrierPlan 取——那是条带的职责，此处直接
+        // 写死（这正是改动后条带会给出的形态），构造 CarrierPlan 本身对
+        // 本测试已经没有意义。
         let core = Arc::new(TransportCore::new());
 
         // ── 出站 A（宿主）：服务端是死的 ──
@@ -610,7 +552,7 @@ mod tests {
             server_pub: [7u8; 32],
             client_priv: [9u8; 32],
             mux_prefs: vec![MuxId::Wsmux],
-            session_bases: vec![plan.base_for("宿主").unwrap()],
+            session_bases: vec![Some("https://host.example:18443".to_string())],
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         });
         let a2 = a.clone();
@@ -656,7 +598,7 @@ mod tests {
 
         // ── 断言四：B 在同一个 core 上仍然发得出请求、收得到应答 ──
         // 这是「A 挂了 B 还活着」的数据面证据，不是结构推断。
-        let b_base = plan.base_for("邻居").unwrap().unwrap();
+        let b_base = "https://peer.example".to_string();
         let b_core = core.clone();
         let b_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let bs = b_seen.clone();

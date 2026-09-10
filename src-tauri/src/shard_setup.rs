@@ -75,7 +75,15 @@ impl ShardPlanEntry {
     fn degraded(server_url: &str) -> Self {
         Self {
             page_url: server_url.to_string(),
-            session_bases: vec![None],
+            // 会话 0 也用显式绝对 origin。它曾经吃相对路径，前提是「承载页
+            // 就是它的 origin」——承载页挪到本机 http 壳之后这个前提没了。
+            //
+            // 取不出 origin 时退回原样：走到这条路径的 URL 有一部分正是因为
+            // `split_url` 失败才降级的，此处再制造一个失败点没有意义。坏 URL
+            // 会在 fetch 时报错，那是能看见的失败。
+            session_bases: vec![Some(
+                origin_of(server_url).unwrap_or_else(|_| server_url.to_string()),
+            )],
             upstream: None,
             bypass_error: None,
         }
@@ -138,6 +146,22 @@ fn split_url(url: &str) -> anyhow::Result<(String, String, u16)> {
         }
     };
     Ok((scheme.to_string(), host, port))
+}
+
+/// 从 URL 取出 origin（`scheme://authority`，无路径、无尾斜杠）。
+///
+/// 与 `split_url` 的区别是**不归一默认端口**：`https://a.com:443` 与
+/// `https://a.com` 对 fetch 等价，但保留用户写的原样能让日志里的基址和配置
+/// 文件对得上。数据面基址要给 WebView 直接拼路径用，所以走这一个。
+fn origin_of(url: &str) -> anyhow::Result<String> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("URL 缺少 scheme: {url}"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        anyhow::bail!("URL 缺少主机: {url}");
+    }
+    Ok(format!("{scheme}://{authority}"))
 }
 
 /// 域名是否值得劫持。IP 字面量与环回主机不劫持：IP 没有「同域名不同端口
@@ -276,12 +300,14 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
         };
 
         let ports = forwarder.ports().to_vec();
-        let origin = |p: u16| format!("{scheme}://{host}:{p}");
-        // 会话 0 用相对路径：页面本身就加载自该 origin，保持完全同源
-        // （spec §6.7），只有额外会话才跨源。
-        let mut session_bases = vec![None];
-        session_bases.extend(ports.iter().skip(1).map(|p| Some(origin(*p))));
-        let page_url = format!("{}/", origin(ports[0]));
+        // 数据面的 origin。**与承载页的 scheme 无关**：承载页是本机的 http
+        // 壳，而数据面必须留在 https 才有真实 TLS 指纹。两者共用一个闭包，
+        // 下一次有人改承载页 scheme 就会把数据面一起带歪。
+        let data_origin = |p: u16| format!("{scheme}://{host}:{p}");
+        // 每条会话都用显式绝对 URL，**含会话 0**——见 degraded 上的注释。
+        let session_bases: Vec<Option<String>> =
+            ports.iter().map(|p| Some(data_origin(*p))).collect();
+        let page_url = format!("{}/", data_origin(ports[0]));
 
         prepared.push(Prepared {
             idx,
@@ -358,6 +384,46 @@ mod tests {
             base_port,
             extra_sessions,
             on_upstream: None,
+        }
+    }
+
+    #[test]
+    fn degraded_gives_session_zero_an_explicit_absolute_origin() {
+        // 会话 0 曾经吃相对路径，前提是「承载页就是它的 origin」。
+        // 承载页马上要挪到本机 http 壳上（下一个任务），这个前提消失，
+        // 因此降级路径也必须显式写死数据面 origin。
+        let e = ShardPlanEntry::degraded("https://a.example/some/path");
+        assert_eq!(
+            e.session_bases,
+            vec![Some("https://a.example".to_string())],
+            "降级路径的会话 0 必须是绝对 origin，且路径要被剥掉"
+        );
+    }
+
+    #[test]
+    fn degraded_keeps_an_explicit_port_verbatim() {
+        // 不归一默认端口：https://a:443 与 https://a 对 fetch 等价，
+        // 但保留原样能让日志里的基址和配置文件对得上。
+        let e = ShardPlanEntry::degraded("https://a.example:8443/");
+        assert_eq!(e.session_bases, vec![Some("https://a.example:8443".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn no_session_base_is_ever_relative() {
+        // 钉死「没有任何一项是 None」——None 意味着相对路径，而承载页
+        // 已经不是任何出站的 origin 了。
+        //
+        // 走降级路径：劫持路径要真实 DNS 解析 + 真的起转发器，单测里既慢
+        // 又不确定（离线环境直接降级），那条腿交给 Task 5 的真机走查。
+        // 不变量本身两条路径是同一条。
+        let r = plan_many(
+            vec![target("https://x.com/", 18443, 0)],
+            "/nonexistent".into(),
+        )
+        .await;
+        for (i, b) in r.entries[0].session_bases.iter().enumerate() {
+            let b = b.as_ref().unwrap_or_else(|| panic!("会话 {i} 的基址是 None"));
+            assert!(b.starts_with("https://"), "会话 {i} 的基址必须是 https：{b}");
         }
     }
 
