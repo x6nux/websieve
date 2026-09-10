@@ -54,8 +54,6 @@ pub struct ShardTarget {
 /// 单个出站的编排结果（不含 guard——guard 是整批共享的一份，见
 /// [`ShardManyPlan::guard`]）。
 pub struct ShardPlanEntry {
-    /// 主 WebView 应加载的 URL（劫持生效时是本地端口）。
-    pub page_url: String,
     /// 各会话的请求基址；`None` 表示该会话用相对路径（同源，即会话 0）。
     pub session_bases: Vec<Option<String>>,
     /// 解析到的服务器真实地址。`None` 表示本次走了降级路径，压根没解析。
@@ -71,19 +69,19 @@ pub struct ShardPlanEntry {
 }
 
 impl ShardPlanEntry {
-    /// 降级：不劫持、单会话、页面就是原始 URL。
+    /// 降级：不劫持、单会话，会话 0 用原始 URL 的 origin。
     fn degraded(server_url: &str) -> Self {
         Self {
-            page_url: server_url.to_string(),
             // 会话 0 也用显式绝对 origin。它曾经吃相对路径，前提是「承载页
             // 就是它的 origin」——承载页挪到本机 http 壳之后这个前提没了。
             //
             // 取不出 origin 时退回原样：走到这条路径的 URL 有一部分正是因为
             // `split_url` 失败才降级的，此处再制造一个失败点没有意义。真正
-            // 挡住这种坏 URL 的安全网是 `carrier::validate`——它会对同一个
-            // 字符串再跑一遍 `origin_of` 并拒绝非法 URL。这道网立在另一个
-            // 模块里，两边一旦失步，这里退回原样就会悄悄拼出一个指向承载页
-            // origin 的相对 URL——脆，但今天真实拦截它的就是这道网。
+            // 挡住这种坏 URL 的安全网是 `runtime_state::build_startup_plan`——
+            // 它对 `config.proxies[].url`（与这里的 `server_url` 是同一个
+            // 字符串）逐个再跑一遍 `origin_of` 并拒绝非法 URL。这道网立在
+            // 另一个模块里，两边一旦失步，这里退回原样就会悄悄拼出一个指向
+            // 承载页 origin 的相对 URL——脆，但今天真实拦截它的就是这道网。
             session_bases: vec![Some(
                 origin_of(server_url).unwrap_or_else(|_| server_url.to_string()),
             )],
@@ -156,7 +154,13 @@ fn split_url(url: &str) -> anyhow::Result<(String, String, u16)> {
 /// 与 `split_url` 的区别是**不归一默认端口**：`https://a.com:443` 与
 /// `https://a.com` 对 fetch 等价，但保留用户写的原样能让日志里的基址和配置
 /// 文件对得上。数据面基址要给 WebView 直接拼路径用，所以走这一个。
-fn origin_of(url: &str) -> anyhow::Result<String> {
+///
+/// `pub(crate)`：`runtime_state::build_startup_plan` 复用它来校验
+/// `config.proxies[].url`。这道校验以前长在 `outbound::carrier::validate`
+/// 里，承载计划不再摸出站 URL 之后无处可挂，只能搬家；`outbound::carrier`
+/// 那边本来也有一份 `origin_of`（已随 `validate` 一起删掉），两份重复实现
+/// 不该再添第三份，直接复用这一份。
+pub(crate) fn origin_of(url: &str) -> anyhow::Result<String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| anyhow::anyhow!("URL 缺少 scheme: {url}"))?;
@@ -183,7 +187,6 @@ struct Prepared {
     host: String,
     forwarder: Forwarder,
     session_bases: Vec<Option<String>>,
-    page_url: String,
     upstream: SocketAddr,
     bypass_error: Option<String>,
 }
@@ -310,7 +313,6 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
         // 每条会话都用显式绝对 URL，**含会话 0**——见 degraded 上的注释。
         let session_bases: Vec<Option<String>> =
             ports.iter().map(|p| Some(data_origin(*p))).collect();
-        let page_url = format!("{}/", data_origin(ports[0]));
 
         prepared.push(Prepared {
             idx,
@@ -318,7 +320,6 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
             host,
             forwarder,
             session_bases,
-            page_url,
             upstream,
             bypass_error,
         });
@@ -348,7 +349,6 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
             let mut forwarders = Vec::with_capacity(prepared.len());
             for p in prepared {
                 entries[p.idx] = Some(ShardPlanEntry {
-                    page_url: p.page_url,
                     session_bases: p.session_bases,
                     upstream: Some(p.upstream),
                     bypass_error: p.bypass_error,
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn degraded_gives_session_zero_an_explicit_absolute_origin() {
         // 会话 0 曾经吃相对路径，前提是「承载页就是它的 origin」。
-        // 承载页马上要挪到本机 http 壳上（下一个任务），这个前提消失，
+        // 承载页已经挪到本机 http 壳上，这个前提不再成立，
         // 因此降级路径也必须显式写死数据面 origin。
         let e = ShardPlanEntry::degraded("https://a.example/some/path");
         assert_eq!(
@@ -462,13 +462,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_extra_sessions_keeps_original_url() {
+    async fn zero_extra_sessions_degrades_to_a_single_absolute_origin() {
         let r = plan_many(
             vec![target("https://x.com/", 18443, 0)],
             "/nonexistent".into(),
         )
         .await;
-        assert_eq!(r.entries[0].page_url, "https://x.com/");
+        assert_eq!(
+            r.entries[0].session_bases,
+            vec![Some("https://x.com".to_string())]
+        );
         assert_eq!(r.entries[0].session_count(), 1);
         assert!(r.guard.is_none());
     }
@@ -481,7 +484,10 @@ mod tests {
             "/proc/definitely-not-writable/hosts".into(),
         )
         .await;
-        assert_eq!(r.entries[0].page_url, "https://x.com/");
+        assert_eq!(
+            r.entries[0].session_bases,
+            vec![Some("https://x.com".to_string())]
+        );
         assert_eq!(r.entries[0].session_count(), 1);
         assert!(r.guard.is_none());
     }
@@ -573,7 +579,6 @@ mod tests {
     #[test]
     fn a_failing_bypass_hook_is_recorded_rather_than_swallowed() {
         let e = ShardPlanEntry {
-            page_url: "https://x.com/".into(),
             session_bases: vec![None],
             upstream: Some("203.0.113.7:443".parse().unwrap()),
             bypass_error: Some("must be root to alter routing table".into()),
@@ -636,9 +641,18 @@ mod tests {
         .await;
         assert!(r.guard.is_none(), "没有任何目标真的需要劫持");
         assert_eq!(r.entries.len(), 3);
-        assert_eq!(r.entries[0].page_url, "https://a.example/");
-        assert_eq!(r.entries[1].page_url, "https://127.0.0.1:8443/");
-        assert_eq!(r.entries[2].page_url, "not-a-url");
+        assert_eq!(
+            r.entries[0].session_bases,
+            vec![Some("https://a.example".to_string())]
+        );
+        assert_eq!(
+            r.entries[1].session_bases,
+            vec![Some("https://127.0.0.1:8443".to_string())]
+        );
+        assert_eq!(
+            r.entries[2].session_bases,
+            vec![Some("not-a-url".to_string())]
+        );
         for e in &r.entries {
             assert_eq!(e.session_count(), 1);
             assert!(e.upstream.is_none());

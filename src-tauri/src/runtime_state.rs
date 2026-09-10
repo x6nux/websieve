@@ -285,11 +285,13 @@ pub fn diff_outbounds(
 /// `OutboundInstance`、建窗口、跑本地条带）两半——前者不依赖 Tauri，
 /// 可以脱离真实文件系统/网络单测；后者留给调用方。
 ///
-/// **本地条带的结果是输入而不是输出**：会话基址与承载页面 URL 都取决于
-/// hosts 劫持有没有成功（成功则页面加载的是本地转发端口，失败则是原始
-/// 服务端 URL），而那是异步 IO，不属于"纯"的范围。因此调用方先跑
-/// `shard_setup::plan_many`，把结果原样递进来——`ShardPlanEntry` 是纯数据，
-/// 本函数照旧可以脱离 Tauri/网络单测。
+/// **本地条带的结果是输入而不是输出**：会话基址取决于 hosts 劫持有没有
+/// 成功（成功则是本地转发端口，失败则是原始服务端的 origin），而那是异步
+/// IO，不属于"纯"的范围。因此调用方先跑 `shard_setup::plan_many`，把结果
+/// 原样递进来——`ShardPlanEntry` 是纯数据，本函数照旧可以脱离 Tauri/网络
+/// 单测。**承载页面 URL 与本地条带无关**：它是本机 http 壳的固定地址
+/// （`carrier_page::spawn` 分配的端口），由调用方作为 `carrier_page_url`
+/// 单独注入。
 #[derive(Debug)]
 pub struct StartupPlan {
     pub outbound_cfgs: Vec<crate::outbound::instance::OutboundCfg>,
@@ -412,6 +414,7 @@ pub fn build_resolver(
 pub fn build_startup_plan(
     config: &wsieve_config::Config,
     shard: &[crate::shard_setup::ShardPlanEntry],
+    carrier_page_url: &str,
 ) -> anyhow::Result<StartupPlan> {
     if shard.len() != config.proxies.len() {
         anyhow::bail!(
@@ -421,23 +424,31 @@ pub fn build_startup_plan(
         );
     }
 
-    // 承载计划先算：它要的页面 URL 来自条带（劫持成功时是本地端口）。
-    // **会话基址不再经过它**——每条会话的基址都由条带全权给出（含会话 0），
-    // 承载计划只负责「谁落在哪个窗口、那个窗口加载什么」。
+    // 出站 URL 合法性校验：这道校验以前长在 `outbound::carrier::validate`
+    // 里（那时承载页的 URL 就是出站 URL 的 origin，非法 URL 会在那一步现形）。
+    // 承载页挪到本机 http 壳之后，承载计划完全不摸出站 URL 了，这道校验就
+    // 无处可挂——只能搬到这里，直接校验 `config.proxies[].url` 本身。
+    // 不是可省的活：`ShardPlanEntry::degraded` 在 `origin_of` 解析失败时会
+    // 静默退回原始字符串（见它的注释），没有这一步，坏 URL 会一路滑到
+    // `OutboundCfg` 里才在请求时炸，而不是在启动时报清楚是哪个出站配错了。
+    for p in &config.proxies {
+        crate::shard_setup::origin_of(&p.url)
+            .map_err(|e| anyhow::anyhow!("出站「{}」的 url 不是合法的 URL: {e}", p.name))?;
+    }
+
+    // 承载计划：单张本机 http 壳页面，与出站 URL 完全无关——`carrier_page_url`
+    // 由调用方（main.rs）注入，是本地 server 分配的端口，这里只管
+    // 「谁落在哪个窗口」。
     let carrier = if config.proxies.is_empty() {
         None
     } else {
         let mode = crate::outbound::carrier::CarrierMode::parse(&config.carrier)?;
-        let entries: Vec<(&str, &str)> = config
-            .proxies
-            .iter()
-            .zip(shard)
-            .map(|(p, e)| (p.name.as_str(), e.page_url.as_str()))
-            .collect();
+        let names: Vec<&str> = config.proxies.iter().map(|p| p.name.as_str()).collect();
         Some(crate::outbound::carrier::CarrierPlan::build(
             mode,
             &config.carrier_host,
-            &entries,
+            &names,
+            carrier_page_url,
         )?)
     };
 
@@ -752,7 +763,6 @@ mod startup_plan_tests {
         cfg.proxies
             .iter()
             .map(|p| crate::shard_setup::ShardPlanEntry {
-                page_url: p.url.clone(),
                 session_bases: vec![None; p.extra_sessions + 1],
                 upstream: None,
                 bypass_error: None,
@@ -761,8 +771,10 @@ mod startup_plan_tests {
     }
 
     /// 测试入口：把 `shard_for` 的结果一并递进去，省得每个用例重复两行。
+    /// 承载页 URL 统一用这个固定值——测试不关心它具体是什么端口，只关心
+    /// 它被原样传给 `CarrierPlan::build`。
     fn plan_of(cfg: &wsieve_config::Config) -> anyhow::Result<StartupPlan> {
-        build_startup_plan(cfg, &shard_for(cfg))
+        build_startup_plan(cfg, &shard_for(cfg), "http://127.0.0.1:53119/")
     }
 
     #[test]
@@ -943,6 +955,21 @@ mod startup_plan_tests {
         assert!(err.contains('A'), "错误要点名是哪个出站：{err}");
     }
 
+    /// 出站 URL 合法性校验：这道校验以前长在 `outbound::carrier::validate`
+    /// 里（承载页的 URL 曾经就是出站 URL 的 origin，非法 URL 在那一步现形）。
+    /// 承载页挪到本机 http 壳之后，承载计划不再摸出站 URL，`build_startup_plan`
+    /// 因此接手了这道校验，复用 `shard_setup::origin_of`——非法 URL 必须在
+    /// 启动时就报错并点名是哪个出站，而不是被 `ShardPlanEntry::degraded` 悄悄
+    /// 退回原始字符串、一路滑到运行时才在握手阶段炸给用户一个不知所云的错误。
+    #[test]
+    fn a_malformed_proxy_url_is_rejected_with_the_outbound_name() {
+        let mut p = proxy("A", &valid_pub(), &valid_priv());
+        p.url = "not-a-url".to_string();
+        let cfg = config_with(vec![p]);
+        let err = plan_of(&cfg).unwrap_err().to_string();
+        assert!(err.contains('A'), "错误要点名是哪个出站：{err}");
+    }
+
     #[test]
     fn two_proxies_with_shared_carrier_share_one_window_label() {
         let cfg = config_with(vec![
@@ -971,16 +998,15 @@ mod startup_plan_tests {
         assert_ne!(carrier.window_label("A"), carrier.window_label("B"));
     }
 
-    /// **承载页面必须是条带算出来的 URL，不是配置里的原始 URL。**
+    /// **承载页面 URL 是调用方注入的 `carrier_page_url`，与条带完全无关。**
     ///
-    /// hosts 劫持成功时，页面要加载的是本地转发端口；照抄配置里的原始
-    /// URL 会让会话 0 直连 :443，绕过整条转发链——多 TCP 条带的第一条腿
-    /// 就此静默失效，而日志里一切正常。
+    /// 承载页挪到本机 http 壳之后，窗口加载的地址不再从条带推导——刻意让
+    /// shard 的 session_bases 落在另一个域名上，确认承载窗口不会被这些
+    /// 数据面地址污染，也不会去抄它们。
     #[test]
-    fn the_carrier_page_comes_from_the_shard_result_not_the_raw_config_url() {
+    fn the_carrier_page_is_the_injected_url_independent_of_the_shard() {
         let cfg = config_with(vec![proxy("A", &valid_pub(), &valid_priv())]);
         let shard = vec![crate::shard_setup::ShardPlanEntry {
-            page_url: "https://a.example:18443/".to_string(),
             session_bases: vec![
                 Some("https://a.example:18443".to_string()),
                 Some("https://a.example:18444".to_string()),
@@ -988,58 +1014,20 @@ mod startup_plan_tests {
             upstream: None,
             bypass_error: None,
         }];
-        let plan = build_startup_plan(&cfg, &shard).unwrap();
+        let plan = build_startup_plan(&cfg, &shard, "http://127.0.0.1:53119/").unwrap();
         let carrier = plan.carrier.expect("有出站就该有承载计划");
         assert_eq!(
             carrier.windows(),
-            vec![("main".to_string(), "https://a.example:18443/".to_string())],
-            "承载窗口该加载条带给出的本地端口页面"
+            vec![("main".to_string(), "http://127.0.0.1:53119/".to_string())],
+            "承载窗口该加载调用方注入的本机 http 壳地址，不是条带的数据面 origin"
         );
-        // 整份 session_bases 原样透传——会话 0 也是条带给的绝对 URL，
-        // 不再被承载计划改写成「相对路径」。
+        // session_bases 原样透传，与承载页 URL 互不干扰。
         assert_eq!(
             plan.outbound_cfgs[0].session_bases,
             vec![
                 Some("https://a.example:18443".to_string()),
                 Some("https://a.example:18444".to_string()),
             ]
-        );
-    }
-
-    /// shared 模式下**非宿主**出站拿到的是绝对 URL（跨域名），而这个 URL
-    /// 也必须来自条带——否则非宿主出站的全部会话都会绕过转发器。
-    #[test]
-    fn a_non_host_outbound_gets_an_absolute_base_taken_from_its_shard_page() {
-        let cfg = config_with(vec![
-            proxy("A", &valid_pub(), &valid_priv()),
-            proxy("B", &valid_pub(), &valid_priv()),
-        ]);
-        let shard = vec![
-            crate::shard_setup::ShardPlanEntry {
-                page_url: "https://a.example:18443/".to_string(),
-                session_bases: vec![Some("https://a.example:18443".to_string())],
-                upstream: None,
-                bypass_error: None,
-            },
-            crate::shard_setup::ShardPlanEntry {
-                page_url: "https://b.example:18450/".to_string(),
-                session_bases: vec![Some("https://b.example:18450".to_string())],
-                upstream: None,
-                bypass_error: None,
-            },
-        ];
-        let plan = build_startup_plan(&cfg, &shard).unwrap();
-        // 宿主的会话 0 也是条带给的绝对 origin——承载计划不再把它改写成
-        // 相对路径，两个出站在这一点上待遇完全一致。
-        assert_eq!(
-            plan.outbound_cfgs[0].session_bases,
-            vec![Some("https://a.example:18443".to_string())],
-            "宿主同样原样透传"
-        );
-        assert_eq!(
-            plan.outbound_cfgs[1].session_bases,
-            vec![Some("https://b.example:18450".to_string())],
-            "非宿主要走自己那份被劫持的 origin"
         );
     }
 
@@ -1055,7 +1043,6 @@ mod startup_plan_tests {
         ]);
         let shard = vec![
             crate::shard_setup::ShardPlanEntry {
-                page_url: "https://a.example:18443/".to_string(),
                 session_bases: vec![
                     Some("https://a.example:18443".to_string()),
                     Some("https://a.example:18444".to_string()),
@@ -1064,13 +1051,12 @@ mod startup_plan_tests {
                 bypass_error: None,
             },
             crate::shard_setup::ShardPlanEntry {
-                page_url: "https://b.example:18450/".to_string(),
                 session_bases: vec![Some("https://b.example:18450".to_string())],
                 upstream: None,
                 bypass_error: None,
             },
         ];
-        let plan = build_startup_plan(&cfg, &shard).unwrap();
+        let plan = build_startup_plan(&cfg, &shard, "http://127.0.0.1:53119/").unwrap();
         assert_eq!(plan.outbound_cfgs[0].session_bases, shard[0].session_bases);
         assert_eq!(plan.outbound_cfgs[1].session_bases, shard[1].session_bases);
         for cfg in &plan.outbound_cfgs {
@@ -1089,12 +1075,11 @@ mod startup_plan_tests {
             proxy("B", &valid_pub(), &valid_priv()),
         ]);
         let short = vec![crate::shard_setup::ShardPlanEntry {
-            page_url: "https://a.example/".to_string(),
             session_bases: vec![None],
             upstream: None,
             bypass_error: None,
         }];
-        assert!(build_startup_plan(&cfg, &short).is_err());
+        assert!(build_startup_plan(&cfg, &short, "http://127.0.0.1:53119/").is_err());
     }
 
     #[test]

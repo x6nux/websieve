@@ -9,16 +9,15 @@
 //!
 //! 两种模式：
 //!
-//! - **`shared`（默认）**：一个 WebView 加载**宿主出站**的页面。宿主用相对
-//!   路径（完全同源），其余出站用绝对 URL（跨域名，靠服务端 CORS 放宽成立）。
-//!   已实测确证：单个真实 WKWebView 与两个**不同 eTLD+1** 的服务端各完成一次
-//!   完整 Noise 握手、数据面均跑通，见
+//! - **`shared`（默认）**：一个 WebView 加载本机承载页（`crate::carrier_page`），
+//!   全部出站挂在上面，各自用**绝对 URL** 发请求。承载页是本机的 http 壳，
+//!   与任何出站都不同源，因此不存在「谁能吃相对路径」的区分。
+//!   跨域名可行已实测确证，见
 //!   `docs/superpowers/spikes/2026-08-25-cross-origin-carrier-spike.md`。
-//!   成立前提是 sid 走 query 而非 cookie（§3.2）—— 若走 cookie，Safari 的 ITP
-//!   会把跨域名请求的 cookie 全部拦掉，这条路当场作废。
-//! - **`isolated`**：每出站一个隐藏窗口，各自加载自己的页面，全部同源。
-//!   换来故障隔离，代价是内存（实测首个约 128 MB、其后每个约 27 MB —— 多个
-//!   WKWebView 共用 WebContent 进程池，**不是**旧说法里的 N×）。
+//! - **`isolated`**：每出站一个隐藏窗口，各自加载**同一张**本机承载页，
+//!   与 `shared` 的差别收敛到只剩「建几个窗口」。换来故障隔离，代价是内存
+//!   （实测首个约 128 MB、其后每个约 27 MB —— 多个 WKWebView 共用
+//!   WebContent 进程池，**不是**旧说法里的 N×）。
 //!
 //! **故障隔离**：`shared` 的全部风险都在「出站 A 挂掉会不会连累出站 B」。
 //! 答案由两条结构性保证给出，二者都有测试：
@@ -27,8 +26,8 @@
 //!    `instance.rs`，测试 `stopping_instance_exits_the_loop_without_touching_core`
 //!    与 `one_outbound_failing_does_not_kill_its_neighbour`）。core 的生死归管理器。
 //! 2. 宿主出站下线**不影响**其他出站：页面已加载完毕，emitter 在页面上下文里
-//!    继续跑，宿主与非宿主在 `CarrierPlan` 里的差别仅仅是「用相对还是绝对
-//!    URL」，没有任何调用依赖（测试 `host_going_down_does_not_change_anyone_elses_base`）。
+//!    继续跑，各出站的数据面基址是条带给出的各自独立的绝对 URL，互不依赖
+//!    ——「宿主」在这一层只剩语义归属，不影响任何请求的落点。
 
 use std::collections::BTreeMap;
 
@@ -90,28 +89,21 @@ pub const SHARED_WINDOW: &str = "main";
 pub const ISOLATED_WINDOW_PREFIX: &str = "wsieve-transport-";
 
 impl CarrierPlan {
-    /// `shared`：一个 WebView 加载宿主的页面，其余用绝对 URL。
+    /// `shared`：一个 WebView 加载承载页，全部出站挂在上面。
     ///
-    /// `host` 传空串表示「未指定」，取第一个启用的出站。
-    /// `outbounds` 为 `(出站名, 页面 URL)`，顺序即配置里的启用顺序。
-    pub fn shared(host: &str, outbounds: &[(&str, &str)]) -> anyhow::Result<Self> {
+    /// `host` 传空串表示「未指定」，取第一个启用的出站。**宿主这个概念在
+    /// 基址职责搬走之后只剩语义归属与错误信息**——它不再影响任何一个出站的
+    /// 请求发往何处（那些全部由条带给出的绝对 URL 决定）。
+    pub fn shared(host: &str, outbounds: &[&str], page_url: &str) -> anyhow::Result<Self> {
         let entries = validate(outbounds)?;
         let host = resolve_host(host, &entries)?;
-        // 宿主的页面就是这个窗口加载的页面 —— 其余出站的请求全都从这张
-        // 页面上发出去，因此它们的 page_url 也是同一个。
-        let host_page = entries
-            .iter()
-            .find(|(n, _)| *n == host)
-            .map(|(_, u)| u.clone())
-            .expect("resolve_host 已保证宿主在表内");
-
         let mut slots = BTreeMap::new();
-        for (name, _url) in &entries {
+        for name in &entries {
             slots.insert(
                 name.clone(),
                 Slot {
                     window: SHARED_WINDOW.to_string(),
-                    page_url: host_page.clone(),
+                    page_url: page_url.to_string(),
                 },
             );
         }
@@ -122,17 +114,20 @@ impl CarrierPlan {
         })
     }
 
-    /// `isolated`：每出站一个隐藏窗口，各自加载自己的页面，全部同源。
-    pub fn isolated(outbounds: &[(&str, &str)]) -> anyhow::Result<Self> {
+    /// `isolated`：每出站一个隐藏窗口。
+    ///
+    /// 它们加载的是**同一个**本机承载 server 的同一张 HTML —— 与 `shared`
+    /// 的差别收敛到只剩「建几个窗口」。
+    pub fn isolated(outbounds: &[&str], page_url: &str) -> anyhow::Result<Self> {
         let entries = validate(outbounds)?;
-        let host = entries[0].0.clone();
+        let host = entries[0].clone();
         let mut slots = BTreeMap::new();
-        for (name, url) in &entries {
+        for name in &entries {
             slots.insert(
                 name.clone(),
                 Slot {
                     window: format!("{ISOLATED_WINDOW_PREFIX}{name}"),
-                    page_url: url.clone(),
+                    page_url: page_url.to_string(),
                 },
             );
         }
@@ -147,11 +142,12 @@ impl CarrierPlan {
     pub fn build(
         mode: CarrierMode,
         host: &str,
-        outbounds: &[(&str, &str)],
+        outbounds: &[&str],
+        page_url: &str,
     ) -> anyhow::Result<Self> {
         match mode {
-            CarrierMode::Shared => Self::shared(host, outbounds),
-            CarrierMode::Isolated => Self::isolated(outbounds),
+            CarrierMode::Shared => Self::shared(host, outbounds, page_url),
+            CarrierMode::Isolated => Self::isolated(outbounds, page_url),
         }
     }
 
@@ -250,23 +246,18 @@ pub fn spawn_carrier_windows(
     Ok(())
 }
 
-/// 校验出站表：非空、无重名、名字非空、URL 可解析出 origin。
+/// 校验出站表：非空、无重名、名字非空。
 ///
-/// 这四条全都**报错而非兜底**：
-/// - 重名会让 `window_label` 变成「看谁后写入」，在 `isolated` 下
-///   还会撞窗口标签（Tauri 建第二个同标签窗口直接失败），是个会拖到运行期才
-///   炸的隐蔽错误；
-/// - 空名字在 `isolated` 下生成 `wsieve-transport-` 这种标签，而且规则根本
-///   引用不到它；
-/// - URL 解析失败若兜底成空基址，请求会打到承载页面自己的 origin ——
-///   悄悄发给了另一台服务器，正是 §6.4 要堵死的那类事故。
-fn validate(outbounds: &[(&str, &str)]) -> anyhow::Result<Vec<(String, String)>> {
+/// **URL 校验已随基址职责一起搬去条带**（`shard_setup` 的 `split_url` /
+/// `origin_of`）。承载计划不再从出站 URL 推导任何东西，它只认名字——在这里
+/// 再校验一次，只会让同一个坏 URL 在两处各报一次，而修的人只想得到其中一处。
+fn validate(outbounds: &[&str]) -> anyhow::Result<Vec<String>> {
     if outbounds.is_empty() {
         anyhow::bail!("承载计划至少需要一个启用的出站");
     }
     let mut seen = BTreeMap::<&str, usize>::new();
     let mut out = Vec::with_capacity(outbounds.len());
-    for (i, (name, url)) in outbounds.iter().enumerate() {
+    for (i, name) in outbounds.iter().enumerate() {
         if name.trim().is_empty() {
             anyhow::bail!("第 {} 个出站的名字为空", i + 1);
         }
@@ -277,71 +268,46 @@ fn validate(outbounds: &[(&str, &str)]) -> anyhow::Result<Vec<(String, String)>>
                 i + 1
             );
         }
-        // 这里就把 URL 验一遍：现在每条出站的会话基址（含宿主）都要从这个
-        // URL 取 origin，坏 URL 早报比等到条带建连接时再报好。
-        origin_of(url).map_err(|e| anyhow::anyhow!("出站 {name:?} 的 url 无效：{e}"))?;
-        out.push((name.to_string(), url.to_string()));
+        out.push(name.to_string());
     }
     Ok(out)
 }
 
 /// 宿主选择：空串取第一个启用的出站；指定了就必须存在。
-fn resolve_host(host: &str, entries: &[(String, String)]) -> anyhow::Result<String> {
+fn resolve_host(host: &str, entries: &[String]) -> anyhow::Result<String> {
     let host = host.trim();
     if host.is_empty() {
-        return Ok(entries[0].0.clone());
+        return Ok(entries[0].clone());
     }
-    if entries.iter().any(|(n, _)| n == host) {
+    if entries.iter().any(|n| n == host) {
         Ok(host.to_string())
     } else {
-        // 报错而非退回第一个：用户点名要拿某个节点当宿主，多半是因为只有它
-        // 的伪装页扛得住长时间挂着。悄悄换一个等于把这个判断作废。
+        // 报错而非退回第一个：用户点名要拿某个节点当宿主是个明确意图，
+        // 悄悄换一个等于把这个判断作废。
         anyhow::bail!(
             "carrier-host 指向不存在的出站：{host}（可选：{}）",
-            entries
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect::<Vec<_>>()
-                .join("、")
+            entries.join("、")
         )
     }
-}
-
-/// 从页面 URL 取出 origin（`scheme://authority`，无路径、无尾斜杠）。
-///
-/// 不归一默认端口：`https://a.com:443` 与 `https://a.com` 对 fetch 等价，
-/// 而保留用户写的原样能让日志里的基址和配置文件对得上。
-fn origin_of(url: &str) -> anyhow::Result<String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("URL 缺少 scheme: {url}"))?;
-    if scheme != "http" && scheme != "https" {
-        anyhow::bail!("不支持的 scheme: {scheme}");
-    }
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() {
-        anyhow::bail!("URL 缺少主机: {url}");
-    }
-    // 用户名密码写进 origin 会让它不再是合法 origin，也会把凭据泄进日志。
-    if authority.contains('@') {
-        anyhow::bail!("URL 不接受 userinfo: {url}");
-    }
-    Ok(format!("{scheme}://{authority}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 测试专用的承载页地址——本模块不关心承载页 server 本身怎么起来
+    /// （那是 `crate::carrier_page` 的职责），只关心这个字符串被原样传递。
+    const PAGE: &str = "http://127.0.0.1:53119/";
+
     #[test]
     fn host_defaults_to_first_enabled_when_unspecified() {
-        let c = CarrierPlan::shared("", &[("A", "https://a.com/"), ("B", "https://b.net/")]).unwrap();
+        let c = CarrierPlan::shared("", &["A", "B"], PAGE).unwrap();
         assert_eq!(c.host_name(), "A");
     }
 
     #[test]
     fn unknown_host_name_is_an_error() {
-        let e = CarrierPlan::shared("幽灵", &[("A", "https://a.com/")])
+        let e = CarrierPlan::shared("幽灵", &["A"], PAGE)
             .unwrap_err()
             .to_string();
         assert!(e.contains("幽灵"), "{e}");
@@ -349,33 +315,30 @@ mod tests {
 
     #[test]
     fn isolated_carrier_gives_every_outbound_its_own_window() {
-        let c = CarrierPlan::isolated(&[("A", "https://a.com/"), ("B", "https://b.net/")]).unwrap();
+        let c = CarrierPlan::isolated(&["A", "B"], PAGE).unwrap();
         assert_eq!(c.window_label("A"), Some("wsieve-transport-A".to_string()));
         assert_eq!(c.window_label("B"), Some("wsieve-transport-B".to_string()));
-        assert_eq!(c.page_url_for("A").as_deref(), Some("https://a.com/"));
-        assert_eq!(c.page_url_for("B").as_deref(), Some("https://b.net/"));
+        // 承载页全局唯一——两个窗口的窗口标签不同，但加载的是同一张页面。
+        assert_eq!(c.page_url_for("A").as_deref(), Some(PAGE));
+        assert_eq!(c.page_url_for("B").as_deref(), Some(PAGE));
     }
 
     #[test]
     fn empty_outbound_list_is_an_error() {
-        assert!(CarrierPlan::shared("", &[]).is_err());
-        assert!(CarrierPlan::isolated(&[]).is_err());
+        assert!(CarrierPlan::shared("", &[], PAGE).is_err());
+        assert!(CarrierPlan::isolated(&[], PAGE).is_err());
     }
 
     #[test]
     fn shared_builds_exactly_one_window_isolated_builds_n() {
-        let obs = [
-            ("A", "https://a.com/"),
-            ("B", "https://b.net/"),
-            ("C", "https://c.org/"),
-        ];
-        let s = CarrierPlan::shared("B", &obs).unwrap();
+        let obs = ["A", "B", "C"];
+        let s = CarrierPlan::shared("B", &obs, PAGE).unwrap();
         assert_eq!(
             s.windows(),
-            vec![("main".to_string(), "https://b.net/".to_string())],
-            "shared 只建一个窗口，加载的是宿主 B 的页面"
+            vec![("main".to_string(), PAGE.to_string())],
+            "shared 只建一个窗口，加载的是承载页"
         );
-        let i = CarrierPlan::isolated(&obs).unwrap();
+        let i = CarrierPlan::isolated(&obs, PAGE).unwrap();
         assert_eq!(i.windows().len(), 3);
     }
 
@@ -383,7 +346,7 @@ mod tests {
     fn unknown_outbound_yields_none_never_a_default_window() {
         // §6.4：认不出的出站必须让调用方拿到 None 去拒绝。这条防线原本
         // 立在 base_for 上，基址职责搬走之后由 window_label 承担。
-        let c = CarrierPlan::shared("A", &[("A", "https://a.com/")]).unwrap();
+        let c = CarrierPlan::shared("A", &["A"], PAGE).unwrap();
         assert_eq!(c.window_label("不存在的节点"), None);
         assert_eq!(c.page_url_for("不存在的节点"), None);
     }
@@ -392,44 +355,40 @@ mod tests {
     fn duplicate_outbound_names_are_an_error() {
         // 重名在 isolated 下会撞窗口标签（Tauri 建第二个同标签窗口直接失败），
         // 在 shared 下会让 window_label 变成「看谁后写入」。必须早报。
-        let e = CarrierPlan::shared("", &[("A", "https://a.com/"), ("A", "https://b.net/")])
+        let e = CarrierPlan::shared("", &["A", "A"], PAGE)
             .unwrap_err()
             .to_string();
         assert!(e.contains("重复"), "{e}");
-        assert!(CarrierPlan::isolated(&[("A", "https://a.com/"), ("A", "https://b.net/")]).is_err());
+        assert!(CarrierPlan::isolated(&["A", "A"], PAGE).is_err());
     }
 
     #[test]
     fn empty_outbound_name_is_an_error() {
-        assert!(CarrierPlan::shared("", &[("", "https://a.com/")]).is_err());
-        assert!(CarrierPlan::isolated(&[("  ", "https://a.com/")]).is_err());
+        assert!(CarrierPlan::shared("", &[""], PAGE).is_err());
+        assert!(CarrierPlan::isolated(&["  "], PAGE).is_err());
     }
 
     #[test]
-    fn malformed_url_is_an_error_not_an_empty_base() {
-        // 空基址 = 相对路径 = 打到承载页面自己的 origin，
-        // 也就是把这个出站的流量悄悄发给了另一台服务器。
-        for bad in [
-            "a.com",                    // 缺 scheme
-            "ftp://a.com/",             // 不支持的 scheme
-            "https:///path",            // 缺主机
-            "https://u:p@a.com/",       // 带凭据
-        ] {
-            let r = CarrierPlan::shared("", &[("A", bad)]);
-            assert!(r.is_err(), "{bad} 应当被拒绝");
+    fn every_window_loads_the_one_carrier_page() {
+        // 承载页全局唯一。两种模式的差别收敛到只剩「建几个窗口」。
+        const PAGE: &str = "http://127.0.0.1:53119/";
+        let s = CarrierPlan::shared("B", &["A", "B", "C"], PAGE).unwrap();
+        assert_eq!(s.windows(), vec![("main".to_string(), PAGE.to_string())]);
+
+        let i = CarrierPlan::isolated(&["A", "B", "C"], PAGE).unwrap();
+        assert_eq!(i.windows().len(), 3);
+        for (_, url) in i.windows() {
+            assert_eq!(url, PAGE, "isolated 的每个窗口也加载同一张承载页");
         }
     }
 
     #[test]
-    fn origin_strips_path_and_keeps_explicit_port() {
-        assert_eq!(origin_of("https://a.com/").unwrap(), "https://a.com");
-        assert_eq!(
-            origin_of("https://a.com:18444/x/y?q=1#f").unwrap(),
-            "https://a.com:18444"
-        );
-        assert_eq!(origin_of("http://a.com").unwrap(), "http://a.com");
-        // 尾斜杠必须被吃掉：拼上 "/api/sync" 会变成 "//api/sync"，另一个路径
-        assert!(!origin_of("https://a.com/").unwrap().ends_with('/'));
+    fn carrier_plan_no_longer_cares_about_server_urls() {
+        // 出站 URL 不再进承载计划——它推导数据面基址的职责已经交给条带。
+        // 这条钉死「别把 URL 校验又加回来」：那会让一个坏 URL 在两个地方
+        // 各报一次，而修的时候只会想到其中一个。
+        let c = CarrierPlan::shared("", &["只有名字"], "http://127.0.0.1:1/").unwrap();
+        assert_eq!(c.window_label("只有名字").as_deref(), Some("main"));
     }
 
     #[test]
@@ -445,11 +404,11 @@ mod tests {
 
     #[test]
     fn build_dispatches_on_mode() {
-        let obs = [("A", "https://a.com/"), ("B", "https://b.net/")];
-        let s = CarrierPlan::build(CarrierMode::Shared, "B", &obs).unwrap();
+        let obs = ["A", "B"];
+        let s = CarrierPlan::build(CarrierMode::Shared, "B", &obs, PAGE).unwrap();
         assert_eq!(s.host_name(), "B");
         assert_eq!(s.window_label("A"), Some(SHARED_WINDOW.to_string()));
-        let i = CarrierPlan::build(CarrierMode::Isolated, "B", &obs).unwrap();
+        let i = CarrierPlan::build(CarrierMode::Isolated, "B", &obs, PAGE).unwrap();
         assert_eq!(i.window_label("A"), Some("wsieve-transport-A".to_string()));
         assert_eq!(i.outbounds(), vec!["A".to_string(), "B".to_string()]);
     }
@@ -476,8 +435,7 @@ mod tests {
             .collect();
 
         // 含中文的出站名也必须被覆盖到。
-        let c = CarrierPlan::isolated(&[("日本节点", "https://a.com/"), ("B", "https://b.net/")])
-            .unwrap();
+        let c = CarrierPlan::isolated(&["日本节点", "B"], PAGE).unwrap();
         for (label, _) in c.windows() {
             assert!(
                 patterns.iter().any(|p| p.matches(&label)),
@@ -485,7 +443,7 @@ mod tests {
             );
         }
         // shared 用的主窗口同样要在表里。
-        let s = CarrierPlan::shared("", &[("A", "https://a.com/")]).unwrap();
+        let s = CarrierPlan::shared("", &["A"], PAGE).unwrap();
         for (label, _) in s.windows() {
             assert!(
                 patterns.iter().any(|p| p.matches(&label)),

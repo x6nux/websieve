@@ -163,9 +163,29 @@ fn main() {
         );
     }
 
+    // ── 起承载页 server（设计文档 2026-09-10 §5.8 的第 -1 步）────────────
+    //
+    // 排在最前面：它 bind 的是 127.0.0.1:0，不解析域名、不出网、不依赖
+    // hosts 或 TUN 任何一步的结果，因此越早失败越早报。
+    //
+    // **它不需要 bypass 路由**（对比条带转发器必须有）：TUN 捕获的是出网
+    // 流量，而这个 server 的连接两端都在回环上，从不离开本机。
+    //
+    // 失败即 exit(2)，不降级：没有承载页就没有传输，静默降级只会变成
+    // 「应用起来了但永远连不上，且没有一条能解释原因的日志」。
+    let carrier_page = match tauri::async_runtime::block_on(carrier_page::spawn()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("承载页 server 启动失败: {e:#}");
+            std::process::exit(2);
+        }
+    };
+    let carrier_page_url = carrier_page.url();
+
     // 本地条带编排：hosts 劫持 + 多端口转发（见 shard_setup）。必须在建
-    // WebView 之前完成——承载 WebView 要加载的正是转发器的端口。任何一步
-    // 失败都降级为单会话，不影响可用性。
+    // WebView 之前完成——承载 WebView 用绝对 URL 直连的数据面基址正是这里
+    // 算出来的转发端口（承载页本身的地址与条带无关，上面已经单独起好）。
+    // 任何一步失败都降级为单会话，不影响可用性。
     //
     // 端口分段：每个出站独占 `extra_sessions + 1` 个端口，从 shard_base_port
     // 起依次排开；溢出与重名由 `try_plan_ports` 报错（两个出站抢同一个端口
@@ -258,9 +278,10 @@ fn main() {
 
     // ── 从配置构建启动计划：出站配置 + 承载计划 + 规则表材料 ────────────
     //
-    // 条带的结果是它的**输入**（承载页面 URL 与各会话基址都取决于 hosts
-    // 劫持成没成功），因此必须排在 `plan_many` 之后。
-    let plan = match runtime_state::build_startup_plan(&config, &shard.entries) {
+    // 条带的结果是它的**输入**（各会话基址取决于 hosts 劫持成没成功），
+    // 因此必须排在 `plan_many` 之后；承载页 URL 则是上面单独起好的本机
+    // http 壳地址，与条带无关。
+    let plan = match runtime_state::build_startup_plan(&config, &shard.entries, &carrier_page_url) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("启动计划构建失败: {e:#}");
@@ -320,6 +341,10 @@ fn main() {
     // guard 持有 hosts 清理职责；进程正常退出时由 RunEvent::Exit 显式 drop，
     // 崩溃路径由下次启动的 clear_managed 兜底。
     let shard_guard = std::sync::Mutex::new(shard.guard);
+    // 承载页 server 必须活到进程结束——句柄一 drop，监听就停，承载窗口
+    // 刷新时会白屏。它不托管任何系统状态（不像 hosts / 系统代理），因此
+    // **不进** RunEvent::Exit 的摘除序列，持有到 main 结束即可。
+    let _carrier_page = carrier_page;
     // 系统代理托管（spec §8.2 / §10）。同 hosts 一样：持有即生效、drop 即恢复，
     // 崩溃残留由启动时的 clear_stale 兜底。
     let sysproxy_guard = std::sync::Mutex::new(setup_system_proxy(&cfg));

@@ -19,7 +19,6 @@ use tokio::net::{TcpListener, TcpStream};
 /// **内容对伪装零影响**：它由本地直接响应，从不出网，网络上没有任何观察者
 /// 能看到它。emitter 由 `initialization_script` 注入（见 `bootstrap::loader_js`），
 /// 所以这里一个 `<script>` 都不需要。
-#[allow(dead_code)] // Task 4 接线之前，回复内容还没有生产调用方在读它
 const PAGE: &str = "<!doctype html><meta charset=\"utf-8\"><title>websieve</title>";
 
 /// 承载页 server 句柄：drop 即停（accept 任务随 abort 结束）。
@@ -44,7 +43,6 @@ impl CarrierPage {
     ///
     /// 带尾斜杠：拼路径的调用方不需要再判断要不要补，而 `origin_of` 一类的
     /// 解析都会把它吃掉。
-    #[allow(dead_code)] // Task 4 才会把它接进建窗逻辑，现在只有测试在调
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}/", self.port)
     }
@@ -62,7 +60,6 @@ impl Drop for CarrierPage {
 /// - 固定端口是本机指纹，别的进程扫到就知道装了什么；
 /// - 条带段的每个端口都是 TCP 转发器，拿明文 HTTP 去打它等于把 HTTP 请求
 ///   塞给真实服务端的 TLS 端口。
-#[allow(dead_code)] // Task 4 才会在启动序列里调用它，现在只有测试在调
 pub async fn spawn() -> anyhow::Result<CarrierPage> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -73,7 +70,6 @@ pub async fn spawn() -> anyhow::Result<CarrierPage> {
     Ok(CarrierPage { port, task })
 }
 
-#[allow(dead_code)] // 只被 spawn() 调用，spawn() 接线前它随之一起是死代码
 async fn accept_loop(listener: TcpListener) {
     loop {
         match listener.accept().await {
@@ -99,7 +95,6 @@ async fn accept_loop(listener: TcpListener) {
 /// `ponytail:` 不解析请求——任何路径都回同一张页面，解析出来的东西没有
 /// 一处会被用到。`windows(4)` 的重复扫描是 O(n²)，对 8KB 上限无所谓。
 /// 升级路径：真需要按路径分流时再上正经的 HTTP 处理。
-#[allow(dead_code)] // 只被 accept_loop() 调用，同上，链路接通前一起是死代码
 async fn serve_one(mut stream: TcpStream) {
     let mut buf = [0u8; 1024];
     let mut seen: Vec<u8> = Vec::new();
