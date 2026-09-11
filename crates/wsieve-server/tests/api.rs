@@ -223,6 +223,42 @@ async fn alt_svc_absent_when_h3_unavailable() {
     assert!(resp.headers().get("alt-svc").is_none());
 }
 
+/// Timing-Allow-Origin 必须无条件出现，且与 h3 是否可用无关。
+///
+/// 承载页（本机 http 壳）与数据面是跨 origin，而 WebKit 自 2022 年起把
+/// `PerformanceResourceTiming.nextHopProtocol` 置于 TAO 保护之下——缺这个头
+/// 时它一律返回空字符串。没有它，客户端就无从知道自己跑在 h1/h2/h3 的哪
+/// 一个上，"h3 是不是变慢了"也就无从判断。
+#[tokio::test]
+async fn timing_allow_origin_is_always_present() {
+    // 连 h3 都没开的情况下也要有——它服务的是观测，不是 h3
+    let ts = start_server(SEEN_CACHE_CAPACITY, KeepaliveRange::default()).await;
+    let resp = http(&ts).get(url(&ts, "/")).send().await.unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("timing-allow-origin")
+            .expect("伪装响应必须带 Timing-Allow-Origin"),
+        "*"
+    );
+
+    // 数据面响应同样要有
+    let (tu, _, _, sid_b64) = make_msg1(&ts, now_ms());
+    let resp2 = http(&ts)
+        .post(url(&ts, &format!("/api/sync?n=0&sid={sid_b64}")))
+        .body(tu)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), 200, "前提：这必须是一条数据面响应");
+    assert_eq!(
+        resp2
+            .headers()
+            .get("timing-allow-origin")
+            .expect("数据面响应必须带 Timing-Allow-Origin"),
+        "*"
+    );
+}
+
 /// `ma` 必须可配，且默认是 86400。
 ///
 /// 这是降级保护的一个旋钮：客户端按 `ma` 记住 h3，期间即使 h3 变慢也不会

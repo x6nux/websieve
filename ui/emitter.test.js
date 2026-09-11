@@ -99,4 +99,13 @@ describe('IPC 通路契约：invoke 实际收到的 body 形状', () => {
     expect(call[1]).not.toBeInstanceOf(Uint8Array);
     expect(typeof call[1].f).toBe('string');
   });
+
+  it('暴露 proto()，读不到时返回空串而不是 undefined', () => {
+    // 协议由 WebKit 单方面决定，我们只能观测。观测不到时必须给出可区分的
+    // 空串——"读不到"（多半是 Timing-Allow-Origin 没生效）与"未知协议"是
+    // 两回事，undefined 会把这个区别抹掉。
+    var emitter = loadEmitter('http:', '127.0.0.1');
+    expect(typeof emitter.proto).toBe('function');
+    expect(emitter.proto()).toBe('');
+  });
 });

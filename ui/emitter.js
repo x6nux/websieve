@@ -496,6 +496,39 @@
     return out;
   }
 
+  // ---- 协议观测 ---------------------------------------------------------
+  //
+  // `nextHopProtocol` 给出 ALPN ID —— "h3" / "h2" / "http/1.1"（注意是
+  // "http/1.1" 而非 "h1"）。数据面走哪个协议由 WebKit 单方面决定，我们既
+  // 不能指定也不能否决，**只能观测**；而观测是判断"h3 是不是变慢了"的前提。
+  //
+  // 两个坑：
+  // 1. WebKit 自 2022 年起把该字段置于 Timing-Allow-Origin 保护之下，跨
+  //    origin 缺该头一律返回**空字符串**。承载页（本机 http 壳）与数据面
+  //    正是跨 origin，所以服务端无条件发了这个头。空串意味着"读不到"而非
+  //    "未知协议"，两者必须分开——前者是配置出了问题。
+  // 2. resource timing 缓冲区有上限（WebKit 默认 250 条），满了就**静默停止**
+  //    记录。所以用 PerformanceObserver 增量接收，并在每次回调后清空缓冲，
+  //    而不是反复 getEntriesByType 全量扫描——后者既是 O(n) 又会把缓冲撑满。
+  var lastProto = '';
+  (function observeProtocol() {
+    if (typeof PerformanceObserver === 'undefined') return;
+    try {
+      new PerformanceObserver(function (list) {
+        var es = list.getEntries();
+        for (var i = es.length - 1; i >= 0; i--) {
+          if (es[i].nextHopProtocol) {
+            lastProto = es[i].nextHopProtocol;
+            break;
+          }
+        }
+        if (performance.clearResourceTimings) performance.clearResourceTimings();
+      }).observe({ type: 'resource', buffered: true });
+    } catch (_) {
+      // 环境不支持 observe({type}) 形式时放弃观测，不影响数据面
+    }
+  })();
+
   // ---- 心跳（健康检测，spec §9.1：5s 一跳，Rust 侧 >15s 判死）--------
   setInterval(function () {
     invoke('wsieve_heartbeat').catch(function () {});
@@ -508,5 +541,8 @@
     // 当前用的是哪条 IPC 通路。排障时在 console 里一眼可见；也是这个判据
     // 唯一的观察点 —— emitter 是 IIFE，不暴露就没法测。
     raw: RAW,
+    // 数据面最近一次请求实际走的 HTTP 协议（"h3"/"h2"/"http/1.1"）。
+    // 空串 = 读不到（多半是 Timing-Allow-Origin 没生效），不是"未知协议"。
+    proto: function () { return lastProto; },
   };
 })();

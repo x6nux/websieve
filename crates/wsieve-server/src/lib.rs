@@ -171,16 +171,27 @@ impl AppState {
             .route("/", any(fallback))
             .route("/{*rest}", any(fallback))
             .with_state(self);
-        match alt_svc {
-            Some(v) => r.layer(axum::middleware::map_response(move |mut resp: Response| {
-                let v = v.clone();
-                async move {
+        r.layer(axum::middleware::map_response(move |mut resp: Response| {
+            let v = alt_svc.clone();
+            async move {
+                // Timing-Allow-Origin 无条件加，且与 h3 是否可用无关：它让
+                // 承载页的 JS 能读到 PerformanceResourceTiming.nextHopProtocol，
+                // 也就是「这次请求实际跑在 h1/h2/h3 的哪一个上」。WebKit 自
+                // 2022 年起把该字段置于 TAO 保护之下，跨 origin 缺这个头一律
+                // 返回空字符串——而承载页（本机 http 壳）与数据面正是跨 origin。
+                //
+                // 没有这扇窗，"h3 是不是变慢了"就无从判断，降级策略也就无从
+                // 标定阈值。CDN 普遍发这个头，不构成异常特征。
+                resp.headers_mut().insert(
+                    axum::http::HeaderName::from_static("timing-allow-origin"),
+                    axum::http::HeaderValue::from_static("*"),
+                );
+                if let Some(v) = v {
                     resp.headers_mut().insert(header::ALT_SVC, v);
-                    resp
                 }
-            })),
-            None => r,
-        }
+                resp
+            }
+        }))
     }
 }
 

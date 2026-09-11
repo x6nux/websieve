@@ -101,7 +101,72 @@ pub fn serve(endpoint: quinn::Endpoint, router: Router) {
     });
 }
 
+/// QUIC 质量采样间隔。
+const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 一次采样的质量快照。
+#[derive(Debug, Clone, Copy)]
+pub struct LinkQuality {
+    pub rtt_ms: u64,
+    pub lost: u64,
+    pub sent: u64,
+    pub congestion_events: u64,
+    pub black_holes: u64,
+}
+
+impl LinkQuality {
+    /// 丢包率（0.0–1.0）。`sent` 为 0 时返回 0，不是"完美"而是"没样本"。
+    pub fn loss_ratio(&self) -> f64 {
+        if self.sent == 0 {
+            return 0.0;
+        }
+        self.lost as f64 / self.sent as f64
+    }
+}
+
+fn sample(conn: &quinn::Connection) -> LinkQuality {
+    let p = conn.stats().path;
+    LinkQuality {
+        rtt_ms: p.rtt.as_millis() as u64,
+        lost: p.lost_packets,
+        sent: p.sent_packets,
+        congestion_events: p.congestion_events,
+        black_holes: p.black_holes_detected,
+    }
+}
+
+/// 周期采样并记录 QUIC 链路质量。
+///
+/// 服务端自己就能测，**不需要客户端配合**——这是降级判据的来源。客户端侧
+/// 那条路（`nextHopProtocol` + 速率）只用于让人看见现状，判定不依赖它。
+fn spawn_quality_probe(conn: quinn::Connection) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SAMPLE_EVERY).await;
+            if conn.close_reason().is_some() {
+                return;
+            }
+            let q = sample(&conn);
+            // 没发过包就没有可谈的质量，跳过——否则空闲连接会刷出一串
+            // loss=0 的假"健康"记录。
+            if q.sent == 0 {
+                continue;
+            }
+            eprintln!(
+                "h3: 链路质量 rtt={}ms 丢包={:.2}% ({}/{}) 拥塞事件={} 黑洞={}",
+                q.rtt_ms,
+                q.loss_ratio() * 100.0,
+                q.lost,
+                q.sent,
+                q.congestion_events,
+                q.black_holes
+            );
+        }
+    });
+}
+
 async fn serve_conn(conn: quinn::Connection, router: Router) -> Result<()> {
+    spawn_quality_probe(conn.clone());
     let mut h3_conn = h3::server::builder()
         .build(h3_quinn::Connection::new(conn))
         .await?;
