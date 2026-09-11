@@ -223,6 +223,67 @@ async fn alt_svc_absent_when_h3_unavailable() {
     assert!(resp.headers().get("alt-svc").is_none());
 }
 
+/// 闸门置位后，响应必须改发 `Alt-Svc: clear`。
+///
+/// 这是降级的第一步。RFC 7838 规定 `clear` 让客户端作废该 origin 的全部
+/// 替代服务记录——但它**只约束新连接**，拆不掉已建立的那条 h3，所以服务端
+/// 侧还必须主动断连（见 http3.rs 的 spawn_quality_probe）。
+#[tokio::test]
+async fn degraded_gate_switches_alt_svc_to_clear() {
+    let gate = wsieve_server::H3Gate::new();
+    let ts = start_server_with_disguise(
+        SEEN_CACHE_CAPACITY,
+        KeepaliveRange::default(),
+        DisguiseCfg {
+            upstream: None,
+            alt_svc_port: Some(443),
+            h3_gate: gate.clone(),
+            ..DisguiseCfg::default()
+        },
+    )
+    .await;
+
+    // 未降级：正常宣告 h3
+    let v = http(&ts).get(url(&ts, "/")).send().await.unwrap().headers()["alt-svc"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(v.contains(r#"h3=":443""#), "降级前应正常宣告，实际: {v}");
+
+    // 置位闸门后：同一个 server、同一个 router，响应必须变成 clear。
+    // 闸门是运行期状态，若实现时在构建 Router 那一刻就把头算死，这里就会失败。
+    gate.degrade_for(Duration::from_secs(600));
+    let v2 = http(&ts).get(url(&ts, "/")).send().await.unwrap().headers()["alt-svc"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(v2, "clear", "降级后必须发 clear，实际: {v2}");
+
+    // 冷却到期后自动恢复宣告，不需要人工干预
+    gate.reset();
+    let v3 = http(&ts).get(url(&ts, "/")).send().await.unwrap().headers()["alt-svc"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(v3.contains(r#"h3=":443""#), "冷却结束应自动恢复，实际: {v3}");
+}
+
+/// 重复降级取较晚的截止时刻，短冷却不得缩短长冷却。
+#[test]
+fn degrade_takes_the_later_deadline() {
+    let gate = wsieve_server::H3Gate::new();
+    gate.degrade_for(Duration::from_secs(600));
+    // 第二次用**零长冷却**，而不是"短一点的冷却"：后者截止时刻仍在未来，
+    // 用 store 还是 fetch_max 实现都会让 is_degraded() 为真，测不出区别。
+    // 零长冷却的截止时刻就是此刻，已然过期——若实现用了 store，它会覆盖掉
+    // 前面那 600 秒，这里立刻变 false。
+    gate.degrade_for(Duration::from_secs(0));
+    assert!(
+        gate.is_degraded(),
+        "后置位的零长冷却不得抹掉前一次的 600 秒"
+    );
+}
+
 /// Timing-Allow-Origin 必须无条件出现，且与 h3 是否可用无关。
 ///
 /// 承载页（本机 http 壳）与数据面是跨 origin，而 WebKit 自 2022 年起把
@@ -275,6 +336,7 @@ async fn alt_svc_ma_is_configurable_and_defaults_to_a_day() {
             upstream: None,
             alt_svc_port: Some(443),
             alt_svc_ma: 600,
+            ..DisguiseCfg::default()
         },
     )
     .await;

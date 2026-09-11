@@ -41,10 +41,11 @@ pub async fn bind(
     key: PrivateKeyDer<'static>,
     listen: SocketAddr,
     router: Router,
+    gate: crate::H3Gate,
 ) -> Result<SocketAddr> {
     let ep = bind_endpoint(certs, key, listen)?;
     let addr = ep.local_addr()?;
-    serve(ep, router);
+    serve(ep, router, gate);
     Ok(addr)
 }
 
@@ -79,10 +80,11 @@ pub fn bind_endpoint(
 }
 
 /// 在已绑定的 endpoint 上开始接受 h3 连接。
-pub fn serve(endpoint: quinn::Endpoint, router: Router) {
+pub fn serve(endpoint: quinn::Endpoint, router: Router, gate: crate::H3Gate) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let router = router.clone();
+            let gate = gate.clone();
             tokio::spawn(async move {
                 // 握手失败是常态（端口扫描、UDP 源地址伪造、被中途丢包的
                 // 客户端），debug 级别足够，不该刷 warn。
@@ -93,7 +95,7 @@ pub fn serve(endpoint: quinn::Endpoint, router: Router) {
                         return;
                     }
                 };
-                if let Err(e) = serve_conn(conn, router).await {
+                if let Err(e) = serve_conn(conn, router, gate).await {
                     eprintln!("h3: 连接结束: {e}");
                 }
             });
@@ -135,12 +137,35 @@ fn sample(conn: &quinn::Connection) -> LinkQuality {
     }
 }
 
-/// 周期采样并记录 QUIC 链路质量。
+/// 判为劣质的丢包率阈值。
+///
+/// 5% 是个保守取值：正常跨境链路的丢包通常在 1% 以下，而被 QoS 限速的 UDP
+/// 往往远高于 5%。定得太低会把正常抖动误判成劣化，太高则失去意义。
+const LOSS_BAD: f64 = 0.05;
+
+/// 连续多少次采样判劣才降级（滞回）。
+///
+/// 没有这个计数，一次瞬时丢包就会触发降级，而降级要付一次断连代价——
+/// 结果是在 h3/h2 之间反复横跳，比不降级更糟。
+const BAD_STREAK: u32 = 3;
+
+/// 降级后的冷却时长：这段时间内不再宣告 h3。
+///
+/// 劣化多半是暂时的（运营商 QoS 有时段性），到点自动恢复，不需要人工干预。
+const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 周期采样 QUIC 链路质量，劣化则触发降级。
 ///
 /// 服务端自己就能测，**不需要客户端配合**——这是降级判据的来源。客户端侧
-/// 那条路（`nextHopProtocol` + 速率）只用于让人看见现状，判定不依赖它。
-fn spawn_quality_probe(conn: quinn::Connection) {
+/// 那条路（`nextHopProtocol`）只用于让人看见现状，判定不依赖它。
+///
+/// 判劣后做两件事，缺一不可（见 `H3Gate` 的文档）：
+///   1. 置位闸门 → 后续响应改发 `Alt-Svc: clear`，清掉客户端的 h3 记忆
+///   2. 主动关闭本连接 → 逼客户端重连；记忆已清，重连自然落到 TCP
+/// 顺序不能反：先断后清的话，客户端重连时记忆还在，又会选 h3。
+fn spawn_quality_probe(conn: quinn::Connection, gate: crate::H3Gate) {
     tokio::spawn(async move {
+        let mut streak = 0u32;
         loop {
             tokio::time::sleep(SAMPLE_EVERY).await;
             if conn.close_reason().is_some() {
@@ -148,25 +173,47 @@ fn spawn_quality_probe(conn: quinn::Connection) {
             }
             let q = sample(&conn);
             // 没发过包就没有可谈的质量，跳过——否则空闲连接会刷出一串
-            // loss=0 的假"健康"记录。
+            // loss=0 的假"健康"记录，还会把 streak 洗掉。
             if q.sent == 0 {
                 continue;
             }
+            let bad = q.loss_ratio() >= LOSS_BAD || q.black_holes > 0;
             eprintln!(
-                "h3: 链路质量 rtt={}ms 丢包={:.2}% ({}/{}) 拥塞事件={} 黑洞={}",
+                "h3: 链路质量 rtt={}ms 丢包={:.2}% ({}/{}) 拥塞事件={} 黑洞={}{}",
                 q.rtt_ms,
                 q.loss_ratio() * 100.0,
                 q.lost,
                 q.sent,
                 q.congestion_events,
-                q.black_holes
+                q.black_holes,
+                if bad { "  [判劣]" } else { "" }
             );
+            if !bad {
+                streak = 0;
+                continue;
+            }
+            streak += 1;
+            if streak < BAD_STREAK {
+                continue;
+            }
+            eprintln!(
+                "h3: 连续 {BAD_STREAK} 次判劣，降级到 h2 并冷却 {}s",
+                COOLDOWN.as_secs()
+            );
+            // 1) 先清记忆
+            gate.degrade_for(COOLDOWN);
+            // 2) 给 clear 一点发出去的机会，再断连。这一小段等待不是凑数：
+            //    闸门置位后，要等客户端发来下一个请求、由响应把 clear 带回去，
+            //    降级才算真正生效。立刻断连会让 clear 根本没机会发出。
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            conn.close(0u32.into(), b"h3 link degraded");
+            return;
         }
     });
 }
 
-async fn serve_conn(conn: quinn::Connection, router: Router) -> Result<()> {
-    spawn_quality_probe(conn.clone());
+async fn serve_conn(conn: quinn::Connection, router: Router, gate: crate::H3Gate) -> Result<()> {
+    spawn_quality_probe(conn.clone(), gate);
     let mut h3_conn = h3::server::builder()
         .build(h3_quinn::Connection::new(conn))
         .await?;

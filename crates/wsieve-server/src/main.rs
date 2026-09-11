@@ -178,6 +178,10 @@ fn main() -> Result<()> {
         // 客户端零星出现校验失败。
         let material = wsieve_server::tls::tls_material(&cfg.deployment)?;
 
+        // h3 降级闸门：QUIC 采样任务置位，Router 据此把 Alt-Svc 改成 clear。
+        // 两边共用同一个（内部是 Arc），所以必须在这里建好再分发。
+        let h3_gate = wsieve_server::H3Gate::new();
+
         // UDP 面**先于 AppState** 绑定：Alt-Svc 要宣告的端口取决于它成不成功，
         // 而 AppState 构造时就需要那个端口（端口 → AppState → router → 服务
         // 是一条链）。失败只警告不中止——h3 是叠加能力，TCP 面必须照常服务，
@@ -223,11 +227,12 @@ fn main() -> Result<()> {
                 // CDN 提供，本进程并不监听 UDP）。
                 alt_svc_port: h3_port.or(cfg.alt_svc_port),
                 alt_svc_ma: cfg.alt_svc_ma,
+                h3_gate: h3_gate.clone(),
             },
         );
 
         if let Some(ep) = h3_endpoint {
-            wsieve_server::http3::serve(ep, state.clone().router());
+            wsieve_server::http3::serve(ep, state.clone().router(), h3_gate);
             eprintln!("HTTP/3 就绪: udp://{}", cfg.listen);
         }
 

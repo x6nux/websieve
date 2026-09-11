@@ -110,6 +110,7 @@ async fn h3_round_trip_over_quic() {
         key,
         "127.0.0.1:0".parse().unwrap(),
         router,
+        wsieve_server::H3Gate::new(),
     )
     .await
     .unwrap();
@@ -145,6 +146,7 @@ async fn downstream_is_streamed_not_buffered() {
         key,
         "127.0.0.1:0".parse().unwrap(),
         router,
+        wsieve_server::H3Gate::new(),
     )
     .await
     .unwrap();

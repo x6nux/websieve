@@ -63,6 +63,59 @@ pub struct ServerKeys {
     pub whitelist: HashSet<[u8; 32]>,
 }
 
+/// h3 降级闸门：服务端判定 QUIC 链路劣化后置位，响应改发 `Alt-Svc: clear`。
+///
+/// # 为什么需要它
+///
+/// WebKit **只在 QUIC 握手失败时回落到 TCP，慢不会触发回落**。跨境链路的
+/// UDP 常被运营商 QoS 限速，此时 h3 连得上却很慢，客户端会按 `ma`（默认
+/// 一天）一直用下去。客户端侧无法自救——WKWebView 没有强制协议的 API。
+///
+/// # 为什么 `clear` 之外还必须断连
+///
+/// RFC 7838 明确：客户端对**已建立**的替代服务连接，不必因缓存失效而停止
+/// 使用；缓存只约束新连接的建立。xhttp 的会话是长连接，只发 `clear` 等于
+/// 什么都没做。所以降级是两步：先让响应带上 `clear`（清掉记忆），再主动
+/// 关闭 QUIC 连接（逼客户端重连，而重连时记忆已清，自然落到 TCP 上）。
+/// 顺序不能反——先断后清的话，客户端重连时记忆还在，又会选 h3。
+///
+/// 内部是一个"降级截止时刻"的 Unix 秒；0 表示未降级。用截止时刻而非布尔，
+/// 是为了自带冷却期：劣化可能是暂时的，到点自动恢复宣告 h3，不需要人工干预。
+#[derive(Clone, Default)]
+pub struct H3Gate(Arc<std::sync::atomic::AtomicU64>);
+
+impl H3Gate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// 当前是否处于降级期。
+    pub fn is_degraded(&self) -> bool {
+        let until = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        until != 0 && Self::now_secs() < until
+    }
+
+    /// 进入降级期。重复调用取**较晚**的截止时刻，避免后置位的短冷却把前一次
+    /// 的长冷却缩短。
+    pub fn degrade_for(&self, cooldown: Duration) {
+        let until = Self::now_secs().saturating_add(cooldown.as_secs());
+        self.0
+            .fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 仅供测试：立刻解除降级。
+    pub fn reset(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Alt-Svc 的 `ma`（max-age）默认值，单位秒。
 ///
 /// 86400 是真实世界的普遍取值（nginx 官方示例即此值），改小会成为可被动
@@ -80,6 +133,11 @@ pub struct DisguiseCfg {
     pub alt_svc_port: Option<u16>,
     /// Alt-Svc 的 `ma` 秒数。见 [`ALT_SVC_MA_DEFAULT`]。
     pub alt_svc_ma: u32,
+    /// h3 降级闸门。置位期间响应改发 `Alt-Svc: clear`，见 [`H3Gate`]。
+    ///
+    /// 放在伪装配置里而非 AppState 顶层，是因为它控制的正是 `alt_svc_port`
+    /// 这个字段的输出形态——两者必须一起读，分开放会让人以为可以只看其一。
+    pub h3_gate: H3Gate,
 }
 
 /// 手写而非 `derive(Default)`：`alt_svc_ma` 的零值是无意义的（`ma=0` 等于
@@ -90,6 +148,7 @@ impl Default for DisguiseCfg {
             upstream: None,
             alt_svc_port: None,
             alt_svc_ma: ALT_SVC_MA_DEFAULT,
+            h3_gate: H3Gate::new(),
         }
     }
 }
@@ -167,12 +226,20 @@ impl AppState {
         let alt_svc = self.disguise.alt_svc_port.and_then(|p| {
             axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma={ma}")).ok()
         });
+        let gate = self.disguise.h3_gate.clone();
+        let clear = axum::http::HeaderValue::from_static("clear");
         let r = Router::new()
             .route("/", any(fallback))
             .route("/{*rest}", any(fallback))
             .with_state(self);
         r.layer(axum::middleware::map_response(move |mut resp: Response| {
-            let v = alt_svc.clone();
+            // 闸门**每次响应都要重新读**：它是运行期状态，不是构建期配置。
+            // 在这里提前算好塞进闭包的话，降级就永远不会生效。
+            let v = if gate.is_degraded() {
+                Some(clear.clone())
+            } else {
+                alt_svc.clone()
+            };
             async move {
                 // Timing-Allow-Origin 无条件加，且与 h3 是否可用无关：它让
                 // 承载页的 JS 能读到 PerformanceResourceTiming.nextHopProtocol，
