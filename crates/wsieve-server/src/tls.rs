@@ -63,16 +63,52 @@ fn ensure_crypto_provider() {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }
 
-/// 读取 PEM 证书 + 私钥 → rustls ServerConfig（TLS 1.3 only + early data）。
-fn rustls_config(certs: Vec<CertificateDer<'static>>, key: PrivateKeyDer<'static>) -> Result<ServerConfig> {
+/// TCP 监听面的 ALPN：h2 优先，客户端不支持时回落 http/1.1。
+///
+/// 顺序即服务端偏好。`hyper_util` 的 `auto::Builder`（见 `serve`）本就能
+/// h1/h2 自适应，所以宣告 h2 不需要任何额外的协议实现——此前缺的只是这
+/// 一句宣告本身。
+pub(crate) const ALPN_TCP: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
+/// QUIC 监听面的 ALPN：只有 h3。
+///
+/// 逐项 `allow(dead_code)`：UDP 监听面尚未接入（计划 Task 3），此刻只有测试
+/// 在用它。与常量本身一起落地而不是等 Task 3 再加，是因为「两个面的 ALPN
+/// 取值互斥」这条约束属于 `rustls_config` 的契约，把它写在契约旁边才不会在
+/// 将来被当成可有可无的细节。见 `carrier_page.rs` 关于逐项 allow 的同款说明。
+#[allow(dead_code)]
+pub(crate) const ALPN_QUIC: [&[u8]; 1] = [b"h3"];
+
+pub(crate) fn alpn_vec(items: &[&[u8]]) -> Vec<Vec<u8>> {
+    items.iter().map(|s| s.to_vec()).collect()
+}
+
+/// 读取 PEM 证书 + 私钥 → rustls ServerConfig（TLS 1.3 only）。
+///
+/// `alpn` 与 `early_data` **由调用方给出，不设默认值**：两个监听面在这两项
+/// 上的取值是互斥的，给了默认值就等于把其中一面焊进函数里，另一面每次都
+/// 得记得覆盖——那正是将来只改一处便产生静默分歧的地方。
+///
+///   TCP 443：`ALPN_TCP`，early_data = 16384（§6.8 第 2 层）
+///   UDP 443：`ALPN_QUIC`，early_data = `u32::MAX`（要 0-RTT）或 0
+///
+/// QUIC 只接受 0 或 `u32::MAX`；拿 16384 去 `QuicServerConfig::try_from`
+/// 会直接失败。
+fn rustls_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    alpn: Vec<Vec<u8>>,
+    early_data: u32,
+) -> Result<ServerConfig> {
     ensure_crypto_provider();
     let mut cfg = ServerConfig::builder_with_protocol_versions(&[&TLS13])
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("证书/私钥加载失败")?;
+    cfg.alpn_protocols = alpn;
     // §6.8 第 2 层：开 early data 让浏览器 0-RTT；重放面由
     // msg1 防重放（§6.3）+ seq 去重（§6.4）全额兜底。
-    cfg.max_early_data_size = 16_384;
+    cfg.max_early_data_size = early_data;
     Ok(cfg)
 }
 
@@ -83,7 +119,7 @@ pub async fn build(deployment: &Deployment) -> Result<ServeMode> {
         Deployment::CdnFullSelfSigned => {
             let (cert, key) = self_signed()?;
             Ok(ServeMode::Tls(TlsAcceptor::from(Arc::new(
-                rustls_config(vec![cert], key)?,
+                rustls_config(vec![cert], key, alpn_vec(&ALPN_TCP), 16_384)?,
             ))))
         }
         Deployment::Direct {
@@ -104,7 +140,7 @@ pub async fn build(deployment: &Deployment) -> Result<ServeMode> {
             .with_context(|| format!("私钥解析失败: {key_path}"))?
             .context("私钥文件不含 PEM 私钥")?;
             Ok(ServeMode::Tls(TlsAcceptor::from(Arc::new(
-                rustls_config(certs, key)?,
+                rustls_config(certs, key, alpn_vec(&ALPN_TCP), 16_384)?,
             ))))
         }
     }
@@ -211,5 +247,41 @@ mod tests {
             build(&Deployment::CdnFlexible).await.unwrap(),
             ServeMode::Plain
         ));
+    }
+
+    /// 自签一对证书供 ALPN 测试用（不落文件系统）。
+    fn test_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let (c, k) = self_signed().unwrap();
+        (vec![c], k)
+    }
+
+    #[test]
+    fn tcp_config_advertises_h2_then_http11() {
+        // 顺序即服务端偏好：h2 在前表示优先 h2，客户端不支持时回落 http/1.1。
+        // 此前一行都没设，握手结果是 `No ALPN negotiated`——一个 TLS1.3 服务端
+        // 在客户端明明提供了 ALPN 的情况下不做任何选择，是可被动识别的异常
+        // 特征，真实世界的 HTTPS 服务端几乎全部会协商 h2。
+        let (certs, key) = test_cert();
+        let cfg = rustls_config(certs, key, alpn_vec(&ALPN_TCP), 16_384).unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            "TCP 面必须按 h2 优先的顺序宣告 ALPN"
+        );
+        assert_eq!(
+            cfg.max_early_data_size, 16_384,
+            "TCP 面的 0-RTT 配置（§6.8 第 2 层）不得被 ALPN 改动波及"
+        );
+    }
+
+    #[test]
+    fn quic_config_advertises_only_h3_with_quic_legal_early_data() {
+        // QUIC 只接受 max_early_data_size 为 0 或 u32::MAX。TCP 面那个 16384
+        // 拿去 `QuicServerConfig::try_from` 会直接失败——这正是两个监听面
+        // 不能共用同一份 config 的根本原因。
+        let (certs, key) = test_cert();
+        let cfg = rustls_config(certs, key, alpn_vec(&ALPN_QUIC), u32::MAX).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(cfg.max_early_data_size, u32::MAX);
     }
 }
