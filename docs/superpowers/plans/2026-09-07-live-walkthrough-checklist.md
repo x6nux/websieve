@@ -91,13 +91,50 @@ origin 之后，Tauri 的 IPC raw body 快路径重新可用」。spike
 `http://127.0.0.1:*` 匹配到实际端口）全部指向它成立，但**没有真机证据**——而
 这类失败恰好是静默的。
 
-**前置条件**：`scripts/e2e.sh` **不能**用来自举这次走查。
-- 阶段 A 在**本次改动之前就已失败**（在 `33dc7a1` 建独立 worktree 复跑，报错
-  逐字相同：`/api/sync?n=0` 被 `Connection reset by peer (os error 54)`），
-  所以需要一个真实可用的服务端。
-- 阶段 B（`--with-app`）已过时：它用 `WSIEVE_SERVER_URL` / `WSIEVE_SERVER_PUB`
-  驱动 app，而 `bb767ef`（启动改读 config.yaml）之后这些变量只剩注释、代码已
-  不读。要跑真实 app 得手写 config.yaml 指向服务端。
+**前置条件**：
+- `scripts/e2e.sh` 阶段 A **本身是好的**。（曾在此记录「阶段 A 在改动前就已
+  失败」，那是**错误结论**：真实原因是端口冲突——18443 被一个遗留的本地 https
+  测试 server 占着、18080 被 `tools/fwd` 占着，与代码无关。清掉冲突后阶段 A
+  能跑通。跑它之前先 `lsof -nP -iTCP:18443 -sTCP:LISTEN` 与 `:18080` 查一遍。）
+- 阶段 B（`--with-app`）确实已过时：它用 `WSIEVE_SERVER_URL` /
+  `WSIEVE_SERVER_PUB` 驱动 app，而 `bb767ef`（启动改读 config.yaml）之后这些
+  变量只剩注释、代码已不读。要跑真实 app 得手写 config.yaml 指向服务端，并用
+  `HOME=<临时目录>` 重定向配置目录以免覆盖真实配置。
+
+### 已在本机验证通过的部分（2026-09-11 实测，release 构建）
+
+用本机 `wsieve-server` + 独立 `HOME` 跑**真实 Tauri app**（不是探针）验过下面
+四条，判据 31/32 仍需真实链路：
+
+| # | 结果 |
+|---|---|
+| 27 | ✅ 日志「承载页 server 就绪: http://127.0.0.1:49644/」，端口每次启动不同 |
+| 28 | ✅ 日志「**回帧通路: raw (custom protocol)**」——**本次改动的核心主张由此在真实 Tauri `invoke` 上得到确认**，不再只是手写 fetch 的 spike 证据 |
+| 29 | ✅ 未出现粘性回退（出现即会打「回帧通路: base64」那条） |
+| 30 | ✅ 出站 `Connected { sessions: 1 }`，50/200 MiB 经隧道逐字节完整取回 |
+| 33 | ✅ 见下表 |
+
+**第 33 条 CPU 实测**（同一台机、release、200 MiB、各两轮，`WSIEVE_EMIT_RAW=0`
+作为 base64 对照组）：
+
+| 指标 | raw | base64 | 差异 |
+|---|---|---|---|
+| 峰值吞吐 | 312–348 MiB/s | 62 MiB/s | **5.3×** |
+| 每 MiB 的 CPU 成本 | 5.5–5.75 ms | 19.05–19.25 ms | **3.4×** |
+
+限速 100 Mbps 传 100 MiB（两组墙钟同为 16.4s，故对比公平）——这一栏最接近真实
+链路下用户感受到的东西：
+
+| 进程 | raw | base64 |
+|---|---|---|
+| `wsieve-app` | 1.01s | 2.19s |
+| WebContent（JS 侧，base64 编码所在） | 0.54s | **2.06s** |
+| 合计占用 | **9% of one core** | **26% of one core** |
+
+> 一处测量边界，如实标注：base64 对照组用的是 `WSIEVE_EMIT_RAW=0`，此时承载页
+> 仍是 http origin，因此 `CHUNK_MAX` 仍为 256 KB；而改动前的生产形态（远程
+> https origin）走的是 64 KB 档。既有实测记录显示 base64 通路 64 KB 比 256 KB
+> 快约 12%，故「5.3×」在真实生产对比下约为 4.7×。CPU 那一栏同理略有高估。
 
 | # | 区域 | 操作步骤 | 期望结果 |
 |---|---|---|---|
