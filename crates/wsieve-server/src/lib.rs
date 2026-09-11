@@ -128,11 +128,33 @@ impl AppState {
     }
 
     /// 构建 Router（main 与测试共用）。
+    ///
+    /// Alt-Svc 加在**整个 Router 上**而不是 `disguise_resp` 里：承载页自
+    /// 2026-09-10 起是本机 http 壳，WebView 的数据面请求直接走 `/api/sync`
+    /// 与 `/api/events`，从不请求伪装页面。只给伪装响应加这个头，客户端就
+    /// 永远看不到它——而 Apple 的网络栈不做推测性 QUIC 尝试，没看到
+    /// Alt-Svc 就永远不会升级到 h3，等于 h3 白做。
+    ///
+    /// `alt_svc_port` 为 None 时**完全不挂这一层**：宣告一个连不上的 QUIC
+    /// 端点，会让客户端此后每次连接都先试 QUIC 超时再回落，比不宣告更糟。
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
+        let alt_svc = self.disguise.alt_svc_port.and_then(|p| {
+            axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma=86400")).ok()
+        });
+        let r = Router::new()
             .route("/", any(fallback))
             .route("/{*rest}", any(fallback))
-            .with_state(self)
+            .with_state(self);
+        match alt_svc {
+            Some(v) => r.layer(axum::middleware::map_response(move |mut resp: Response| {
+                let v = v.clone();
+                async move {
+                    resp.headers_mut().insert(header::ALT_SVC, v);
+                    resp
+                }
+            })),
+            None => r,
+        }
     }
 }
 
@@ -174,8 +196,9 @@ fn parse_sid(s: &str) -> Option<Sid> {
 }
 
 async fn disguise_resp(state: &Arc<AppState>, req: axum::http::Request<Body>) -> Response {
-    let alt_svc = state.disguise.alt_svc_port;
-    let mut resp = match &state.disguise.upstream {
+    // Alt-Svc 不在这里加——它已提升到 Router 层，覆盖含数据面在内的全部
+    // 响应（见 `AppState::router`）。留在这里只会覆盖伪装这一条路径。
+    match &state.disguise.upstream {
         Some(base) => {
             let method = req.method().as_str().to_string();
             let uri = req
@@ -200,13 +223,7 @@ async fn disguise_resp(state: &Arc<AppState>, req: axum::http::Request<Body>) ->
             let path = req.uri().path().to_string();
             disguise::handle_static(&method, &path).await
         }
-    };
-    if let Some(p) = alt_svc {
-        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma=86400")) {
-            resp.headers_mut().insert(header::ALT_SVC, v);
-        }
     }
-    resp
 }
 
 /// 唯一入口：任何方法任何路径。

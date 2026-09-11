@@ -13,7 +13,7 @@ use rand::RngCore;
 use wsieve_proto::crypto::{build_client, gen_keypair};
 use wsieve_proto::hello::{IpStrategy, decode_msg2, encode_msg1, MuxId};
 use wsieve_proto::tu::{decode_frame, Frame};
-use wsieve_server::{AppState, KeepaliveRange, ServerKeys, SEEN_CACHE_CAPACITY};
+use wsieve_server::{AppState, DisguiseCfg, KeepaliveRange, ServerKeys, SEEN_CACHE_CAPACITY};
 use wsieve_xhttp::server::Sid;
 
 struct TestServer {
@@ -24,11 +24,20 @@ struct TestServer {
 
 /// 起一个真实 TCP 上的 axum 服务（随机端口），keepalive 调小使流测试可等。
 async fn start_server(seen_capacity: usize, keepalive: KeepaliveRange) -> TestServer {
+    start_server_with_disguise(seen_capacity, keepalive, DisguiseCfg::default()).await
+}
+
+/// 同上，但可指定伪装配置（Alt-Svc 测试需要非默认的 alt_svc_port）。
+async fn start_server_with_disguise(
+    seen_capacity: usize,
+    keepalive: KeepaliveRange,
+    disguise: DisguiseCfg,
+) -> TestServer {
     let (server_priv, server_pub) = gen_keypair();
     let (client_priv, client_pub) = gen_keypair();
     let mut whitelist = HashSet::new();
     whitelist.insert(client_pub);
-    let state = AppState::new(
+    let state = AppState::with_disguise(
         ServerKeys {
             priv_key: server_priv,
             whitelist,
@@ -36,6 +45,7 @@ async fn start_server(seen_capacity: usize, keepalive: KeepaliveRange) -> TestSe
         vec![MuxId::Wsmux, MuxId::Wsmux],
         keepalive,
         seen_capacity,
+        disguise,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -139,6 +149,76 @@ async fn valid_handshake_returns_msg2() {
     let msg2 = decode_msg2(&plain[..n]).unwrap();
     assert_eq!(msg2.chosen_mux_id, MuxId::Wsmux);
     assert!(!msg2.fallback);
+}
+
+/// Alt-Svc 必须覆盖**数据面**响应，不能只加在伪装页面上。
+///
+/// 承载页自 2026-09-10 起是本机 http 壳，WebView 的数据面请求直接走
+/// `/api/sync` 与 `/api/events`，**从不请求伪装页面**。若这个头只加在
+/// `disguise_resp` 里，客户端就永远看不到它——而 Apple 的网络栈不做推测性
+/// QUIC 尝试，没看到 Alt-Svc 就永远不会升级到 h3，等于 h3 白做。
+#[tokio::test]
+async fn alt_svc_covers_data_plane_responses() {
+    let ts = start_server_with_disguise(
+        SEEN_CACHE_CAPACITY,
+        KeepaliveRange::default(),
+        DisguiseCfg {
+            upstream: None,
+            alt_svc_port: Some(443),
+        },
+    )
+    .await;
+    let (tu, _, _, sid_b64) = make_msg1(&ts, now_ms());
+    let resp = http(&ts)
+        .post(url(&ts, &format!("/api/sync?n=0&sid={sid_b64}")))
+        .body(tu)
+        .send()
+        .await
+        .unwrap();
+    // 200 = 握手成功，这条响应由 handshake() 直接产出，不经 disguise_resp
+    assert_eq!(resp.status(), 200, "前提：这必须是一条数据面响应");
+    let v = resp
+        .headers()
+        .get("alt-svc")
+        .expect("数据面响应必须带 Alt-Svc")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(v.contains(r#"h3=":443""#), "实际: {v}");
+}
+
+/// 伪装响应仍然带 Alt-Svc（把加头位置上移不能弄丢原有覆盖面）。
+#[tokio::test]
+async fn alt_svc_still_covers_disguise_responses() {
+    let ts = start_server_with_disguise(
+        SEEN_CACHE_CAPACITY,
+        KeepaliveRange::default(),
+        DisguiseCfg {
+            upstream: None,
+            alt_svc_port: Some(8443),
+        },
+    )
+    .await;
+    let resp = http(&ts).get(url(&ts, "/")).send().await.unwrap();
+    let v = resp
+        .headers()
+        .get("alt-svc")
+        .expect("伪装响应原本就带这个头，不得回归")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(v.contains(r#"h3=":8443""#), "实际: {v}");
+}
+
+/// 没有可用的 h3 端口时必须完全沉默。
+///
+/// 宣告一个连不上的 QUIC 端点，会让客户端此后每次连接都先试 QUIC 超时
+/// 再回落，白白多一轮延迟——比不宣告更糟。
+#[tokio::test]
+async fn alt_svc_absent_when_h3_unavailable() {
+    let ts = start_server(SEEN_CACHE_CAPACITY, KeepaliveRange::default()).await;
+    let resp = http(&ts).get(url(&ts, "/")).send().await.unwrap();
+    assert!(resp.headers().get("alt-svc").is_none());
 }
 
 /// 4. 同一 msg1 字节重放 → 伪装（404，同随机路径）。
