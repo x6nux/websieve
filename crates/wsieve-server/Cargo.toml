@@ -19,7 +19,21 @@ reqwest = { workspace = true }
 base64 = "0.22"
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
+# 不需要为 QUIC 加 feature：rustls 0.23 的 `rustls::quic` 模块是默认就有的，
+# 而 `QuicServerConfig` 属于 quinn 侧（由 quinn 自己的 rustls feature 提供）。
+# 曾试图加一个 `quic` feature，cargo 直接报 `rustls does not have that feature`。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# HTTP/3 监听面（UDP 443）。三件套各司其职：
+#   quinn    —— QUIC 传输本身
+#   h3       —— HTTP/3 语义（帧、QPACK、请求/响应）
+#   h3-quinn —— 把前两者粘起来的 quic::Connection 实现
+# 注意 h3 的 API 是手动 accept stream，与 hyper/axum 的 Service 模型不同，
+# 所以 src/h3.rs 里有一层适配——那不是可以省掉的胶水，是两种模型的边界。
+quinn = "0.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# 下行要逐块转发 axum 的 body stream（见 src/http3.rs 的流式硬要求）。
+futures = { workspace = true }
 rcgen = "0.13"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 wsieve-mux = { version = "0.1.0", path = "../wsieve-mux" }

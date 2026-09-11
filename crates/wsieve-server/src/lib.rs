@@ -13,6 +13,9 @@
 //! 保活任务下次 tick 自然退出）。
 
 pub mod disguise;
+/// HTTP/3 监听面。模块名刻意不叫 `h3`——那会与 `h3` crate 同名，读代码时
+/// 分不清 `h3::server` 指的是本地模块还是外部 crate。
+pub mod http3;
 pub mod remote;
 pub mod tls;
 

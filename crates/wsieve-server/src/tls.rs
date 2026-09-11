@@ -72,11 +72,9 @@ pub(crate) const ALPN_TCP: [&[u8]; 2] = [b"h2", b"http/1.1"];
 
 /// QUIC 监听面的 ALPN：只有 h3。
 ///
-/// 逐项 `allow(dead_code)`：UDP 监听面尚未接入（计划 Task 3），此刻只有测试
-/// 在用它。与常量本身一起落地而不是等 Task 3 再加，是因为「两个面的 ALPN
-/// 取值互斥」这条约束属于 `rustls_config` 的契约，把它写在契约旁边才不会在
-/// 将来被当成可有可无的细节。见 `carrier_page.rs` 关于逐项 allow 的同款说明。
-#[allow(dead_code)]
+/// 与 `ALPN_TCP` 并排放在这里，是因为「两个监听面的 ALPN 与 early_data 取值
+/// 互斥」这条约束属于 `rustls_config` 的契约本身，写在契约旁边才不会在将来
+/// 被当成可有可无的细节。使用方见 `crate::http3::bind`。
 pub(crate) const ALPN_QUIC: [&[u8]; 1] = [b"h3"];
 
 pub(crate) fn alpn_vec(items: &[&[u8]]) -> Vec<Vec<u8>> {
@@ -94,7 +92,7 @@ pub(crate) fn alpn_vec(items: &[&[u8]]) -> Vec<Vec<u8>> {
 ///
 /// QUIC 只接受 0 或 `u32::MAX`；拿 16384 去 `QuicServerConfig::try_from`
 /// 会直接失败。
-fn rustls_config(
+pub(crate) fn rustls_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     alpn: Vec<Vec<u8>>,
