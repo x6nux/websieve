@@ -165,6 +165,7 @@ async fn alt_svc_covers_data_plane_responses() {
         DisguiseCfg {
             upstream: None,
             alt_svc_port: Some(443),
+            ..DisguiseCfg::default()
         },
     )
     .await;
@@ -196,6 +197,7 @@ async fn alt_svc_still_covers_disguise_responses() {
         DisguiseCfg {
             upstream: None,
             alt_svc_port: Some(8443),
+            ..DisguiseCfg::default()
         },
     )
     .await;
@@ -219,6 +221,44 @@ async fn alt_svc_absent_when_h3_unavailable() {
     let ts = start_server(SEEN_CACHE_CAPACITY, KeepaliveRange::default()).await;
     let resp = http(&ts).get(url(&ts, "/")).send().await.unwrap();
     assert!(resp.headers().get("alt-svc").is_none());
+}
+
+/// `ma` 必须可配，且默认是 86400。
+///
+/// 这是降级保护的一个旋钮：客户端按 `ma` 记住 h3，期间即使 h3 变慢也不会
+/// 自己回到 TCP（WebKit 只在握手失败时回落）。调小能缩短劣化窗口，代价是
+/// 偏离真实世界的普遍取值。
+#[tokio::test]
+async fn alt_svc_ma_is_configurable_and_defaults_to_a_day() {
+    assert_eq!(wsieve_server::ALT_SVC_MA_DEFAULT, 86_400);
+
+    let ts = start_server_with_disguise(
+        SEEN_CACHE_CAPACITY,
+        KeepaliveRange::default(),
+        DisguiseCfg {
+            upstream: None,
+            alt_svc_port: Some(443),
+            alt_svc_ma: 600,
+        },
+    )
+    .await;
+    let resp = http(&ts).get(url(&ts, "/")).send().await.unwrap();
+    let v = resp.headers()["alt-svc"].to_str().unwrap().to_string();
+    assert!(v.contains("ma=600"), "实际: {v}");
+
+    // 默认构造仍是一天
+    let ts2 = start_server_with_disguise(
+        SEEN_CACHE_CAPACITY,
+        KeepaliveRange::default(),
+        DisguiseCfg {
+            alt_svc_port: Some(443),
+            ..DisguiseCfg::default()
+        },
+    )
+    .await;
+    let resp2 = http(&ts2).get(url(&ts2, "/")).send().await.unwrap();
+    let v2 = resp2.headers()["alt-svc"].to_str().unwrap().to_string();
+    assert!(v2.contains("ma=86400"), "实际: {v2}");
 }
 
 /// 4. 同一 msg1 字节重放 → 伪装（404，同随机路径）。

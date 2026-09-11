@@ -63,13 +63,35 @@ pub struct ServerKeys {
     pub whitelist: HashSet<[u8; 32]>,
 }
 
+/// Alt-Svc 的 `ma`（max-age）默认值，单位秒。
+///
+/// 86400 是真实世界的普遍取值（nginx 官方示例即此值），改小会成为可被动
+/// 识别的特征。但它同时是降级保护的代价：客户端会记住 h3 达 24 小时，
+/// 期间即使 h3 质量变差也不会自己回到 TCP——这正是 `--alt-svc-ma` 存在的
+/// 理由，以及设计文档 §12 那套主动降级机制存在的理由。
+pub const ALT_SVC_MA_DEFAULT: u32 = 86_400;
+
 /// 伪装配置：默认内嵌 nginx 页；配置 upstream 后未认证请求反代到上游（spec §8）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DisguiseCfg {
     /// 反代上游基址（如 `https://example.com`）。None = 内嵌页模式。
     pub upstream: Option<String>,
     /// Alt-Svc 广播端口（§6.8 第 3 层铺路；None = 不广播）。
     pub alt_svc_port: Option<u16>,
+    /// Alt-Svc 的 `ma` 秒数。见 [`ALT_SVC_MA_DEFAULT`]。
+    pub alt_svc_ma: u32,
+}
+
+/// 手写而非 `derive(Default)`：`alt_svc_ma` 的零值是无意义的（`ma=0` 等于
+/// 让客户端立刻忘掉），derive 会悄悄给出那个值。
+impl Default for DisguiseCfg {
+    fn default() -> Self {
+        Self {
+            upstream: None,
+            alt_svc_port: None,
+            alt_svc_ma: ALT_SVC_MA_DEFAULT,
+        }
+    }
 }
 
 /// 共享状态（公开构造，测试直连）。
@@ -141,8 +163,9 @@ impl AppState {
     /// `alt_svc_port` 为 None 时**完全不挂这一层**：宣告一个连不上的 QUIC
     /// 端点，会让客户端此后每次连接都先试 QUIC 超时再回落，比不宣告更糟。
     pub fn router(self: Arc<Self>) -> Router {
+        let ma = self.disguise.alt_svc_ma;
         let alt_svc = self.disguise.alt_svc_port.and_then(|p| {
-            axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma=86400")).ok()
+            axum::http::HeaderValue::from_str(&format!("h3=\":{p}\"; ma={ma}")).ok()
         });
         let r = Router::new()
             .route("/", any(fallback))
