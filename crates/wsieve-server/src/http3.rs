@@ -83,6 +83,18 @@ pub fn bind_endpoint(
 pub fn serve(endpoint: quinn::Endpoint, router: Router, gate: crate::H3Gate) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
+            // 冷却期内**拒绝新的 QUIC 连接**，不能只靠"不宣告 + 关旧连接"。
+            //
+            // 2026-09-11 实测打脸：降级 18 秒后又冒出新的 h3 连接。原因是
+            // `Alt-Svc: clear` 要搭响应才能送到客户端，而客户端在收到它之前
+            // 就用旧记忆重连了 QUIC——服务端照单全收，冷却形同虚设。
+            //
+            // 在这里拒绝，客户端会立刻拿到连接失败并回落 TCP（WebKit 的握手
+            // 失败回落是可靠的，慢才不可靠）。这比等 clear 送达确定得多。
+            if gate.is_degraded() {
+                incoming.refuse();
+                continue;
+            }
             let router = router.clone();
             let gate = gate.clone();
             tokio::spawn(async move {

@@ -98,6 +98,42 @@ async fn bind_fails_loudly_when_udp_port_is_taken() {
     );
 }
 
+/// 降级冷却期内必须**拒绝新的 QUIC 连接**。
+///
+/// 2026-09-11 真机实测暴露的缺陷：只做"不宣告 Alt-Svc + 关掉旧连接"是不够的
+/// ——`Alt-Svc: clear` 要搭响应才能送到客户端，而客户端在收到它之前就会用
+/// 旧记忆重连 QUIC。当时降级 18 秒后就又冒出新的 h3 连接，冷却形同虚设。
+///
+/// 在 accept 处拒绝，客户端会立刻拿到失败并回落 TCP——WebKit 的握手失败
+/// 回落是可靠的（不可靠的是"慢"不触发回落）。
+#[tokio::test]
+async fn degraded_gate_refuses_new_quic_connections() {
+    let (cert, key) = self_signed();
+    let gate = wsieve_server::H3Gate::new();
+    let router = axum::Router::new().route("/hello", axum::routing::get(|| async { "hi" }));
+    let addr = wsieve_server::http3::bind(
+        vec![cert.clone()],
+        key,
+        "127.0.0.1:0".parse().unwrap(),
+        router,
+        gate.clone(),
+    )
+    .await
+    .unwrap();
+
+    let ep = client_endpoint(cert);
+    // 未降级：连得上
+    ep.connect(addr, "localhost").unwrap().await.expect("降级前应当连得上");
+
+    // 降级后：新连接必须被拒
+    gate.degrade_for(Duration::from_secs(600));
+    let r = ep.connect(addr, "localhost").unwrap().await;
+    assert!(
+        r.is_err(),
+        "冷却期内必须拒绝新 QUIC 连接，否则客户端会用旧记忆绕过降级"
+    );
+}
+
 #[tokio::test]
 async fn h3_round_trip_over_quic() {
     let (cert, key) = self_signed();
