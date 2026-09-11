@@ -145,6 +145,37 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
+        // 证书材料只读一次，TCP 与 UDP 两面共用。各读各的会在证书轮换的那
+        // 一瞬间读到两个版本，两个面于是拿着不同证书对外服务——不报错，只在
+        // 客户端零星出现校验失败。
+        let material = wsieve_server::tls::tls_material(&cfg.deployment)?;
+
+        // UDP 面**先于 AppState** 绑定：Alt-Svc 要宣告的端口取决于它成不成功，
+        // 而 AppState 构造时就需要那个端口（端口 → AppState → router → 服务
+        // 是一条链）。失败只警告不中止——h3 是叠加能力，TCP 面必须照常服务，
+        // 与 shard_setup 里「条带禁用则退回单会话」同源的纪律。
+        let h3_endpoint = match &material {
+            Some((certs, key)) => {
+                match wsieve_server::http3::bind_endpoint(
+                    certs.clone(),
+                    key.clone_key(),
+                    cfg.listen,
+                ) {
+                    Ok(ep) => Some(ep),
+                    Err(e) => {
+                        eprintln!("HTTP/3 未启用（{e:#}）——继续以 h1/h2 提供服务");
+                        None
+                    }
+                }
+            }
+            // 明文部署（cdn-flexible）没有证书，QUIC 无从谈起
+            None => None,
+        };
+        let h3_port = h3_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|a| a.port());
+
         let state = AppState::with_disguise(
             ServerKeys { priv_key, whitelist },
             enabled_mux(),
@@ -152,10 +183,21 @@ fn main() -> Result<()> {
             SEEN_CACHE_CAPACITY,
             DisguiseCfg {
                 upstream: cfg.upstream,
-                alt_svc_port: cfg.alt_svc_port,
+                // 只在 h3 真的起来了才宣告。宣告一个连不上的 QUIC 端点，会让
+                // 客户端此后每次连接都先试 QUIC 超时再回落，比不宣告更糟。
+                // 命令行的 --alt-svc-port 保留为手工覆盖（CDN 模式下 h3 由
+                // CDN 提供，本进程并不监听 UDP）。
+                alt_svc_port: h3_port.or(cfg.alt_svc_port),
             },
         );
-        wsieve_server::tls::serve(&cfg.deployment, cfg.listen, state.router()).await?;
+
+        if let Some(ep) = h3_endpoint {
+            wsieve_server::http3::serve(ep, state.clone().router());
+            eprintln!("HTTP/3 就绪: udp://{}", cfg.listen);
+        }
+
+        let mode = wsieve_server::tls::mode_from_material(material)?;
+        wsieve_server::tls::serve_mode(mode, cfg.listen, state.router()).await?;
         eprintln!("wsieve-server listening on {} ({:?})", cfg.listen, cfg.deployment);
         tokio::signal::ctrl_c().await.ok();
         anyhow::Ok(())

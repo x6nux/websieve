@@ -80,6 +80,24 @@ async fn h3_get(
     (status, body, marks)
 }
 
+/// UDP 端口被占用时必须**明确报错**，不能静默成功。
+///
+/// 启动编排完全依赖这个 `Err`：拿不到它就会以为 h3 起来了，进而宣告一个
+/// 连不上的 Alt-Svc 端点——客户端此后每次连接都要先试 QUIC 超时再回落，
+/// 比根本不支持 h3 还糟。
+#[tokio::test]
+async fn bind_fails_loudly_when_udp_port_is_taken() {
+    let squatter = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let taken = squatter.local_addr().unwrap();
+    let (cert, key) = self_signed();
+    let err = wsieve_server::http3::bind_endpoint(vec![cert], key, taken)
+        .expect_err("端口已被占用，绑定必须失败");
+    assert!(
+        format!("{err:#}").contains("QUIC 监听"),
+        "错误信息要指明是 QUIC 监听失败，实际: {err:#}"
+    );
+}
+
 #[tokio::test]
 async fn h3_round_trip_over_quic() {
     let (cert, key) = self_signed();

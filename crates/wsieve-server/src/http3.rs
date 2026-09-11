@@ -34,13 +34,33 @@ const MAX_UPLINK: usize = 1 << 20;
 
 /// 绑定 UDP 并 spawn accept 循环，返回**实际**绑定地址（传 `:0` 时测试用）。
 ///
-/// 绑定失败原样返回 `Err`：h3 是叠加能力，降不降级由调用方判断。
+/// 便利入口，供测试与不需要拆两步的调用方使用；启动编排走
+/// [`bind_endpoint`] + [`serve`]，理由见 `bind_endpoint` 的注释。
 pub async fn bind(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     listen: SocketAddr,
     router: Router,
 ) -> Result<SocketAddr> {
+    let ep = bind_endpoint(certs, key, listen)?;
+    let addr = ep.local_addr()?;
+    serve(ep, router);
+    Ok(addr)
+}
+
+/// 只绑定 UDP，不开始服务。
+///
+/// 之所以要跟 [`serve`] 拆开：`Alt-Svc` 要宣告的端口取决于这里绑没绑成功，
+/// 而 `AppState` 构造时就需要那个端口，`router()` 又出自 `AppState`——
+/// 「端口 → AppState → router → 服务」是一条链，绑定必须先于 AppState。
+/// 合成一步就成了 router 与端口互相等待的死结。
+///
+/// 绑定失败原样返回 `Err`：h3 是叠加能力，降不降级由调用方判断。
+pub fn bind_endpoint(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    listen: SocketAddr,
+) -> Result<quinn::Endpoint> {
     // QUIC 面**单独**构建 rustls config：ALPN 只有 h3，且 early_data 必须是
     // 0 或 u32::MAX——TCP 面那个 16384 拿过来会让 try_from 直接失败。这正是
     // 两个监听面不能共用一份 config 的原因（见 tls::rustls_config 的注释）。
@@ -54,10 +74,12 @@ pub async fn bind(
         .context("rustls config 不满足 QUIC 要求（需 TLS1.3，且 early_data 为 0 或 u32::MAX）")?;
     let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
 
-    let endpoint = quinn::Endpoint::server(server_cfg, listen)
-        .with_context(|| format!("QUIC 监听 {listen} 失败"))?;
-    let addr = endpoint.local_addr()?;
+    quinn::Endpoint::server(server_cfg, listen)
+        .with_context(|| format!("QUIC 监听 {listen} 失败"))
+}
 
+/// 在已绑定的 endpoint 上开始接受 h3 连接。
+pub fn serve(endpoint: quinn::Endpoint, router: Router) {
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let router = router.clone();
@@ -77,7 +99,6 @@ pub async fn bind(
             });
         }
     });
-    Ok(addr)
 }
 
 async fn serve_conn(conn: quinn::Connection, router: Router) -> Result<()> {

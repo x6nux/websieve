@@ -110,15 +110,19 @@ pub(crate) fn rustls_config(
     Ok(cfg)
 }
 
-/// 按部署模式构建 ServeMode。
-pub async fn build(deployment: &Deployment) -> Result<ServeMode> {
+/// 该部署模式下的证书链与私钥；明文模式（CDN Flexible）返回 `None`。
+///
+/// 单独抽出来是因为 TCP 与 UDP 两个监听面都要用同一份材料。各读各的会在
+/// 证书轮换的那一瞬间读到两个不同版本——两个面于是拿着不同证书对外服务，
+/// 而且不会报错，只在客户端零星出现校验失败。
+pub fn tls_material(
+    deployment: &Deployment,
+) -> Result<Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>> {
     match deployment {
-        Deployment::CdnFlexible => Ok(ServeMode::Plain),
+        Deployment::CdnFlexible => Ok(None),
         Deployment::CdnFullSelfSigned => {
             let (cert, key) = self_signed()?;
-            Ok(ServeMode::Tls(TlsAcceptor::from(Arc::new(
-                rustls_config(vec![cert], key, alpn_vec(&ALPN_TCP), 16_384)?,
-            ))))
+            Ok(Some((vec![cert], key)))
         }
         Deployment::Direct {
             cert_path,
@@ -137,11 +141,27 @@ pub async fn build(deployment: &Deployment) -> Result<ServeMode> {
             ))
             .with_context(|| format!("私钥解析失败: {key_path}"))?
             .context("私钥文件不含 PEM 私钥")?;
-            Ok(ServeMode::Tls(TlsAcceptor::from(Arc::new(
-                rustls_config(certs, key, alpn_vec(&ALPN_TCP), 16_384)?,
-            ))))
+            Ok(Some((certs, key)))
         }
     }
+}
+
+/// 由已读出的证书材料构建 ServeMode（TCP 面：ALPN h2/http1.1）。
+pub fn mode_from_material(
+    material: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ServeMode> {
+    match material {
+        None => Ok(ServeMode::Plain),
+        Some((certs, key)) => Ok(ServeMode::Tls(TlsAcceptor::from(Arc::new(
+            rustls_config(certs, key, alpn_vec(&ALPN_TCP), 16_384)?,
+        )))),
+    }
+}
+
+/// 按部署模式构建 ServeMode（自己读证书；两面共用材料的场景请改用
+/// [`tls_material`] + [`mode_from_material`]）。
+pub async fn build(deployment: &Deployment) -> Result<ServeMode> {
+    mode_from_material(tls_material(deployment)?)
 }
 
 /// rcgen 自签证书（CN/NS 均为占位身份；CDN Full 模式下 CDN 不校验源站证书）。
@@ -160,9 +180,21 @@ pub async fn serve(
     listen: SocketAddr,
     router: Router,
 ) -> Result<SocketAddr> {
+    serve_mode(build(deployment).await?, listen, router).await
+}
+
+/// 同上，但 `ServeMode` 由调用方给出。
+///
+/// 启动编排走这个入口：TCP 与 UDP 两面必须共用同一份证书材料，各读各的会
+/// 在轮换瞬间拿到两个版本（见 [`tls_material`]）。
+pub async fn serve_mode(
+    mode: ServeMode,
+    listen: SocketAddr,
+    router: Router,
+) -> Result<SocketAddr> {
     let tcp = TcpListener::bind(listen).await.with_context(|| listen.to_string())?;
     let addr = tcp.local_addr()?;
-    match build(deployment).await? {
+    match mode {
         ServeMode::Plain => {
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(tcp, router).await {
