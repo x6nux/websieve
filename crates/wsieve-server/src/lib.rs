@@ -332,6 +332,15 @@ async fn disguise_resp(state: &Arc<AppState>, req: axum::http::Request<Body>) ->
 
 /// 唯一入口：任何方法任何路径。
 async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Request<Body>) -> Response {
+    // 服务端耗时的计时**从这里起**，不能从 `push_post` 之前起。
+    //
+    // 这个数字的唯一用途是让客户端从 RTT 里把它扣掉（见 `apply_server_timing`）。
+    // 从 `push_post` 起算的话，量到的只是一次内存队列 push——微秒级，`{:.1}` ms
+    // 格式化出来恒为 "0.0"，客户端那边的扣减就永远是零，整个回传通道白搭了一遍。
+    //
+    // 读 body（`to_bytes`）才是服务端这一侧真正可能耗时的那一段：大 body、
+    // 慢上行、背压都落在它身上，而它恰恰全部发生在计时点之前。
+    let t0 = std::time::Instant::now();
     let method = req.method().as_str().to_string();
     let path = req.uri().path().to_string();
     let uri = req.uri().clone();
@@ -363,6 +372,8 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
                         .body(Body::empty())
                         .unwrap();
                     apply_cors(&mut r, &cors);
+                    let (gaps, dups) = state.store.link_observations(&sid).await;
+                    apply_server_timing(&mut r, t0.elapsed(), gaps, dups);
                     r
                 } else {
                     disguise_resp(&state, bad_req()).await
@@ -385,6 +396,37 @@ async fn fallback(State(state): State<Arc<AppState>>, mut req: axum::http::Reque
         r
     } else {
         disguise_resp(&state, req).await
+    }
+}
+
+/// 把服务端侧的链路观测经 `Server-Timing` 回传给客户端。
+///
+/// **为什么用这个头而不是自定义头**：客户端的链路画像需要两样服务端才有的
+/// 信息——服务端自报的处理耗时（从 RTT 里扣掉才是纯网络往返），以及上行 seq
+/// 的空洞/重复计数（客户端只知道自己重试了，分不清是请求丢了还是响应丢了）。
+/// 传这两样需要一个通道，而 `Server-Timing` 恰好：
+///   1. 是标准头，Cloudflare/Fastly 这类 CDN 普遍发送，伪装上零风险；
+///   2. 浏览器读它受 `Timing-Allow-Origin` 保护，而那个头我们**已经无条件在发**
+///      （原本是为了让 JS 读 `nextHopProtocol`），所以通道是白捡的，协议零改动。
+///
+/// `dur` 用毫秒（规范要求），`q` 的 `desc` 带 `<空洞>-<重复>`。
+///
+/// 只挂在**认证成功**的响应上——与 `apply_cors` 同一个位置，理由也相同：
+/// 探测者发不出合法的 msg1，就永远看不到这个头，它不构成可探测的特征。
+fn apply_server_timing(
+    r: &mut Response<Body>,
+    dur: std::time::Duration,
+    gaps: u32,
+    dups: u32,
+) {
+    let v = format!(
+        "edge;dur={:.1}, q;desc=\"{}-{}\"",
+        dur.as_secs_f64() * 1000.0,
+        gaps,
+        dups
+    );
+    if let Ok(hv) = header::HeaderValue::from_str(&v) {
+        r.headers_mut().insert("server-timing", hv);
     }
 }
 
@@ -423,6 +465,20 @@ fn apply_cors(resp: &mut Response, origin: &Option<String>) {
     );
     resp.headers_mut()
         .insert(header::VARY, axum::http::HeaderValue::from_static("Origin"));
+    // 没有这一行，跨域的 `resp.headers.get('server-timing')` 永远是 null。
+    //
+    // 两个头管的是**两件不同的事**，很容易混：
+    //   - `Timing-Allow-Origin` 放行的是 `PerformanceResourceTiming`（含
+    //     `nextHopProtocol`、`serverTiming` 条目），走 Performance API；
+    //   - `Access-Control-Expose-Headers` 放行的是 `Response.headers.get()`，
+    //     走 fetch。CORS 默认只暴露 7 个安全头，`server-timing` 不在其中。
+    //
+    // 自适应流控的回传通道读的是后者（emitter.js 的 `peerObs`），所以两个
+    // 都得发。少了这个头不会报错，只表现为服务端观测恒为"无数据"。
+    resp.headers_mut().insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        axum::http::HeaderValue::from_static("server-timing"),
+    );
 }
 
 /// 失败路径的最小请求（body 已消费的场合）。

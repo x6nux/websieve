@@ -21,6 +21,11 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
+// `now_or_never`：非阻塞地收掉已完成的在途写入。用 `StreamExt::next().await`
+// 会把「顺手收一下」变成「等齐」，那正是这次要去掉的队头阻塞。
+use futures::{FutureExt, StreamExt};
+use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::Notify;
@@ -38,7 +43,20 @@ pub type LaneOpener = Arc<
     dyn Fn(Dir) -> BoxFuture<'static, anyhow::Result<MuxStream>> + Send + Sync,
 >;
 
-/// 在指定 mux 上开一条 lane 并写好 OPEN 头。
+/// 「这是一条追加 lane，不是新 conn」的线上标记。
+///
+/// 首 lane 的 OPEN 后面跟着 TargetAddr，追加 lane 没有。接收侧此前只能靠
+/// 「conn 认不认识」来区分，而那正是竞态所在：追加 lane 抢在 conn 登记之前
+/// 到达时，会被当成新 conn 去 `read_open_addr`——把分片数据当地址解析。
+///
+/// `lane_id` 本来就在线上（头部 11..13 字节），一直写 0 没派上用场，正好
+/// 拿来做这个标记。数值本身不参与路由，只区分「首」与「追加」。
+const LANE_ID_EXTRA: u16 = 1;
+
+/// 在指定 mux 上开一条**追加** lane 并写好 OPEN 头。
+///
+/// 首 lane 不走这里（它要带 TargetAddr，见 `StripeDialer::connect`），
+/// 因此这里恒填 [`LANE_ID_EXTRA`]。
 async fn open_lane_on(
     mux: &Arc<dyn Mux>,
     conn_id: u64,
@@ -49,7 +67,7 @@ async fn open_lane_on(
         conn_id,
         cmd: Cmd::Open,
         dir,
-        lane_id: 0,
+        lane_id: LANE_ID_EXTRA,
     })
     .to_vec();
     stream.write_all(&hdr).await?;
@@ -337,6 +355,15 @@ impl StripeConn {
         self.inner.lane_count.load(Ordering::Relaxed)
     }
 
+    /// **接收**方向存活的 lane 数（诊断/测试）。
+    ///
+    /// 与 [`Self::lane_count`]（发送侧）不是一回事：`accept_lane` 归并进来的
+    /// lane 只增这一个，发送侧那个纹丝不动。两者混用会让「lane 归并成功了
+    /// 没有」这类断言永远看着像失败。
+    pub fn recv_lane_count(&self) -> usize {
+        self.inner.recv.lock().unwrap().live_lanes
+    }
+
     pub fn conn_id(&self) -> u64 {
         self.inner.conn_id
     }
@@ -549,6 +576,16 @@ async fn lane_reader(inner: Arc<ConnInner>, mut r: ReadHalf<MuxStream>) {
 /// `live_lanes`，中间有一段它还"不存在"的窗口。这个常量就是留给那段窗口的。
 const LANE_JOIN_GRACE: Duration = Duration::from_millis(300);
 
+/// 收尾阶段（排空在途写、发 CLOSE、flush/shutdown）的总时限。
+///
+/// 收尾路径上没有别的分支能救场：对端一旦不读，那里的每个 await 都会永久
+/// Pending，而 `mark_dead` 排在它们之后——任务会停在倒数第二行，写端的 waker
+/// 不被唤醒，conn 的资源一件都不回收。
+///
+/// 5 秒远长于任何正常的收尾（都是本地缓冲操作），又不至于让一条已经废掉的
+/// conn 把回收拖到分钟级。超时就意味着放弃尾部数据，而那时对端已经不读了。
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 一条入站 lane 结束。
 ///
 /// 注意终结判据不是"所有 lane 都 EOF"——那只说明**已知的** lane 没数据了，
@@ -653,9 +690,116 @@ fn maybe_finish(inner: &Arc<ConnInner>, st: &mut RecvState) {
 
 // ---------------- 发送任务 ----------------
 
+/// 病态慢的判据：EWMA 速率低于当前最快 lane 的 1/N 就停发。
+///
+/// 为什么光靠 work-stealing 不够：空闲轮转已经让分配与速率成正比（快 lane
+/// 先写完先回来，自然拿到更多片），对**吞吐**是对的。但重组端是连续推进
+/// ——发给一条慢 10 倍的 lane 的那一片，会把它后面所有数据一起堵住 10 倍
+/// 时长。按比例少发解决不了这个，得干脆不发。
+///
+/// 8 是拍脑袋的初值：低于此倍数的差距在跨境链路上属于正常抖动，停发反而
+/// 会把可用带宽白白丢掉；真正值得停的是那种「卡住了」级别的 lane。
+/// `ponytail:` 待实测调参。
+const LANE_SLOW_FACTOR: f64 = 8.0;
+
+/// 停发的 lane 每隔这么久强制放行一片，用来刷新它的速率估计。
+///
+/// 没有这个，一条 lane 一旦被判慢就再也拿不到数据 ⇒ EWMA 永远停在那个旧
+/// 值 ⇒ 永远出不来。链路恢复了也白搭，而跨境链路的抖动恰恰是分钟级的。
+const LANE_REPROBE: Duration = Duration::from_secs(2);
+
+/// 一条发送 lane 的健康度。
+///
+/// 只用**写入完成**这一个可观测量：完成一片 CHUNK 花了多久 ⇒ 瞬时速率。
+/// 不去猜 RTT / 丢包——mux 层看不到它们，而写入完成时间本身就已经把窗口
+/// 阻塞、重传、对端消费速度全都折进去了。
+struct LaneHealth {
+    /// 速率的指数滑动平均（字节/秒）。`None` = 还没有样本。
+    ewma_bps: Option<f64>,
+    /// 上一次真的发出数据的时刻（用于再探）。
+    last_sent: Instant,
+}
+
+impl LaneHealth {
+    fn new() -> Self {
+        Self { ewma_bps: None, last_sent: Instant::now() }
+    }
+
+    /// 记一次写入完成。`elapsed` 过短时不采样——除以一个接近 0 的数会得到
+    /// 天文数字，一次就能把 EWMA 拉到没法再下来，之后所有 lane 都显得「慢」。
+    fn observe(&mut self, bytes: usize, elapsed: Duration) {
+        const MIN_SAMPLE: Duration = Duration::from_micros(50);
+        if elapsed < MIN_SAMPLE {
+            return;
+        }
+        let bps = bytes as f64 / elapsed.as_secs_f64();
+        // α=0.3：够快地跟上链路变化，又不至于被单次抖动带飞。
+        self.ewma_bps = Some(match self.ewma_bps {
+            Some(prev) => prev * 0.7 + bps * 0.3,
+            None => bps,
+        });
+    }
+}
+
 struct LaneW {
     w: Option<WriteHalf<MuxStream>>,
     last_write: Instant,
+    health: LaneHealth,
+}
+
+/// 一笔在途写入完成时带回来的东西：`(lane 下标, 写半, 成功?, 字节数, 耗时)`。
+type WriteDone = (usize, WriteHalf<MuxStream>, bool, usize, Duration);
+
+/// 收回一笔完成的在途写入：把写半还给那条 lane，并记一笔健康样本。
+///
+/// 返回 `false` 表示那笔写入**失败**，调用方必须 `mark_dead` 并结束发送任务。
+///
+/// 抽出来是因为这三行在发送任务里原样出现了三次——分发内层的背压等待、
+/// 分发之后的非阻塞顺手收、停车时的 `select!` 分支——而三处必须逐字一致：
+/// 漏掉 `l.w = Some(w)` 那条 lane 就永久失踪（再也挑不到它，条带静默降级成
+/// 更少的 lane），漏掉 `health.observe` 健康度就冻在旧值上（慢 lane 不再被
+/// 识别出来）。两种漏法都不报错，只表现为"莫名其妙变慢了"。
+///
+/// 收尾时的那一处（排空在途写入）**有意不走这里**：那时不该再判死（对端
+/// 已经不读了，那不是链路故障），也没人会再读健康度。
+fn reclaim_write(lanes: &mut [LaneW], done: WriteDone) -> bool {
+    let (i, w, ok, bytes, took) = done;
+    if !ok {
+        return false;
+    }
+    if let Some(l) = lanes.get_mut(i) {
+        l.w = Some(w);
+        l.last_write = Instant::now();
+        l.health.observe(bytes, took);
+    }
+    true
+}
+
+/// 这条 lane 现在能不能发。
+///
+/// 判据是**相对**的，不是绝对阈值：整条链路一起变慢时谁都不该被停发（停了
+/// 就是白扔带宽），只有明显掉队的那条才停。没有样本的一律放行——新加的
+/// lane 必须先拿到数据才会有样本，一上来就判它慢会让它永远出不来。
+fn lane_is_usable(h: &LaneHealth, best_bps: f64, now: Instant) -> bool {
+    let Some(bps) = h.ewma_bps else {
+        return true; // 还没测过，先给机会
+    };
+    if best_bps <= 0.0 {
+        return true; // 谁都没样本
+    }
+    if bps * LANE_SLOW_FACTOR >= best_bps {
+        return true;
+    }
+    // 已判慢：但要定期放行一片刷新估计，否则永远出不来（见 LANE_REPROBE）。
+    now.duration_since(h.last_sent) >= LANE_REPROBE
+}
+
+/// 当前最快 lane 的 EWMA（没有任何样本时为 0）。
+fn best_lane_bps(lanes: &[LaneW]) -> f64 {
+    lanes
+        .iter()
+        .filter_map(|l| l.health.ewma_bps)
+        .fold(0.0f64, f64::max)
 }
 
 /// 发送方向单写者任务：分片、轮转、按阈值加 lane、CLOSE 收尾。
@@ -666,10 +810,18 @@ async fn send_task(
     initial_w: WriteHalf<MuxStream>,
     mut ctl: tokio::sync::mpsc::Receiver<CtlMsg>,
 ) {
-    let mut lanes = vec![LaneW { w: Some(initial_w), last_write: Instant::now() }];
+    let mut lanes = vec![LaneW { w: Some(initial_w), last_write: Instant::now(), health: LaneHealth::new() }];
     let mut up_off: u64 = 0;
     // lane 轮转游标：跨队列项持续（见分发处注释）。
     let mut lane_rr: u64 = 0;
+    // 在途写入：每条 lane 至多一笔，写完把写半还回 `lanes[i].w`。
+    // **跨队列项保留**——每项都排空的话就没有流水线了（见分发处注释②）。
+    // 元组：(lane 下标, 归还的写半, 是否成功, 写了多少字节, 花了多久)。
+    // 后两项喂给 `LaneHealth::observe`——健康度只用「写入完成」这一个可
+    // 观测量，不去猜 RTT/丢包（mux 层看不到，而完成时间已经把窗口阻塞、
+    // 重传、对端消费速度全折进去了）。
+    type InflightWrite = Pin<Box<dyn Future<Output = WriteDone> + Send>>;
+    let mut inflight: FuturesUnordered<InflightWrite> = FuturesUnordered::new();
     let start = Instant::now();
     let mut sent: u64 = 0;
     if !initial_bytes.is_empty() {
@@ -683,7 +835,7 @@ async fn send_task(
         }
     }
 
-    loop {
+    'dispatch: loop {
         // 1. 排空待发队列
         loop {
             let next = {
@@ -718,62 +870,122 @@ async fn send_task(
             )
             .await;
             let mut off = up_off;
-            // 并行分发：每条 lane 攒好自己的帧批次，然后各 lane 的写入并发执行
-            // （join_all + 每批次 move 进独立 future）。串行 await 会让窗口满的
-            // lane 阻塞其他 lane（队头阻塞），多车道退化成单车道——这正是
-            // 分片要解决的问题。每 lane 内部帧顺序天然保持（批次内顺序 write_all）。
+            // 分发策略：**谁空闲谁接下一片**（work-stealing），而不是固定轮转。
             //
-            // 轮转游标 `lane_rr` 必须跨队列项持续，不能每项从 0 重来：上游泵
-            // 用 64KiB 缓冲读取，而 CHUNK 也是 64KiB，于是每个队列项通常只切出
-            // 一个 chunk。游标每项归零 ⇒ 恒取 lane 0 ⇒ 全部流量压在一条 lane 上，
-            // 多 lane / 多会话形同虚设（实测 64MB 下载里 68MB 走了第一条 TCP，
-            // 其余每条只有几百字节）。
-            let mut batches: Vec<Vec<u8>> = vec![Vec::new(); lanes.len()];
+            // 一条 lane 同一时刻最多一笔在途写入：它的写半被借进 `inflight`
+            // 里的 future，回来了才算空闲。于是快的 lane 先写完、先回来、分到
+            // 更多片；慢的 lane 只占着自己手里那一片，不挡别人。
+            //
+            // 这里换掉的是两个叠在一起的设计缺陷（2026-09-11 跨境实测，会话数
+            // 1→2→4 时小包多线程延迟 50.6→69.3→91.1ms，大包吞吐同向变差，
+            // 六轮含反序跑一致）：
+            //
+            //   ① 固定轮转不看 lane 快慢。每片按顺序发给下一条，于是 N 条
+            //      lane 各分到 1/N，总耗时 = max_i(S/N / r_i)，聚合吞吐是
+            //      **N × min(r_i)** 而不是 Σr_i。跨境链路上各连接速率相差
+            //      十倍是常态，4 次抽样取最小值远低于单次抽样的中位数，
+            //      N=4 补不回来。
+            //   ② 每个队列项都 `join_all` 等所有 lane 写完才取下一项。而上游
+            //      泵用 64KiB 缓冲、CHUNK 也是 64KiB，于是每项通常只有一片
+            //      ——实际行为退化成「写 lane 0、等；写 lane 1、等；…」，
+            //      **完全没有流水线**，只是把慢尾巴抽样得更频繁。这就是
+            //      「lane 越多越慢」的直接来源。
+            //
+            // 在途写入跨队列项保留（不再每项 drain），流水线才成立。缓冲有界：
+            // 每 lane 至多一笔 ≤CHUNK 的在途写入，叠加 conn 级的 MAX_PENDING。
             for chunk in bytes.chunks(CHUNK) {
-                let li = (lane_rr % lanes.len() as u64) as usize;
-                lane_rr = lane_rr.wrapping_add(1);
-                encode_frame(off, chunk, &mut batches[li]);
+                // 在**空闲** lane 之间轮转，全忙就等最先写完的那条回来。
+                //
+                // 是「轮转 + 跳过忙的」而不是「挑第一条空闲的」：后者在写入能
+                // 被本地缓冲瞬间吸收时会退化成贪心——lane 0 永远空闲、永远
+                // 被选中，8MB 上行有 6.5MB 压在第一条上（实测分布
+                // [6489275, 655496, 655496, 589948]），多 lane 白做。轮转保住
+                // 均摊，跳过忙的则让慢 lane 自动少分。
+                // 再叠一层健康度：**病态慢的 lane 直接跳过**（见
+                // `lane_is_usable`）。空闲轮转已经让分配与速率成正比，对吞吐
+                // 够用；但重组是连续推进的，发给慢 10 倍那条的一片会把它后面
+                // 所有数据一起堵住 10 倍时长——按比例少发解决不了，只能不发。
+                let li = loop {
+                    let n = lanes.len();
+                    let best = best_lane_bps(&lanes);
+                    let now = Instant::now();
+                    let pick = |usable_only: bool| {
+                        (0..n).find(|k| {
+                            let i = (lane_rr as usize).wrapping_add(*k) % n;
+                            let l = &lanes[i];
+                            l.w.is_some()
+                                && (!usable_only || lane_is_usable(&l.health, best, now))
+                        })
+                    };
+                    // 先在「健康且空闲」里挑；一条都没有时**退回只看空闲**——
+                    // 宁可发给一条慢 lane，也不能因为集体判慢而干脆不发
+                    // （那是把活着的链路判死，比慢严重得多）。
+                    if let Some(k) = pick(true).or_else(|| pick(false)) {
+                        let i = (lane_rr as usize).wrapping_add(k) % n;
+                        lane_rr = (i as u64).wrapping_add(1);
+                        break i;
+                    }
+                    // 全忙 = 真正的背压：此刻不该再往任何 lane 塞东西。
+                    //
+                    // **等待必须能被收尾请求打断。** 对端一旦停止读取，所有
+                    // lane 的写都永久 Pending，这个 `inflight.next()` 就成了
+                    // 终点：任务再也回不到循环顶部去看 `closing`，`mark_dead`
+                    // 永不调用，conn 的资源一件都不回收，而写端还在往无界队列
+                    // 里塞东西、每次都返回 `Ok`。
+                    //
+                    // 这是整条发送路径上**最深**的那个卡点：它在分发循环内层，
+                    // 比"停车前排空"和"收尾时排空"都更早触发（只要有一批数据
+                    // 正在分发就会走到）。三处形状相同，都需要出口。
+                    let interrupted = tokio::select! {
+                        r = inflight.next() => {
+                            match r {
+                                Some(done) => {
+                                    if !reclaim_write(&mut lanes, done) {
+                                        mark_dead(&inner);
+                                        return;
+                                    }
+                                    false
+                                }
+                                // inflight 空而又没有空闲 lane ⇒ 一条 lane 都没有了
+                                None => {
+                                    mark_dead(&inner);
+                                    return;
+                                }
+                            }
+                        }
+                        _ = wait_closing(&inner) => true,
+                    };
+                    if interrupted {
+                        break 'dispatch;
+                    }
+                };
+                let mut frame = Vec::new();
+                encode_frame(off, chunk, &mut frame);
                 off += chunk.len() as u64;
+                let n_bytes = frame.len();
+                lanes[li].health.last_sent = Instant::now();
+                let w = lanes[li].w.take().expect("刚判过 is_some");
+                inflight.push(Box::pin(async move {
+                    let mut w = w;
+                    let t0 = Instant::now();
+                    let ok = w.write_all(&frame).await.is_ok();
+                    (li, w, ok, n_bytes, t0.elapsed())
+                }));
             }
-            // 把每条 lane 的写半 move 到独立 future 再 join——所有权出借问题
-            // 用「写完放回」解决：lane 写半包成 Option，future 归还。
-            let mut lane_ws: Vec<Option<WriteHalf<MuxStream>>> =
-                lanes.iter_mut().map(|l| l.w.take()).collect();
-            let mut futs = Vec::new();
-            for (li, buf) in batches.into_iter().enumerate() {
-                if buf.is_empty() {
-                    continue;
+            // 让出一次执行器。
+            //
+            // 不是可有可无的礼貌：分发循环现在不再等写入完成，队列里有货时它
+            // 可以一路跑到底一次都不让出，把同进程的 lane 读任务、重组任务全
+            // 饿着——吞吐没涨，延迟先炸。旧代码靠每项 `join_all().await` 顺带
+            // 完成了这件事，改成流水线就得显式做。
+            tokio::task::yield_now().await;
+            // 顺手收掉已经完成的，让下一项能挑到更多空闲 lane。不阻塞：
+            // 这里要是 await，就又变回 join_all 那种「每项等齐」的老样子。
+            while let Some(Some(done)) = inflight.next().now_or_never() {
+                if !reclaim_write(&mut lanes, done) {
+                    mark_dead(&inner);
+                    return;
                 }
-                let Some(mut w) = lane_ws[li].take() else { continue };
-                futs.push(async move {
-                    let r = w.write_all(&buf).await.is_ok();
-                    (li, w, r)
-                });
-            }
-            let results = futures::future::join_all(futs).await;
-            let mut failed = false;
-            for (li, w, ok) in results {
-                if let Some(l) = lanes.get_mut(li) {
-                    l.w = Some(w);
-                    l.last_write = Instant::now();
-                }
-                if !ok {
-                    failed = true;
-                }
-            }
-            // 本轮没分到数据的 lane：写半还留在 lane_ws 里，必须放回。
-            // 否则它被 drop → 该 lane 的写侧关闭 → 对端 lane_reader 读到 EOF
-            // → live_lanes 归零后整条 conn 被判终结。轮转游标持续化之前，
-            // 每批总是从 lane 0 开始填，靠后的 lane 几乎必然分到空批次，
-            // 于是升级出来的 lane 刚建好就被这里关掉——多 lane 从未真正成立。
-            for (li, w) in lane_ws.into_iter().enumerate() {
-                if let (Some(w), Some(l)) = (w, lanes.get_mut(li)) {
-                    l.w = Some(w);
-                }
-            }
-            if failed {
-                mark_dead(&inner);
-                return;
             }
             up_off = off;
             sent += bytes.len() as u64;
@@ -782,7 +994,7 @@ async fn send_task(
             // 推迟到下一批到来，短流量下就等于永不升级。`maybe_upgrade` 幂等。
             maybe_upgrade(&mut lanes, &inner, send_dir, sent, start).await;
         }
-        // 2. 判断是否收尾
+        // 2. 判断是否收尾。在途写入不在这里排空，见第 3 步。
         let (closing, _reason) = {
             let out = inner.out.lock().unwrap();
             (out.closing, out.close_reason)
@@ -790,7 +1002,22 @@ async fn send_task(
         if closing {
             break;
         }
-        // 3. 等新工作：队列来数据 / 控制消息。
+        // 3. 等新工作：队列来数据 / 控制消息 / **在途写入完成**。
+        //
+        // `inflight` 里的写入**只有本任务会 poll**，所以停车时必须继续 poll
+        // 它们，否则那些写入永远不再推进 → mux 窗口不推进 → 对端收不到剩余
+        // 分片 → 整条流挂死（2026-09-11 真机：8MiB 下载 5 轮全部 30s 超时，
+        // 小包因为每轮都能排空队列所以完全正常，症状只打在大流上）。
+        //
+        // 早先的写法是在停车**之前**用 `while inflight.next().await` 排空。
+        // 那修掉了挂死，但换来一个更隐蔽的问题：那个 while 没有出口。一条
+        // 永久卡住的 lane（对端不读、或被 orphan 驱逐后没人消费）会把整个
+        // conn 冻在那一行上——健康的 lane 全都空闲，任务却再也不接新工作、
+        // 不发 CLOSE、不 `mark_dead`。而 `lane_is_usable` 的跳过逻辑对此无能
+        // 为力，它只管"下一项派给谁"。
+        //
+        // 放进 `select!` 两个问题一起解决：在途写照样被推进，而任何一个分支
+        // 就绪都能让任务继续往前走。
         // 注意：waker 注册与队列检查在同一锁临界区内完成（无丢失唤醒窗口）。
         let notified = std::future::poll_fn::<(), _>(|cx| {
             let mut out = inner.out.lock().unwrap();
@@ -804,9 +1031,18 @@ async fn send_task(
         });
         tokio::select! {
             _ = notified => {},
+            // 在途写完成：收回 WriteHalf 并记一笔健康样本，然后回到循环顶部。
+            // guard 是必需的——`FuturesUnordered::next` 在空集上立刻返回
+            // `Ready(None)`，没有它这个分支会抢占 `select!` 空转。
+            Some(done) = inflight.next(), if !inflight.is_empty() => {
+                if !reclaim_write(&mut lanes, done) {
+                    mark_dead(&inner);
+                    return;
+                }
+            }
             msg = ctl.recv() => match msg {
                 Some(CtlMsg::AddLane(w)) => {
-                    lanes.push(LaneW { w: Some(w), last_write: Instant::now() });
+                    lanes.push(LaneW { w: Some(w), last_write: Instant::now(), health: LaneHealth::new() });
                     inner.lane_count.store(lanes.len(), Ordering::Relaxed);
                 }
                 None => {
@@ -817,7 +1053,29 @@ async fn send_task(
         }
     }
 
-    // 4. 发 CLOSE 帧（最闲 lane）并关闭全部 lane
+    // 4. 排空在途写入，再发 CLOSE。
+    //
+    // 顺序不能反：CLOSE 带的是**最终偏移** `up_off`，对端收到它就知道「到这个
+    // 偏移为止是全部数据」。在途的那几片偏移都小于它，CLOSE 抢先到达的话，
+    // 对端会在数据还没收齐时判定流已结束——尾部静默丢几十 KiB，且不报错。
+    //
+    // 但排空必须**有出口**：对端不读时那些写入永远完不成，而这条收尾路径
+    // 上没有任何别的分支能救它——任务会永久停在这里，`mark_dead` 不被调用，
+    // 写端的 waker 不被唤醒，conn 的资源一件都不回收。宁可丢掉尾部（对端
+    // 反正已经不读了）也不能把任务钉死在这儿。
+    let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, async {
+        // 这里**有意不走 `reclaim_write`**：收尾时不该再判死（对端已经不读了，
+        // 那不是链路故障），也没人会再读健康度。只把写半还回去，好让下面发
+        // CLOSE 时还能挑到 lane。
+        while let Some((i, w, _ok, _n, _took)) = inflight.next().await {
+            if let Some(l) = lanes.get_mut(i) {
+                l.w = Some(w);
+                l.last_write = Instant::now();
+            }
+        }
+    })
+    .await;
+    // 发 CLOSE 帧（最闲 lane）并关闭全部 lane
     if !lanes.is_empty() {
         let mut best = 0usize;
         for (i, l) in lanes.iter().enumerate() {
@@ -837,13 +1095,39 @@ async fn send_task(
             let _ = w.write_all(&frame).await;
         }
     }
-    for l in &mut lanes {
-        if let Some(w) = l.w.as_mut() {
-            let _ = w.flush().await;
-            let _ = w.shutdown().await;
+    // flush/shutdown 同样要有出口：对端不读时它们也会永久 Pending，而
+    // `mark_dead` 在它们之后——少了这个超时，收尾会卡在倒数第二行。
+    let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, async {
+        for l in &mut lanes {
+            if let Some(w) = l.w.as_mut() {
+                let _ = w.flush().await;
+                let _ = w.shutdown().await;
+            }
         }
-    }
+    })
+    .await;
     mark_dead(&inner);
+}
+
+/// 等到收尾被请求。
+///
+/// 与第 3 步停车用的那个 `poll_fn` 同构（也复用同一个 waker 槽），只是这里
+/// 只关心 `closing`：调用点是"等一条 lane 空出来"，队列里有没有新数据无关。
+///
+/// 存在的理由：发送路径上有三处会 `await` 在途写入，对端一停止读取它们全都
+/// 永久 Pending。少了这个出口，任务就再也回不到能看见 `closing` 的地方。
+async fn wait_closing(inner: &Arc<ConnInner>) {
+    std::future::poll_fn::<(), _>(|cx| {
+        let mut out = inner.out.lock().unwrap();
+        if out.closing || out.dead {
+            return Poll::Ready(());
+        }
+        if out.send_task_waker.is_none() {
+            out.send_task_waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 fn mark_dead(inner: &Arc<ConnInner>) {
@@ -872,13 +1156,29 @@ async fn maybe_upgrade(
     if lanes.len() >= cfg.target_lanes || sent < cfg.upgrade_bytes {
         return;
     }
+    // 时间窗只用来给速率一个像样的分母，**不作为策略门**。
+    //
+    // 曾经是「elapsed < upgrade_window 就直接返回」，于是窗口没跨过之前一条
+    // lane 都不加：5 MiB/s 的链路上等满 1 秒，就是 5 MiB 白白挤在首 lane 上。
+    // 发送侧改成流水线之后更明显——8MB 上行里 6.7MB 在窗口跨过前就发完了
+    // （实测分布 [6751467, 589948, 524400, 524400]）。
+    //
+    // 分母不够长时，「已经攒够 `upgrade_bytes`」本身就足以判定这是个大流。
+    // 速率门留给**慢流**：花了超过一个窗口才攒够那些字节的，才真的不值得
+    // 加 lane。lane 是 mux 流不是 TCP 连接，多开几条代价很小，判早了远比
+    // 判晚了划算。
+    //
+    // 放开这道门的前提是接收侧**不再丢弃未知 conn 的 lane**（见
+    // `ConnRegistry::park_orphan`）：升级得早时，lane 1..N 的 OPEN 会赶在
+    // conn 登记之前到达，此前那条路径直接丢流，而发送侧照样往它们写分片，
+    // 重组端就此静默卡死（实测 `read timeout at 65536/...`，恰好停在首
+    // lane 之后）。两处改动是配套的，不能只做一半。
     let elapsed = start.elapsed();
-    if elapsed < cfg.upgrade_window {
-        return;
-    }
-    let rate = sent as f64 / elapsed.as_secs_f64();
-    if (rate as u64) < cfg.upgrade_rate_bps {
-        return;
+    if elapsed >= cfg.upgrade_window {
+        let rate = sent as f64 / elapsed.as_secs_f64();
+        if (rate as u64) < cfg.upgrade_rate_bps {
+            return;
+        }
     }
     let want = cfg.target_lanes - lanes.len();
     for _ in 0..want {
@@ -886,7 +1186,7 @@ async fn maybe_upgrade(
         let (r, w) = tokio::io::split(stream);
         // 自己开的 lane 上对端不会有数据，但读半须有人消费（EOF 检测）
         tokio::spawn(drain_read_half(r));
-        lanes.push(LaneW { w: Some(w), last_write: Instant::now() });
+        lanes.push(LaneW { w: Some(w), last_write: Instant::now(), health: LaneHealth::new() });
         inner.lane_count.store(lanes.len(), Ordering::Relaxed);
     }
 }
@@ -903,10 +1203,20 @@ async fn drain_read_half(mut r: ReadHalf<MuxStream>) {
 
 // ---------------- conn 表 ----------------
 
+/// 孤儿 lane 的暂存上限（条）与有效期。
+///
+/// 有界是硬要求：`conn_id` 来自对端，攒未知 conn 的流等于给对方一个用随机
+/// conn_id 灌内存的口子。超过上限就丢最旧的，超过有效期的同样丢——正常的
+/// 乱序只差一个 RTT 级别的量，秒级窗口绰绰有余。
+const ORPHAN_CAP: usize = 64;
+const ORPHAN_TTL: Duration = Duration::from_secs(5);
+
 /// conn_id → conn 表（双端共用；接受侧据此归并 lane）。
 #[derive(Default)]
 pub struct ConnRegistry {
     map: Mutex<std::collections::HashMap<u64, Arc<StripeConn>>>,
+    /// 先于自己的 conn 到达的 lane（见 [`ConnRegistry::park_orphan`]）。
+    orphans: Mutex<VecDeque<(Instant, u64, MuxStream)>>,
 }
 
 impl ConnRegistry {
@@ -914,7 +1224,100 @@ impl ConnRegistry {
         Self::default()
     }
     pub fn insert(&self, id: u64, conn: Arc<StripeConn>) {
-        self.map.lock().unwrap().insert(id, conn);
+        // **锁顺序固定为 orphans → map**，与 `park_orphan` 一致。
+        //
+        // 两者必须在同一个临界区里完成"看一眼对面、再动自己这边"，否则有个
+        // 会静默丢流的窗口：`park_orphan` 查 map 查不到 → 这里 insert 进 map
+        // 并 `take_orphans`（队列里还没有那条）→ `park_orphan` 才把它塞进队列。
+        // 那条 lane 就此烂在队列里直到被驱逐，而发送侧照样往它写分片，重组端
+        // 永远等不齐（实测症状 `read timeout at 65536/...`）。
+        //
+        // 顺序统一是为了避免 ABBA 死锁：两个函数都先 orphans 后 map。
+        let mut q = self.orphans.lock().unwrap();
+        self.map.lock().unwrap().insert(id, conn.clone());
+        let now = Instant::now();
+        q.retain(|(t, _, _)| now.duration_since(*t) < ORPHAN_TTL);
+        let mut pending = Vec::new();
+        let mut keep = VecDeque::with_capacity(q.len());
+        while let Some(item) = q.pop_front() {
+            if item.1 == id {
+                pending.push(item.2);
+            } else {
+                keep.push_back(item);
+            }
+        }
+        *q = keep;
+        drop(q);
+        // conn 刚登记，把此前先到的 lane 接回来。
+        for stream in pending {
+            conn.accept_lane(stream);
+        }
+    }
+
+    /// 暂存一条「conn 还不存在」的 lane。
+    ///
+    /// 这不是理论竞态：升级出来的 lane 1..N 与首 lane 之间**没有顺序保证**
+    /// ——多会话下它们走的是不同的 TCP，单会话下 conn 的登记也发生在被
+    /// spawn 的处理任务里。此前这些流一律直接丢弃，而发送侧并不知情，照样
+    /// 往它们写分片：那些分片成了重组端永远填不上的洞，整条流静默卡死
+    /// （实测症状是 `read timeout at 65536/...`，恰好停在首 lane 之后）。
+    ///
+    /// 暂存而非丢弃之后，晚到的 conn 登记会把它们接回去。
+    pub fn park_orphan(&self, id: u64, stream: MuxStream) {
+        // 锁顺序 orphans → map，与 `insert` 一致（避免 ABBA 死锁）。
+        let mut q = self.orphans.lock().unwrap();
+        // **在同一个临界区里再查一次 map**：调用方的 `get` 与这里之间存在
+        // 窗口，conn 可能刚刚被登记。查不到才 park，查到就直接交付——否则
+        // 这条 lane 会烂在队列里，而发送侧照样往它写（见 `insert` 的注释）。
+        if let Some(conn) = self.map.lock().unwrap().get(&id).cloned() {
+            drop(q);
+            conn.accept_lane(stream);
+            return;
+        }
+        let now = Instant::now();
+        let mut evicted: Vec<MuxStream> = Vec::new();
+        q.retain(|(t, _, _)| now.duration_since(*t) < ORPHAN_TTL);
+        while q.len() >= ORPHAN_CAP {
+            if let Some((_, _, s)) = q.pop_front() {
+                evicted.push(s);
+            }
+        }
+        q.push_back((now, id, stream));
+        drop(q);
+        // **被驱逐的流要显式关掉，不能只是 drop。**
+        //
+        // wsmux 的流是信用制的：单纯 drop 只摘掉本端的 sid，对端的 `write_all`
+        // 照样返回 `Ok`，而 dispatch 会把那些分片丢给一个不存在的 sid——重组端
+        // 出现一个永远填不上的洞，两侧都不报错。显式 shutdown 让对端拿到
+        // EOF，它的写入随之失败，上层才有机会重建。
+        for s in evicted {
+            tokio::spawn(async move {
+                let mut s = s;
+                let _ = s.shutdown().await;
+            });
+        }
+    }
+
+    /// 取走该 conn 的全部暂存 lane（顺带清掉过期项）。
+    ///
+    /// 仅留给外部调用方；`insert` 自己在锁内完成同样的事，因为它必须与
+    /// `park_orphan` 互斥（见 `insert` 的注释）。
+    #[allow(dead_code)]
+    fn take_orphans(&self, id: u64) -> Vec<MuxStream> {
+        let mut q = self.orphans.lock().unwrap();
+        let now = Instant::now();
+        q.retain(|(t, _, _)| now.duration_since(*t) < ORPHAN_TTL);
+        let mut out = Vec::new();
+        let mut keep = VecDeque::with_capacity(q.len());
+        while let Some(item) = q.pop_front() {
+            if item.1 == id {
+                out.push(item.2);
+            } else {
+                keep.push_back(item);
+            }
+        }
+        *q = keep;
+        out
     }
     pub fn remove(&self, id: u64) {
         self.map.lock().unwrap().remove(&id);
@@ -1450,8 +1853,13 @@ pub async fn join_inbound(
             conn.accept_lane(stream);
             return Ok(());
         }
+        // conn 还没登记：**暂存**而不是丢弃。升级出来的 lane 与首 lane 之间
+        // 没有顺序保证（多会话下走不同 TCP），丢掉它们会让发送侧继续往一条
+        // 不存在的 lane 写分片，重组端静默卡死。见 `park_orphan`。
+        registry.park_orphan(header.conn_id, stream);
+        return Ok(());
     }
-    // 未知 conn / 非 OPEN 首帧：丢流
+    // 非 OPEN 首帧：丢流
     let _ = stream.shutdown().await;
     Ok(())
 }
@@ -1549,6 +1957,23 @@ where
     if header.cmd != Cmd::Open {
         return Ok(InboundLane::Dropped);
     }
+    // 追加 lane 抢在它的 conn 登记之前到达：**暂存**，等 conn 建好再接回去。
+    //
+    // 不能接着往下走——下面那行 `read_open_addr` 假定 OPEN 后面跟着
+    // TargetAddr，而追加 lane 没有，会把分片数据当地址解析出来，凭空造一个
+    // 指向乱七八糟目标的 conn。这个竞态在多会话下尤其真实：追加 lane 走的是
+    // 另一条 TCP，与首 lane 之间毫无顺序保证；即便单会话，conn 的登记也发生
+    // 在被 spawn 的处理任务里，与 accept 顺序无关。
+    //
+    // 判据是 `!= 0` 而不是 `== LANE_ID_EXTRA`：`lane_id` 的**数值不参与路由**
+    // （见那个常量的注释），它只区分"首"与"追加"。按具体数值判会留一个错位
+    // 的隐患——任何填了别的非零值的追加 lane（换一个常量、对端版本不同、
+    // 或将来真的用 lane_id 编号）都会被当成首 lane 送去 `read_open_addr`，
+    // 把分片数据当 TargetAddr 解析，凭空造一个指向乱七八糟目标的 conn。
+    if header.lane_id != 0 {
+        registry.park_orphan(header.conn_id, stream);
+        return Ok(InboundLane::Dropped);
+    }
     let (addr, early_data) = read_open_addr(&mut stream).await?;
     // 关键：下行 lane 不再钉死在 conn 到达的那条会话上。钉死意味着下载
     // 全程只吃一个 TCP 拥塞窗口，上行条带、下行不条带——而基准测的是下载。
@@ -1563,4 +1988,109 @@ where
     spawn_registry_cleanup(registry.clone(), &conn);
     on_new(conn.clone(), addr.clone());
     Ok(InboundLane::New(conn, addr))
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    fn h(bps: Option<f64>, sent_ago: Duration) -> LaneHealth {
+        LaneHealth {
+            ewma_bps: bps,
+            last_sent: Instant::now() - sent_ago,
+        }
+    }
+
+    /// 没有样本的 lane 必须放行。
+    ///
+    /// 新加进来的 lane 一个样本都没有——一上来就判它慢，它就永远拿不到数据、
+    /// 永远产生不了样本，升级出来的 lane 全是摆设。
+    #[test]
+    fn a_lane_without_samples_is_always_usable() {
+        let now = Instant::now();
+        assert!(lane_is_usable(&h(None, Duration::ZERO), 10_000_000.0, now));
+    }
+
+    /// 判据是**相对**的：整条链路一起变慢时谁都不该被停发。
+    ///
+    /// 换成绝对阈值的话，链路整体劣化时全部 lane 会被同时判死，表现为
+    /// 「网络一慢就彻底不通」——比慢严重得多。
+    #[test]
+    fn a_uniformly_slow_link_keeps_every_lane() {
+        let now = Instant::now();
+        // 三条都只有 10 KB/s，但彼此相当 ⇒ 全部可用
+        for _ in 0..3 {
+            assert!(lane_is_usable(&h(Some(10_000.0), Duration::ZERO), 10_000.0, now));
+        }
+    }
+
+    /// 明显掉队的那条才停发。
+    #[test]
+    fn a_pathologically_slow_lane_is_skipped() {
+        let now = Instant::now();
+        // 比最快的慢 100 倍，且刚发过（不在再探窗口里）
+        assert!(!lane_is_usable(&h(Some(100_000.0), Duration::ZERO), 10_000_000.0, now));
+    }
+
+    /// 差距没到阈值的不停发——正常抖动停发只会白扔带宽。
+    #[test]
+    fn a_moderately_slower_lane_is_still_used() {
+        let now = Instant::now();
+        // 慢 4 倍 < LANE_SLOW_FACTOR(8) ⇒ 仍然用
+        assert!(lane_is_usable(&h(Some(2_500_000.0), Duration::ZERO), 10_000_000.0, now));
+    }
+
+    /// **被停发的 lane 必须能回来。**
+    ///
+    /// 停发之后它拿不到数据 ⇒ EWMA 永远停在那个旧值 ⇒ 永远出不来。链路恢复
+    /// 了也白搭，而跨境链路的抖动恰恰是分钟级的。所以要定期强制放行一片。
+    #[test]
+    fn a_skipped_lane_is_reprobed_so_it_can_recover() {
+        let now = Instant::now();
+        let stale = h(Some(100_000.0), LANE_REPROBE + Duration::from_millis(1));
+        assert!(
+            lane_is_usable(&stale, 10_000_000.0, now),
+            "过了再探间隔必须放行一片刷新估计，否则判慢即终身"
+        );
+    }
+
+    /// 谁都没样本时不得据此判死。
+    #[test]
+    fn no_samples_anywhere_means_everyone_is_usable() {
+        let now = Instant::now();
+        assert!(lane_is_usable(&h(Some(1.0), Duration::ZERO), 0.0, now));
+    }
+
+    /// 过短的样本不入账。
+    ///
+    /// 除以一个接近 0 的耗时会得到天文数字，一次就能把「最快」拉到没法企及，
+    /// 之后所有 lane 都显得慢 —— 全员停发。内存 duplex 上写入常是几微秒，
+    /// 这条不是理论担忧。
+    #[test]
+    fn an_absurdly_short_sample_is_ignored() {
+        let mut hh = LaneHealth::new();
+        hh.observe(65536, Duration::from_nanos(10));
+        assert!(hh.ewma_bps.is_none(), "过短的样本必须丢弃，否则会把基准拉到天上");
+        hh.observe(65536, Duration::from_millis(10));
+        assert!(hh.ewma_bps.is_some(), "正常样本要入账");
+    }
+
+    /// EWMA 要真的跟得上变化，又不被单次抖动带飞。
+    #[test]
+    fn the_ewma_tracks_change_without_overreacting() {
+        let mut hh = LaneHealth::new();
+        // 稳定在 ~6.5 MB/s
+        for _ in 0..5 {
+            hh.observe(65536, Duration::from_millis(10));
+        }
+        let steady = hh.ewma_bps.unwrap();
+        // 单次掉到 1/10
+        hh.observe(65536, Duration::from_millis(100));
+        let after = hh.ewma_bps.unwrap();
+        assert!(after < steady, "变慢要反映出来");
+        assert!(
+            after > steady * 0.5,
+            "单次抖动不该把估计砍掉一半以上（α=0.3）：steady={steady}, after={after}"
+        );
+    }
 }

@@ -1,8 +1,21 @@
-//! 本地条带的启动编排：清残留 → 解析 → 起转发器 → 写 hosts，以及失败时的降级。
+//! 本地条带的启动编排：清残留 → 解析 → 起转发器 → 让 WebView 找到转发器，
+//! 以及失败时的降级。
 //!
 //! 顺序是关键（见 `plan_many` 的注释）：**清残留在最前面且无条件执行**，
-//! 然后才解析、起转发器、最后写 hosts。任何一步失败都降级到单会话继续跑，
+//! 然后才解析、起转发器、最后把域名指过去。任何一步失败都降级到单会话继续跑，
 //! 而不是拒绝启动——与 mux 协商失败的处理一致（优先建立连接 + 警告日志）。
+//!
+//! # 两条「让 WebView 找到转发器」的路
+//!
+//! 转发器在 `127.0.0.1:base..base+N` 上监听，而 WebView 要连的是
+//! `https://域名:base+i/`。把前者接到后者有两种做法，差别**只在这一步**，
+//! 解析、起转发器、算 session_bases 全都一模一样：
+//!
+//! - [`Reach::Proxy`]（首选）：给 WebView 设一个本地 SOCKS5 代理，代理按
+//!   `(host, port)` 查表改写到 `127.0.0.1:port`。不要管理员权限、只作用于
+//!   我们自己的 WebView、**纯 IP 服务端也能用**。见 [`crate::webview_proxy`]。
+//! - [`Reach::Hosts`]（兜底）：把域名写进 `/etc/hosts` 指向 127.0.0.1。要
+//!   管理员权限、全系统生效、IP 服务端用不了（hosts 映射不了「IP→IP」）。
 //!
 //! hosts 条目的托管本身归 `crate::custody`（设计文档 §10），本模块只管编排。
 //!
@@ -41,6 +54,25 @@ use crate::shard::{self, Forwarder, ShardGuard};
 /// 入口用，与 TUN 无关，没道理因为 TUN 起不来就把这个出站整个关掉。错误被
 /// 记进 [`ShardPlanEntry::bypass_error`]，由调用方据此**拒绝拉起 TUN**。
 pub type UpstreamHook = Arc<dyn Fn(SocketAddr) -> anyhow::Result<()> + Send + Sync>;
+
+/// 让 WebView 找到本地转发器的方式。见模块文档「两条路」。
+pub enum Reach<'a> {
+    /// 经 WebView 自己的 SOCKS5 代理改写（免提权，首选）。
+    Proxy(&'a crate::webview_proxy::WebviewProxy),
+    /// 写 `/etc/hosts` 劫持域名（要管理员权限，代理不可用时的兜底）。
+    Hosts,
+}
+
+impl Reach<'_> {
+    /// 这条路要不要求「主机名可劫持」。
+    ///
+    /// 只有 hosts 路要求：它靠「域名→IP」的映射，对 IP 字面量无能为力
+    /// （映射不了「IP→IP」），对环回也没有跨网链路可并行。代理路不做名字
+    /// 解析，只按 (host, port) 查表，因此纯 IP 服务端一样拿得到多会话。
+    fn needs_hijackable_host(&self) -> bool {
+        matches!(self, Reach::Hosts)
+    }
+}
 
 /// 一个待编排的出站：它的服务端 URL、本地转发端口起点、额外会话数、
 /// 以及（若 TUN 开启）解析出真实 IP 后要调用的 bypass 钩子。
@@ -206,7 +238,16 @@ struct Prepared {
 ///
 /// 每个目标独立解析、独立起转发器——一个目标的失败只降级它自己，不影响其他
 /// 目标。但 hosts 的写入是**批量的、原子的一次**：见模块文档「为什么是一批」。
-pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardManyPlan {
+///
+/// `reach` 决定最后一步怎么把域名接到转发器上（见模块文档「两条路」）。
+/// 无论走哪条，**步骤 0 的 hosts 残留清理都照常执行**：上一次运行可能走的
+/// 是 hosts 路且被 SIGKILL，那行残留必须清掉，否则那个域名会一直指向一个
+/// 早已不在跑的转发器——而且是全系统生效。
+pub async fn plan_many(
+    targets: Vec<ShardTarget>,
+    hosts_path: PathBuf,
+    reach: Reach<'_>,
+) -> ShardManyPlan {
     let hosts = Arc::new(HostsFile::new(hosts_path));
 
     // 0) 无条件先清残留 —— 在任何目标的处理之前，覆盖整批。
@@ -243,12 +284,15 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
                 continue;
             }
         };
-        if !hijackable(&host) {
+        // 下面两道门只对 hosts 路成立。代理路不做名字解析、不写系统文件，
+        // 因此 IP 服务端与无管理员权限这两种情形在代理路下都不是阻碍——
+        // 这正是它存在的主要理由。
+        if reach.needs_hijackable_host() && !hijackable(&host) {
             tracing::warn!("条带禁用：主机 {host} 是 IP 或环回，不做 hosts 劫持——退回单会话");
             entries[idx] = Some(ShardPlanEntry::degraded(&t.server_url));
             continue;
         }
-        if !hosts.writable() {
+        if reach.needs_hijackable_host() && !hosts.writable() {
             tracing::warn!(
                 "条带禁用：{} 不可写——退回单会话。要启用多 TCP 条带，请以管理员身份运行，\
                  或手动加一行：127.0.0.1 {host} # wsieve-managed",
@@ -317,7 +361,22 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
         // 数据面的 origin。**与承载页的 scheme 无关**：承载页是本机的 http
         // 壳，而数据面必须留在 https 才有真实 TLS 指纹。两者共用一个闭包，
         // 下一次有人改承载页 scheme 就会把数据面一起带歪。
-        let data_origin = |p: u16| format!("{scheme}://{host}:{p}");
+        let data_origin = |p: u16| {
+            // IPv6 字面量在 URL 的 authority 里**必须加方括号**（RFC 3986
+            // §3.2.2），否则地址自带的冒号会被当成端口分隔符：
+            // `https://2001:db8::1:18443` 被解析成 host=2001。
+            //
+            // 后果是彻底的而非降级的：每条会话基址都成了连不上的 URL，而
+            // 改写表的 key 又永远匹配不上，出站完全不可用且不报错。
+            // `runtime_state::build_startup_plan` 校验的是 `config.proxies[].url`
+            // （经 `origin_of`，那里会正确加括号），**不校验这里派生出来的
+            // 基址**，所以这条路上没有任何别的关卡。
+            if host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("{scheme}://[{host}]:{p}")
+            } else {
+                format!("{scheme}://{host}:{p}")
+            }
+        };
         // 每条会话都用显式绝对 URL，**含会话 0**——见 degraded 上的注释。
         let session_bases: Vec<Option<String>> =
             ports.iter().map(|p| Some(data_origin(*p))).collect();
@@ -340,9 +399,51 @@ pub async fn plan_many(targets: Vec<ShardTarget>, hosts_path: PathBuf) -> ShardM
         };
     }
 
-    // 4) 批量写 hosts：一次 `CustodyGuard::acquire` 覆盖全部需要劫持的域名。
-    //    托管交给 CustodyGuard：持有即生效，drop 即摘除，崩溃残留由下次
-    //    启动的步骤 0 兜底（§10）。
+    // 4) 把域名接到转发器上。两条路见模块文档。
+    let proxy = match reach {
+        Reach::Proxy(p) => Some(p),
+        Reach::Hosts => None,
+    };
+    if let Some(proxy) = proxy {
+        // 代理路：把 `(域名, 转发端口) -> 127.0.0.1:转发端口` 灌进改写表。
+        //
+        // 一次性整体替换而非逐条追加——上一代的端口映射必须随这次换代一起
+        // 消失，否则会留下指向已 abort 转发器的死映射（见 `set_routes`）。
+        // 这与 hosts 路「一次原子写入覆盖全部域名」是同一个理由。
+        let mut routes = crate::webview_proxy::Routes::new();
+        for p in &prepared {
+            for port in p.forwarder.ports() {
+                routes.insert(
+                    (p.host.to_ascii_lowercase(), *port),
+                    SocketAddr::from(([127, 0, 0, 1], *port)),
+                );
+            }
+        }
+        let n = routes.len();
+        proxy.set_routes(routes);
+        let names: Vec<&str> = prepared.iter().map(|p| p.host.as_str()).collect();
+        tracing::info!(
+            "本地条带就绪（经 WebView 代理，无需管理员权限）：{} 个出站、{n} 条改写，域名 {names:?}",
+            prepared.len()
+        );
+        let mut forwarders = Vec::with_capacity(prepared.len());
+        for p in prepared {
+            entries[p.idx] = Some(ShardPlanEntry {
+                session_bases: p.session_bases,
+                upstream: Some(p.upstream),
+                bypass_error: p.bypass_error,
+            });
+            forwarders.push(p.forwarder);
+        }
+        return ShardManyPlan {
+            entries: entries.into_iter().map(|e| e.expect("每项都已填充")).collect(),
+            guard: Some(ShardGuard::without_hosts(forwarders)),
+        };
+    }
+
+    // hosts 路：一次 `CustodyGuard::acquire` 覆盖全部需要劫持的域名。
+    // 托管交给 CustodyGuard：持有即生效，drop 即摘除，崩溃残留由下次
+    // 启动的步骤 0 兜底（§10）。
     let all_hosts: Vec<String> = prepared.iter().map(|p| p.host.clone()).collect();
     match CustodyGuard::acquire(HostsCustody::new(
         hosts.clone(),
@@ -430,12 +531,148 @@ mod tests {
         let r = plan_many(
             vec![target("https://x.com/", 18443, 0)],
             "/nonexistent".into(),
+            Reach::Hosts,
         )
         .await;
         for (i, b) in r.entries[0].session_bases.iter().enumerate() {
             let b = b.as_ref().unwrap_or_else(|| panic!("会话 {i} 的基址是 None"));
             assert!(b.starts_with("https://"), "会话 {i} 的基址必须是 https：{b}");
         }
+    }
+
+    // ── 代理路与 hosts 路的分水岭 ──
+
+    /// **纯 IP 服务端在代理路下也能拿到多会话。**
+    ///
+    /// 这是代理路存在的主要理由，也是 hosts 路做不到的事：hosts 只能映射
+    /// 「域名→IP」，映射不了「IP→IP」，所以 `hijackable` 直接拒绝 IP 字面量。
+    /// 代理路不做名字解析，只按 (host, port) 查表改写，IP 一样成立。
+    ///
+    /// 与下面那条 hosts 路的对照测试成对存在——单看这一条无法分辨「代理路
+    /// 真的放行了」还是「这个 URL 本来就不会被拒」。
+    ///
+    /// 用 RFC 5737 的 TEST-NET-3（`203.0.113.x`）：保证不是环回（否则会被
+    /// `is_loopback` 拦下），也保证不会真连到谁身上。
+    #[tokio::test]
+    async fn an_ip_literal_server_still_gets_multiple_sessions_via_the_proxy() {
+        let proxy = crate::webview_proxy::WebviewProxy::spawn().await.unwrap();
+        let r = plan_many(
+            vec![target("https://203.0.113.7/", 18661, 3)],
+            "/nonexistent".into(),
+            Reach::Proxy(&proxy),
+        )
+        .await;
+        assert_eq!(
+            r.entries[0].session_count(),
+            4,
+            "IP 服务端在代理路下必须拿到 extra_sessions+1 条会话；\
+             退化成 1 说明 needs_hijackable_host 那道门把代理路也拦了"
+        );
+        // 每条会话一个不同端口 = 不同 origin，这才是多 TCP 的来源
+        let bases: Vec<&str> = r.entries[0]
+            .session_bases
+            .iter()
+            .map(|b| b.as_deref().expect("基址不得为 None"))
+            .collect();
+        for (i, b) in bases.iter().enumerate() {
+            assert_eq!(
+                *b,
+                format!("https://203.0.113.7:{}", 18661 + i),
+                "会话 {i} 的基址端口不对——端口相同就是同一个 origin，条带归零"
+            );
+        }
+        // 改写表要覆盖全部会话端口，否则 WebView 连过来查不到、直连一个
+        // 没人监听的假端口
+        assert_eq!(proxy.route_count(), 4, "改写表要覆盖每一条会话");
+    }
+
+    /// IPv6 字面量的每条会话基址都必须是**可解析的 URL**。
+    ///
+    /// 这条与上面那条 IPv4 的不是重复：IPv4 的 `1.2.3.4:443` 拼进 authority
+    /// 天然无歧义，IPv6 的 `2001:db8::1:443` 则会被浏览器按最后一个冒号切开、
+    /// 把 `2001` 当主机。少了方括号不是「基址不好看」，是**四条会话全部连不
+    /// 上且不报错**——改写表的 key 存的是裸地址，WebView 拿着 host=2001
+    /// 连过来永远查不到。
+    #[tokio::test]
+    async fn an_ipv6_literal_server_gets_bracketed_session_bases() {
+        let proxy = crate::webview_proxy::WebviewProxy::spawn().await.unwrap();
+        let r = plan_many(
+            vec![target("https://[2001:db8::1]/", 18681, 3)],
+            "/nonexistent".into(),
+            Reach::Proxy(&proxy),
+        )
+        .await;
+        assert_eq!(r.entries[0].session_count(), 4, "IPv6 服务端也该拿到多会话");
+        for (i, b) in r.entries[0].session_bases.iter().enumerate() {
+            let b = b.as_deref().expect("基址不得为 None");
+            assert_eq!(
+                b,
+                format!("https://[2001:db8::1]:{}", 18681 + i),
+                "会话 {i} 的 IPv6 基址缺方括号——浏览器会把 2001 当主机"
+            );
+            // 再把基址喂回 `split_url`（改写表的 key 就是从它来的）：解出来的
+            // 主机必须是**裸地址**、端口必须是这条会话的端口。这一步才是
+            // 「基址和改写表能不能对上」的判据——只比字符串的话，两边同时
+            // 少括号也照样通过。
+            let (_, h, p) = split_url(b).expect("基址必须能被自己的解析器解回");
+            assert_eq!(h, "2001:db8::1", "解回的主机必须是裸地址");
+            assert_eq!(p, 18681 + i as u16);
+        }
+        // 改写表的 key 是裸地址（SOCKS5 的 ATYP_IPV6 就是这么发的），
+        // 与上面带括号的 URL 形式必须能对上。
+        assert_eq!(proxy.route_count(), 4, "改写表要覆盖每一条 IPv6 会话");
+    }
+
+    /// 对照：同一个 IP 服务端走 hosts 路必然退回单会话。
+    ///
+    /// 这条不是重复——它保证上面那条测的是「代理路放行」而不是「这个 URL
+    /// 谁都不会拒」。两条一起才把分水岭钉死。
+    #[tokio::test]
+    async fn the_same_ip_literal_server_degrades_on_the_hosts_path() {
+        let r = plan_many(
+            vec![target("https://203.0.113.7/", 18671, 3)],
+            "/nonexistent".into(),
+            Reach::Hosts,
+        )
+        .await;
+        assert_eq!(
+            r.entries[0].session_count(),
+            1,
+            "hosts 路对 IP 字面量无能为力，必须退回单会话"
+        );
+    }
+
+    /// 代理路**一个字节都不写 hosts**。
+    ///
+    /// 写了的话免提权就是假的：没有管理员权限时那次写入会失败，整批目标
+    /// 按现有逻辑一起退回单会话——表现为「装了新版本还是要管理员权限」。
+    #[tokio::test]
+    async fn the_proxy_path_never_touches_the_hosts_file() {
+        // 与 custody::hosts 的测试同一套造法：临时目录 + 唯一名，不引新依赖。
+        let hosts = std::env::temp_dir().join(format!(
+            "wsieve-proxy-path-hosts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original = "127.0.0.1 localhost\n# 用户自己的行\n";
+        std::fs::write(&hosts, original).unwrap();
+
+        let proxy = crate::webview_proxy::WebviewProxy::spawn().await.unwrap();
+        let r = plan_many(
+            vec![target("https://proxy-path.example/", 18681, 2)],
+            hosts.clone(),
+            Reach::Proxy(&proxy),
+        )
+        .await;
+        // 这个域名解析不出来 ⇒ 走降级；解析得出来 ⇒ 走代理路。无论哪条，
+        // hosts 文件都不该被碰过一个字节。
+        let _ = r;
+        let after = std::fs::read_to_string(&hosts).unwrap();
+        let _ = std::fs::remove_file(&hosts);
+        assert_eq!(after, original, "代理路不得改动 hosts 文件");
     }
 
     #[test]
@@ -474,6 +711,7 @@ mod tests {
         let r = plan_many(
             vec![target("https://x.com/", 18443, 0)],
             "/nonexistent".into(),
+            Reach::Hosts,
         )
         .await;
         assert_eq!(
@@ -490,6 +728,7 @@ mod tests {
         let r = plan_many(
             vec![target("https://x.com/", 18443, 3)],
             "/proc/definitely-not-writable/hosts".into(),
+            Reach::Hosts,
         )
         .await;
         assert_eq!(
@@ -506,6 +745,7 @@ mod tests {
         let r = plan_many(
             vec![target("https://127.0.0.1:8443/", 18443, 3)],
             p.clone(),
+            Reach::Hosts,
         )
         .await;
         assert_eq!(r.entries[0].session_count(), 1);
@@ -534,7 +774,7 @@ mod tests {
             "degrade",
             "127.0.0.1 localhost\n127.0.0.1 old.com # wsieve-managed\n",
         );
-        let r = plan_many(vec![target("https://x.com/", 18443, 0)], p.clone()).await;
+        let r = plan_many(vec![target("https://x.com/", 18443, 0)], p.clone(), Reach::Hosts).await;
         assert!(r.guard.is_none(), "条带关掉时不该有 guard");
         let s = std::fs::read_to_string(&p).unwrap();
         assert!(!s.contains("old.com"), "降级路径也必须清掉上次的残留：{s}");
@@ -553,6 +793,7 @@ mod tests {
         let r = plan_many(
             vec![target("https://127.0.0.1:8443/", 18443, 3)],
             p.clone(),
+            Reach::Hosts,
         )
         .await;
         assert!(r.guard.is_none());
@@ -571,6 +812,7 @@ mod tests {
         let r = plan_many(
             vec![target("https://x.com/", 18443, 0)],
             "/nonexistent".into(),
+            Reach::Hosts,
         )
         .await;
         assert!(r.entries[0].upstream.is_none(), "降级路径压根没解析");
@@ -621,6 +863,7 @@ mod tests {
                 on_upstream: Some(hook),
             }],
             "/nonexistent".into(),
+            Reach::Hosts,
         )
         .await;
         assert!(
@@ -645,6 +888,7 @@ mod tests {
                 target("not-a-url", 18460, 3),           // 畸形 URL
             ],
             p.clone(),
+            Reach::Hosts,
         )
         .await;
         assert!(r.guard.is_none(), "没有任何目标真的需要劫持");

@@ -9,7 +9,7 @@
 //! 各自一侧——上行加密与下行解密共用这一份状态，由 Mutex 串行化。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -27,26 +27,57 @@ use wsieve_proto::hello::{decode_msg2, encode_msg1, IpStrategy, MuxId};
 use wsieve_proto::tu::{decode_frame, encode_frame, Frame, TuDecoder, MAX_PAYLOAD};
 use wsieve_transport::HttpTransport;
 
-/// 这三个是上行的**形状参数**，最优值随链路 RTT 变化一个数量级，
-/// 因此做成 env 可调：局域网 0.5ms 与跨洲 66ms 的最优点完全不同，
-/// 而每试一个值都重编 release 要三分多钟，扫不动。
-/// 不设环境变量时取原来的硬编码值，行为不变。
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+use crate::link_profile::{FlowKind, LinkProfile, Tier};
+
+/// 这三个是上行的**形状参数**，最优值随链路 RTT 变化一个数量级：局域网
+/// 0.5ms 与跨洲 66ms 的最优点完全不同。
+///
+/// 它们现在由 [`LinkProfile`] 按实测 BDP 自动定档（见 `link_profile.rs`），
+/// env 只作为**显式覆盖**保留——那是排障和扫参用的旋钮，不能被自适应吃掉。
+/// 优先级：env > 自适应 > 默认档（默认档逐字节等于改造前的硬编码值）。
+/// 覆盖值**只解析一次**，之后从 `OnceLock` 读。
+///
+/// 缓存不是过早优化：这三个函数跑在 2ms 的 tick、每次 flush、每个 POST 上，
+/// 而 `std::env::var` 每次都要遍历 environ 并分配一个 `String`。
+///
+/// 缓存也不损失语义——env 是启动时设好就不动的调试旋钮。真正需要随链路变的
+/// 是**档位**那一路（`t.inflight` 等），它不走这里。这一点曾经被搞混：
+/// `merge_window` 当初把整个函数（含档位取值）裹在 `OnceLock` 里，于是自适应
+/// 对它完全失效；正确的粒度是「只缓存 env 这一侧」。
+fn env_usize(cell: &'static OnceLock<Option<usize>>, key: &str) -> Option<usize> {
+    *cell.get_or_init(|| std::env::var(key).ok().and_then(|v| v.parse().ok()))
 }
 
 /// 在途 POST 上限（上行窗口深度）。
-fn max_inflight() -> usize {
-    env_usize("WSIEVE_XHTTP_INFLIGHT", 8)
+fn max_inflight(t: &Tier) -> usize {
+    static C: OnceLock<Option<usize>> = OnceLock::new();
+    env_usize(&C, "WSIEVE_XHTTP_INFLIGHT").unwrap_or(t.inflight)
 }
 /// 攒批阈值：攒够这么多字节就发，不等 tick。
-fn aggregate_bytes() -> usize {
-    env_usize("WSIEVE_XHTTP_AGG_BYTES", 64_000)
+fn aggregate_bytes(t: &Tier) -> usize {
+    static C: OnceLock<Option<usize>> = OnceLock::new();
+    env_usize(&C, "WSIEVE_XHTTP_AGG_BYTES").unwrap_or(t.agg_bytes)
 }
-const AGGREGATE_MS: u64 = 4;
+
+/// 聚合 tick 的**轮询**粒度。
+///
+/// 这不是聚合阈值本身——阈值是档位里的 `agg_wait`，判据在 tick 分支里用当前
+/// 档的 `agg_wait` 比较。拆成两件事的原因是 tokio 的 `Interval` 没有 period
+/// setter：阈值若和粒度共用一个常量，阈值一变就得重建 ticker。
+///
+/// 取 2ms 而非阈值本身的 4ms，只为把**检出延迟的最坏情况**折半：粒度等于阈值
+/// 时，一笔只差 0.1ms 就够 4ms 的缓冲要再等整整一个 tick（最坏 ~8ms）；
+/// 粒度取一半，最坏降到 ~6ms。
+///
+/// 不变量是「粒度 ≤ 任何档的 `agg_wait`」，由下面那条 `const _` 在编译期守住。
+/// 眼下全部
+/// 档位的 `agg_wait` 都是 4ms（它不随 BDP 变，见 `BASE_SHAPE`），所以这个
+/// 常量与「最小档」无关——那个说法曾经写在这里，是错的。
+const TICK_GRANULARITY_MS: u64 = 2;
+const _: () = assert!(
+    (TICK_GRANULARITY_MS as u128) * 1_000 <= crate::link_profile::MIN_AGG_WAIT.as_micros(),
+    "tick 粒度大于某个档的 agg_wait：那个档的攒批会永远晚一个 tick 才被检出"
+);
 /// 一次从命令通道最多取多少条写入合并。取到这个数就先发一批，避免
 /// 上行洪峰时 `agg_buffer` 无限涨大。
 const RECV_BATCH: usize = 64;
@@ -60,17 +91,24 @@ const RECV_BATCH: usize = 64;
 /// 跨进程 + HTTP 栈的固定开销。
 ///
 /// 只在**密集**时才等（见调用处的判据）：孤立的请求立刻发，延迟不受影响。
-fn merge_window() -> Duration {
-    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        Duration::from_micros(
-            std::env::var("WSIEVE_XHTTP_MERGE_US")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(400),
-        )
-    })
+///
+/// 这里曾经把**整个函数**裹进 `OnceLock`：读一次就连档位一起永久定死。自适应
+/// 要求它能随链路变，那样缓存等于自适应对这个参数完全失效——而它恰恰是三个
+/// 参数里对小包延迟影响最大的那个。现在只缓存 env 覆盖值那一侧。
+fn merge_window(t: &Tier) -> Duration {
+    static C: OnceLock<Option<usize>> = OnceLock::new();
+    match env_usize(&C, "WSIEVE_XHTTP_MERGE_US") {
+        Some(us) => Duration::from_micros(us as u64),
+        None => t.merge,
+    }
 }
+/// 下行吞吐的采样窗口。
+///
+/// 200ms 是个折中：短到能跟上链路变化（一次换档要连续 3 个样本，也就是
+/// 0.6 秒），长到足以盖过 chunk 到达的调度抖动（单个 chunk 间隔常在微秒级，
+/// 那个尺度上算出来的速率是噪声不是带宽）。
+const DOWNLINK_WINDOW: Duration = Duration::from_millis(200);
+
 const IDLE_HEARTBEAT_MS: u64 = 60_000;
 /// 单 POST body 上限 1 MB（spec §6.4）。单个 TU 密文 ≤ 65537 字节，
 /// 15 个 TU（≤ 983 055 B）必然落在 1 MB 内。
@@ -91,6 +129,10 @@ pub struct UpstreamCfg {
     /// 服务端解析域名目标时用哪个地址族。双栈服务器按 RFC 6724 通常优先
     /// IPv6，配 `V4Only`/`PreferV4` 可以把出口拉回 IPv4。
     pub ip_strategy: IpStrategy,
+    /// 这条链路的实测画像。**与同一条链路上的 mux 会话共用同一个 `Arc`**：
+    /// 画像在这里测（上行 POST 的往返），在 mux 那边用（接收窗口），
+    /// 分成两份就等于两边各学各的，谁也拿不到完整信息。
+    pub profile: Arc<LinkProfile>,
 }
 
 /// 生成一个会话组 id。客户端在启动时调用一次，之后所有会话复用。
@@ -159,6 +201,41 @@ struct SharedState {
     last_flush: Instant,
     /// 握手后的 Noise 状态：write_message = 上行加密，read_message = 下行解密
     noise: TransportState,
+    /// 这条链路的实测画像，决定当前该用哪一档形状参数。
+    profile: Arc<LinkProfile>,
+    /// 最近一次观察到**真并发**的时刻（聚合循环里 `extra >= 2` 的判据）。
+    ///
+    /// 流型不能每轮翻转：一次孤立请求就把批量流打回交互档，会让大文件传输
+    /// 的参数在两档之间反复横跳。给它一个粘性窗口，见 `flow_kind`。
+    last_concurrent: Option<Instant>,
+}
+
+/// 流型的粘性窗口：最后一次观察到并发之后，这么久内仍算批量流。
+///
+/// 取 1 秒是因为批量传输的间隙（一次 GC、一次磁盘写、对端的一次慢响应）
+/// 通常在百毫秒量级，比这短得多；而真正的交互式请求之间的间隔远长于此。
+const FLOW_STICKY: Duration = Duration::from_secs(1);
+
+impl SharedState {
+    /// 当前流型。见 `last_concurrent` 的注释。
+    fn flow_kind(&self) -> FlowKind {
+        match self.last_concurrent {
+            // **从未观察到并发 → 用默认档，不是交互式。**
+            //
+            // "还没看到并发"和"这是交互式流量"是两件事。原先这里落到
+            // `Interactive`，于是每条会话从建立那一刻起就吃减半后的参数——
+            // 而"默认行为与改造前逐字节相同"这条保底原则正是被它破掉的，
+            // 且完全无声（`window_capped_at_8` 断言的是 `<= 8`，4 也满足）。
+            None => FlowKind::Bulk,
+            Some(t) if t.elapsed() < FLOW_STICKY => FlowKind::Bulk,
+            Some(_) => FlowKind::Interactive,
+        }
+    }
+
+    /// 当前该用的一组形状参数。
+    fn tier(&self) -> Tier {
+        self.profile.tier(self.flow_kind())
+    }
 }
 
 impl XhttpConn {
@@ -215,6 +292,8 @@ impl XhttpConn {
             last_write: Instant::now(),
             last_flush: Instant::now(),
             noise: client.into_transport_mode()?,
+            profile: cfg.profile.clone(),
+            last_concurrent: None,
         }));
 
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
@@ -257,7 +336,7 @@ impl XhttpConn {
         // 合并窗口的到期时刻；None = 当前没有待合并的批次。
         // `recv_many` 的收件篮，循环里复用，不每轮重新分配。
         let mut cmd_batch: Vec<Command> = Vec::with_capacity(RECV_BATCH);
-        let mut ticker = interval(Duration::from_millis(AGGREGATE_MS));
+        let mut ticker = interval(Duration::from_millis(TICK_GRANULARITY_MS));
         let mut heartbeat_interval = interval(Duration::from_millis(IDLE_HEARTBEAT_MS));
 
         // 启动下行任务
@@ -318,9 +397,10 @@ impl XhttpConn {
 
                 _ = ticker.tick() => {
                     let mut st = shared.lock().await;
+                    let tier = st.tier();
                     let elapsed = st.last_write.elapsed();
                     let should_send =
-                        agg_buffer.len() >= aggregate_bytes() || elapsed >= Duration::from_millis(AGGREGATE_MS);
+                        agg_buffer.len() >= aggregate_bytes(&tier) || elapsed >= tier.agg_wait;
                     if should_send {
                         Self::flush(&shared, &mut st, &mut agg_buffer, &transport, &event_tx);
                     }
@@ -353,13 +433,14 @@ impl XhttpConn {
             // 却正好给了对端任务把第二次写入排进队列的机会。
             if collected {
                 tokio::task::yield_now().await;
+                let tier = shared.lock().await.tier();
                 let mut extra = 0usize;
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         Command::WriteData(data) => agg_buffer.extend_from_slice(&data),
                     }
                     extra += 1;
-                    if agg_buffer.len() >= aggregate_bytes() {
+                    if agg_buffer.len() >= aggregate_bytes(&tier) {
                         break;
                     }
                 }
@@ -372,13 +453,33 @@ impl XhttpConn {
                 // 判据卡在 `>= 2` 上，正是为了不误伤串行：串行场景 `extra` 恒为 1，
                 // 一秒都不会多等（早先按"最近是否发过"判，串行 P50 从 1.8ms 掉到
                 // 3.0ms，就是被这个误伤的）。
-                if extra >= 2 && agg_buffer.len() < aggregate_bytes() {
-                    tokio::time::sleep(merge_window()).await;
+                //
+                // 这个判据同时是**流型的来源**：捞到两笔以上就是真并发，也就是
+                // 批量流。流型定了用哪一套档位参数（交互式把合并窗口归零），
+                // 所以这里记一笔时刻，由 `SharedState::flow_kind` 加粘性窗口读取。
+                // 不另造一套流型识别——这个判据是实测扫出来的，换一个等于把
+                // 「串行不误伤」那条结论重新赌一遍。
+                if extra >= 2 {
+                    shared.lock().await.last_concurrent = Some(Instant::now());
+                }
+                if extra >= 2 && agg_buffer.len() < aggregate_bytes(&tier) {
+                    // 用上面那份 `tier`，不重新取。
+                    //
+                    // 这里曾经再锁一次，理由写的是「上面刚把流型置成批量，合并
+                    // 窗口的取值跟着变」。那个理由今天不成立：`to_interactive`
+                    // 是恒等的，流型不改变任何字段（见它的注释——两处差异都被
+                    // 实测拿掉了）。于是那次加锁是一个可证明的空操作，还在
+                    // 每一批并发写入上多抢一次共享锁。
+                    //
+                    // 上面的 `last_concurrent` 记账要留着：它是流型判据的输入，
+                    // 等哪天真有了单变量证据、差异化加回 `to_interactive` 时，
+                    // 要变的是那一个函数，而不是重新在这里散一次取档。
+                    tokio::time::sleep(merge_window(&tier)).await;
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             Command::WriteData(data) => agg_buffer.extend_from_slice(&data),
                         }
-                        if agg_buffer.len() >= aggregate_bytes() {
+                        if agg_buffer.len() >= aggregate_bytes(&tier) {
                             break;
                         }
                     }
@@ -405,7 +506,7 @@ impl XhttpConn {
         // 窗口占满时数据留在**无界**的 agg_buffer 里等下一次 tick。缓冲堆多少、
         // 堵了多久，此前完全不可见——而它正是「请求莫名卡 10 秒」这类现象的
         // 首要嫌疑。
-        if st.in_flight.len() >= max_inflight() {
+        if st.in_flight.len() >= max_inflight(&st.tier()) {
             tracing::debug!(
                 pending_bytes = agg_buffer.len(),
                 in_flight = st.in_flight.len(),
@@ -477,6 +578,13 @@ impl XhttpConn {
         // 下行的**静默间隔**是最关键的一个数：请求卡住时，到底是我们没发出去，
         // 还是发出去了但对端半天不回，只有这个数分得开。
         let mut last_chunk = Instant::now();
+        // 下行吞吐的累计器：**按时间窗口报，不按 chunk 报**。
+        //
+        // 单个 chunk 的到达间隔常在微秒级，那个尺度上 `bytes/gap` 量的是
+        // 调度抖动而不是链路速率——一次内存拷贝也能"跑出" GB/s。攒够一个
+        // 窗口再除，才是这段时间里真实的交付速率。
+        let mut win_bytes = 0u64;
+        let mut win_start = Instant::now();
 
         while let Some(chunk) = stream.next().await {
             let gap = last_chunk.elapsed();
@@ -498,6 +606,26 @@ impl XhttpConn {
                 // 它，剩下的才是本机协议栈（SOCKS/stripe/mux）自己花掉的。
                 let since_up = shared.lock().await.last_flush.elapsed();
                 tracing::debug!(?gap, ?since_up, bytes = chunk.len(), "下行分片");
+            }
+
+            // 累计这一窗的下行字节，够一窗就报给链路画像。
+            //
+            // 静默超过一窗时直接重开：那段空闲不是"传得慢"，把它算进分母会
+            // 让一条空闲链路看起来带宽极低，进而被降档——恰恰在它随时可能
+            // 要提速的时候。
+            win_bytes += chunk.len() as u64;
+            let win = win_start.elapsed();
+            if gap >= DOWNLINK_WINDOW {
+                win_bytes = chunk.len() as u64;
+                win_start = Instant::now();
+            } else if win >= DOWNLINK_WINDOW {
+                shared
+                    .lock()
+                    .await
+                    .profile
+                    .observe_downlink(win_bytes, win);
+                win_bytes = 0;
+                win_start = Instant::now();
             }
 
             // TuDecoder 返回的每个元素是完整 TU（含 2 字节长度前缀）：
@@ -633,6 +761,24 @@ async fn send_post<T: HttpTransport + 'static>(
         let t0 = Instant::now();
         let outcome = transport.post(&path, body.clone()).await;
         let rtt = t0.elapsed();
+        // 喂给链路画像。这个测量点本来就在（为了那条"上行 POST 异常慢"的
+        // 日志），此前只进 tracing——自适应需要的信号一直都有人采，只是没人用。
+        //
+        // `attempt > 0` 要告诉画像：重试过的样本里含了退避时间，拿它算带宽
+        // 会把链路严重低估。
+        {
+            let st = shared.lock().await;
+            st.profile
+                .observe_post(rtt, body.len(), attempt > 0);
+            // 服务端自报的处理耗时要从这次往返里扣掉，剩下的才是纯网络 RTT。
+            // 顺序不能反：`observe_peer` 修的是**刚刚**那条 RTT 样本。
+            if let Ok(ref reply) = outcome {
+                if let Some(p) = reply.peer {
+                    st.profile
+                        .observe_peer(Duration::from_micros(p.server_us as u64), p.gaps as u32);
+                }
+            }
+        }
         if rtt > Duration::from_secs(1) {
             tracing::warn!(seq, ?rtt, bytes = body.len(), attempt, "上行 POST 异常慢");
         } else {

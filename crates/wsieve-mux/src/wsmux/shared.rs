@@ -246,7 +246,19 @@ pub(crate) struct StreamState {
     /// 它防的是一个坏掉或恶意的对端把我们的内存吃穿——`VecDeque` 本身无界，
     /// 少了这道闸就是一个远端可触发的 OOM。
     queued_in: AtomicUsize,
-    in_limit: usize,
+    /// 原子的，因为接收窗口会随链路画像在运行期变大（见 `Session::grow_window`）。
+    /// 窗口涨了而这条线不涨，对端按新窗口发就会撞上越窗判定——一条守规矩的流
+    /// 被自己人掐断，正是 `new` 的注释里警告的那种故障。
+    in_limit: AtomicUsize,
+}
+
+/// 入站积压上限：给接收窗口留一倍余量。
+///
+/// 留余量是因为窗口的归还（`Cmd::Wnd`）本身要走一个 RTT：对端在我们的 WND
+/// 送达之前仍可能按旧信用继续发，队列会短暂超过窗口本身。下限 64 KiB 对应
+/// 一个满帧放得下的最小窗口。
+fn in_limit_for(local_window: u32) -> usize {
+    local_window.max(64 * 1024) as usize * 2
 }
 
 impl StreamState {
@@ -268,12 +280,22 @@ impl StreamState {
             reader: AtomicWaker::new(),
             credit: AtomicI64::new(peer_window as i64),
             queued_in: AtomicUsize::new(0),
-            in_limit: local_window.max(64 * 1024) as usize * 2,
+            in_limit: AtomicUsize::new(in_limit_for(local_window)),
             credit_waker: AtomicWaker::new(),
             unacked: AtomicU32::new(0),
             fin_sent: AtomicBool::new(false),
             dead: AtomicBool::new(false),
         }
+    }
+
+    /// 提高本端接收窗口对应的入站积压上限。
+    ///
+    /// **必须先于**把新窗口通告给对端（`Cmd::Wnd`）：反过来的话，对端收到
+    /// 更大的窗口会立刻多发，而本端的闸还卡在旧值上，于是它一边守规矩一边
+    /// 被判越窗。顺序错了不会报错，只表现为"窗口一调大链路就断"。
+    pub(crate) fn grow_in_limit(&self, local_window: u32) {
+        self.in_limit
+            .fetch_max(in_limit_for(local_window), Ordering::AcqRel);
     }
 
     pub(crate) fn is_dead(&self) -> bool {
@@ -296,7 +318,7 @@ impl StreamState {
                 return true; // 流已关，丢弃即可——对端迟早会看到我们的 FIN。
             }
             let now = self.queued_in.fetch_add(data.len(), Ordering::AcqRel) + data.len();
-            if now > self.in_limit {
+            if now > self.in_limit.load(Ordering::Acquire) {
                 return false;
             }
             ib.q.push_back(data);

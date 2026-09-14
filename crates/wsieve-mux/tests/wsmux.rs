@@ -174,3 +174,100 @@ async fn two_ends_configured_with_different_windows_still_transfer() {
         .unwrap();
     assert_eq!(got, expect_len);
 }
+
+/// 接收窗口在运行期扩大后，对端必须真的能多发——两件事都要做对才算通过。
+///
+/// 这条同时抓两种失败，而它们的现场长得完全不一样：
+///   1. `Cmd::Wnd` 没通告出去 → 对端信用还停在旧窗口 → 写到旧窗口大小就卡死
+///      （表现为超时，不报错）
+///   2. `grow_in_limit` 没调用（或调用晚于通告）→ 对端按新窗口发，本端的入站
+///      闸还在旧值 → `deliver` 返回 false → 会话被自己人终止（表现为读出错）
+///
+/// 用一个远小于负载的初始窗口（64 KiB vs 1 MiB），保证不扩窗就一定过不去。
+#[tokio::test]
+async fn a_grown_window_really_lets_the_peer_send_more() {
+    use wsieve_mux::wsmux::{Config, Session};
+    let small = || Config {
+        window: 64 * 1024,
+        keepalive: std::time::Duration::from_secs(15),
+    };
+    let (c_io, s_io) = tokio::io::duplex(8 * 1024 * 1024);
+    let client: Arc<Session> = Arc::new(Session::with_config(Box::new(c_io), false, small()));
+    let server: Arc<Session> = Arc::new(Session::with_config(Box::new(s_io), true, small()));
+
+    let payload = pattern(1024 * 1024, 9);
+    let expect = payload.clone();
+
+    let sv = server.clone();
+    let reader = tokio::spawn(async move {
+        let mut s = sv.accept().await.unwrap();
+        // 流建好之后再扩窗：这正是自适应的时序——画像要先收到样本才知道
+        // 该开多大，那时流早就在跑了。只对新流生效的实现过不了这一关。
+        sv.grow_window(4 * 1024 * 1024);
+        let mut got = vec![0u8; expect.len()];
+        s.read_exact(&mut got).await.unwrap();
+        got
+    });
+
+    let mut cs = client.open().await.unwrap();
+    // 给 accept + grow_window 一点时间，让扩窗发生在写入之前。
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cs.write_all(&payload).await.unwrap();
+    cs.flush().await.unwrap();
+
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+        .await
+        .expect("扩窗没生效：对端信用停在旧窗口上，写到 64 KiB 就卡死了")
+        .unwrap();
+    assert_eq!(got, payload, "内容对不上——扩窗路径上丢了数据");
+    assert_eq!(server.window(), 4 * 1024 * 1024);
+}
+
+/// 只增不减：更小的目标值不得让窗口缩水。
+///
+/// 协议里没有负的 WND，缩小窗口要靠停发 delta 让它自然耗尽。若 `grow_window`
+/// 真按小值改了本端记账，通告出去的 delta 就会与实际信用对不上。
+#[tokio::test]
+async fn growing_the_window_downward_is_a_no_op() {
+    use wsieve_mux::wsmux::{Config, Session};
+    let (c_io, _s_io) = tokio::io::duplex(64 * 1024);
+    let c = Session::with_config(
+        Box::new(c_io),
+        false,
+        Config {
+            window: 4 * 1024 * 1024,
+            keepalive: std::time::Duration::from_secs(15),
+        },
+    );
+    c.grow_window(1024);
+    assert_eq!(c.window(), 4 * 1024 * 1024, "窗口只增不减");
+}
+
+/// 窗口有硬上限，`grow_window` 与 env 覆盖都越不过去。
+///
+/// 窗口是给对端的授信，而本实现不限并发流数——总量 = 流数 × 窗口，乘数由
+/// 对端决定。`Cmd::Wnd` 只有正增量，通告出去就收不回，所以闸只能立在通告
+/// 之前。没有它，一条高 BDP 链路上应用侧读取一停，这份额度就全部变成常驻
+/// 内存，而且是远端可触发的。
+#[tokio::test]
+async fn the_receive_window_has_a_hard_ceiling() {
+    use wsieve_mux::wsmux::{Config, Session};
+    let (c_io, _s_io) = tokio::io::duplex(64 * 1024);
+    let c = Session::with_config(
+        Box::new(c_io),
+        false,
+        Config {
+            window: 4 * 1024 * 1024,
+            keepalive: std::time::Duration::from_secs(15),
+        },
+    );
+    // 自适应顶档按 BDP 公式可以要到远超上限的值。
+    c.grow_window(1024 * 1024 * 1024);
+    let w = c.window();
+    assert!(
+        w <= 16 * 1024 * 1024,
+        "窗口涨到 {w} 字节，越过了 16 MiB 硬上限"
+    );
+    // 上限本身也得是"真的放大过"，不然这条测试用一个永不扩窗的实现也能过。
+    assert!(w > 4 * 1024 * 1024, "根本没扩窗，这条测试就测不到上限");
+}

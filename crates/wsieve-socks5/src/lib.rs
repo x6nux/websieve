@@ -48,36 +48,56 @@ pub async fn serve_conn(
     handle_conn(tcp, handler).await
 }
 
-async fn handle_conn(
-    mut tcp: TcpStream,
-    handler: impl Fn(AddrPort) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>>,
-) -> anyhow::Result<()> {
+/// 把一条已建立的连接上的 SOCKS5 协商跑完，返回 CONNECT 的目标。
+///
+/// `Ok(None)` = **这条连接不用再管了**：对端在协商中途断开、首字节不是 0x05、
+/// 或者请求用了我们不支持的命令/地址类型（后两种已按 RFC 回过对应的错误码）。
+/// 调用方直接丢掉连接即可，不必也不该再回什么。
+///
+/// `Ok(Some(target))` = 协商成功，**成功应答还没发**——发不发、发之前还要不要
+/// 做别的检查（比如目标是否在白名单里），是调用方的策略。
+///
+/// 拆出这个函数是为了让第二个 SOCKS5 服务端能共用同一份解析：
+/// `src-tauri` 的 `webview_proxy` 也终止 SOCKS5（给 WebView 改写目标端口），
+/// 它曾经自己写了一遍 greeting + CONNECT 的解析。同一个 RFC 子集解两遍，
+/// 修一边的 bug 到不了另一边。它需要的只是「别替我决定怎么回复」，所以这里
+/// 只做解析，策略留给调用方。
+pub async fn negotiate(tcp: &mut TcpStream) -> anyhow::Result<Option<AddrPort>> {
     // 1. greeting: VER NMETHODS METHODS...
     let mut hdr = [0u8; 2];
-    if !read_exact_opt(&mut tcp, &mut hdr).await? {
-        return Ok(()); // 对端在问候前断开
+    if !read_exact_opt(tcp, &mut hdr).await? {
+        return Ok(None); // 对端在问候前断开
     }
     // 即使 VER 不对也先把 METHODS 读干净，避免残留数据导致 RST
     let mut methods = vec![0u8; hdr[1] as usize];
-    if !read_exact_opt(&mut tcp, &mut methods).await? {
-        return Ok(());
+    if !read_exact_opt(tcp, &mut methods).await? {
+        return Ok(None);
     }
     if hdr[0] != 0x05 || hdr[1] == 0 {
-        return Ok(()); // 非 SOCKS5 / 无方法：直接关闭
+        return Ok(None); // 非 SOCKS5 / 无方法：直接关闭
+    }
+    if !methods.contains(&0x00) {
+        // 明确回绝（0xFF = 无可接受方法）而不是默默按无认证往下走。
+        //
+        // 早先这里不看 METHODS，直接回 `[05 00]` 宣布选中无认证——对一个只
+        // 支持用户名口令的客户端，那是在回一个它没提供的方式，接下来双方对
+        // 帧的理解就错位了，表现为连接莫名卡住。0xFF 让它立刻报错。
+        tcp.write_all(&[0x05, 0xFF]).await?;
+        return Ok(None);
     }
     tcp.write_all(&[0x05, 0x00]).await?; // 选中 NO AUTHENTICATION
 
     // 2. request: VER CMD RSV ATYP addr port
     let mut req = [0u8; 4];
-    if !read_exact_opt(&mut tcp, &mut req).await? {
-        return Ok(());
+    if !read_exact_opt(tcp, &mut req).await? {
+        return Ok(None);
     }
     if req[0] != 0x05 {
-        return Ok(());
+        return Ok(None);
     }
     if req[1] != 0x01 {
         tcp.write_all(&reply_err(0x07)).await?; // command not supported
-        return Ok(());
+        return Ok(None);
     }
     // 地址部分与 mux 首帧的 TargetAddr 编码一致（atyp + addr + be port）
     let mut tail = Vec::new();
@@ -86,8 +106,8 @@ async fn handle_conn(
         0x01 => 4 + 2,
         0x03 => {
             let mut l = [0u8; 1];
-            if !read_exact_opt(&mut tcp, &mut l).await? {
-                return Ok(());
+            if !read_exact_opt(tcp, &mut l).await? {
+                return Ok(None);
             }
             tail.push(l[0]);
             l[0] as usize + 2
@@ -96,15 +116,25 @@ async fn handle_conn(
         other => {
             let _ = other;
             tcp.write_all(&reply_err(0x08)).await?; // address type not supported
-            return Ok(());
+            return Ok(None);
         }
     };
     let mut rest = vec![0u8; addr_len];
-    if !read_exact_opt(&mut tcp, &mut rest).await? {
-        return Ok(());
+    if !read_exact_opt(tcp, &mut rest).await? {
+        return Ok(None);
     }
     tail.extend_from_slice(&rest);
     let (target, _) = decode_addr(&tail).map_err(|e| anyhow::anyhow!("bad request addr: {e}"))?;
+    Ok(Some(target))
+}
+
+async fn handle_conn(
+    mut tcp: TcpStream,
+    handler: impl Fn(AddrPort) -> BoxFuture<'static, std::io::Result<tokio::io::DuplexStream>>,
+) -> anyhow::Result<()> {
+    let Some(target) = negotiate(&mut tcp).await? else {
+        return Ok(());
+    };
 
     // 3. 出口接线
     match handler(target).await {

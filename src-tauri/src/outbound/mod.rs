@@ -257,6 +257,7 @@ mod tests {
             client_priv: [2u8; 32],
             mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None; sessions],
+            server_origin: format!("https://{name}.example"),
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         }
     }

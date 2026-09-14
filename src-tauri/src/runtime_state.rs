@@ -505,6 +505,8 @@ pub fn build_startup_plan(
             client_priv,
             mux_prefs,
             session_bases,
+            // 上面那个 for 循环已经保证它能解析（非法 URL 在那里就报错了）。
+            server_origin: crate::shard_setup::origin_of(&p.url)?,
             ip_strategy,
         });
     }
@@ -776,6 +778,48 @@ mod startup_plan_tests {
     /// 它被原样传给 `CarrierPlan::build`。
     fn plan_of(cfg: &wsieve_config::Config) -> anyhow::Result<StartupPlan> {
         build_startup_plan(cfg, &shard_for(cfg), "http://127.0.0.1:53119/")
+    }
+
+    /// 链路画像的主键必须来自**服务端 URL**，而不是会话基址。
+    ///
+    /// 会话基址里的端口是本地转发器端口，启动时按 `config.proxies` 的顺序
+    /// 分配。拿它当主键的话，用户把配置里两条出站上下换个位置，端口就对调，
+    /// 两套历史画像跟着互相认错链路：一条慢链路会继承快链路的基线，一上来
+    /// 就跳到过高的档——而两端日志全是正常的。
+    #[test]
+    fn the_profile_key_survives_reordering_the_proxy_list() {
+        // 这个 `proxy` 助手按名字派生 url（`https://{name}.example/`）。
+        let (a, b) = (proxy("aa", "11".repeat(32).as_str(), &"22".repeat(32)),
+                      proxy("bb", "33".repeat(32).as_str(), &"44".repeat(32)));
+        let keys = |cfg: &wsieve_config::Config| -> Vec<(String, String)> {
+            plan_of(cfg)
+                .unwrap()
+                .outbound_cfgs
+                .into_iter()
+                .map(|o| (o.name.clone(), o.server_origin.clone()))
+                .collect()
+        };
+        let mut forward = keys(&config_with(vec![a.clone(), b.clone()]));
+        let mut reversed = keys(&config_with(vec![b, a]));
+        forward.sort();
+        reversed.sort();
+        assert_eq!(
+            forward, reversed,
+            "换了配置顺序主键就变了——历史画像会记到另一条链路名下"
+        );
+        assert_eq!(
+            forward,
+            vec![
+                ("aa".to_string(), "https://aa.example".to_string()),
+                ("bb".to_string(), "https://bb.example".to_string()),
+            ]
+        );
+        // 反过来钉住：`shard_for` 给的会话基址是所有出站共用的同一个地址，
+        // 拿它当主键的话两条出站会挤进同一条记录。
+        assert_ne!(
+            forward[0].1, "https://example.com",
+            "主键退回会话基址了"
+        );
     }
 
     #[test]
@@ -1168,6 +1212,7 @@ mod tests {
             client_priv: [2u8; 32],
             mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None],
+            server_origin: format!("https://{name}.example"),
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         }
     }

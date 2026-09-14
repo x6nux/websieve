@@ -463,7 +463,7 @@ mod tests {
     async fn pending_post_add_complete() {
         let core = TransportCore::new();
         let rx = core.register_post(7).await;
-        core.complete_post(7, Ok(PostReply { status: 204, body: Bytes::new() }))
+        core.complete_post(7, Ok(PostReply { status: 204, body: Bytes::new(), peer: None }))
             .await;
         let r = rx.await.unwrap().unwrap();
         assert_eq!(r.status, 204);
@@ -472,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_post_completion_is_silent() {
         let core = TransportCore::new();
-        core.complete_post(999, Ok(PostReply { status: 200, body: Bytes::new() }))
+        core.complete_post(999, Ok(PostReply { status: 200, body: Bytes::new(), peer: None }))
             .await; // 不 panic
     }
 

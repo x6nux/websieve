@@ -41,6 +41,13 @@ pub const PREWARM_DEPTH: usize = 2;
 ///
 /// `ponytail:` 45s 是拍脑袋的初值，**待实测**（同上）。典型 NAT 空闲超时在
 /// 60s–300s 之间，取一个明显低于下限的值。
+///
+/// **本仓库的服务端也是一道「下限」**：`wsieve-server` 的
+/// `tls::HANDSHAKE_TIMEOUT`（当前 60s）会掐掉静默太久、迟迟不发 ClientHello
+/// 的连接，而预建连接在被用掉之前正是这个样子。这个值必须留在它**之下**，
+/// 否则预建连接会在被用掉前就死掉：省 RTT 的收益归零，还多出一轮连接抖动。
+/// 两个常量分属两个 crate，编译器管不到，症状只是「开了多会话反而更慢」
+/// ——2026-09-11 实测踩过一次。那边有测试守着，改这里就要同步改那边。
 pub const PREWARM_TTL: Duration = Duration::from_secs(45);
 
 /// 一条预建好的上游连接，连同它的出生时间。
@@ -271,7 +278,8 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
-/// 本地条带的运行态：一批转发器 + 一份 hosts 托管，drop 时自动摘除 hosts 条目。
+/// 本地条带的运行态：一批转发器 + （走 hosts 路时）一份 hosts 托管，
+/// drop 时自动摘除 hosts 条目。
 ///
 /// 摘除动作不在这里写 —— 它归 `CustodyGuard<HostsCustody>`（设计文档 §10）。
 /// 本结构只负责「转发器与 hosts 条目同生共死」：字段顺序即 drop 顺序，
@@ -281,9 +289,12 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
 /// 持有的是**一批**转发器而非一个：`shard_setup::plan_many` 把多个出站的
 /// hosts 写入合并成一次原子操作（见该模块的文档），因此它们的转发器也必须
 /// 同生共死——都随这一份 hosts 托管一起摘除，而不是各自一份 guard。
+///
+/// `_hosts` 是 `Option`：走 [`crate::webview_proxy`] 那条免提权路时根本不碰
+/// hosts，没有托管可持有，但转发器照样要保活。
 pub struct ShardGuard {
-    /// 持有即生效：drop 时摘除 hosts 托管条目。
-    _hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
+    /// 持有即生效：drop 时摘除 hosts 托管条目。代理路为 `None`。
+    _hosts: Option<crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>>,
     /// 持有即保活：drop 时每个 listener 任务被 abort。
     _forwarders: Vec<Forwarder>,
 }
@@ -294,7 +305,15 @@ impl ShardGuard {
         hosts: crate::custody::CustodyGuard<crate::custody::hosts::HostsCustody>,
     ) -> Self {
         Self {
-            _hosts: hosts,
+            _hosts: Some(hosts),
+            _forwarders: forwarders,
+        }
+    }
+
+    /// 代理路专用：只保活转发器，不碰 hosts。
+    pub fn without_hosts(forwarders: Vec<Forwarder>) -> Self {
+        Self {
+            _hosts: None,
             _forwarders: forwarders,
         }
     }

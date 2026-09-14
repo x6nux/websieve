@@ -52,7 +52,16 @@ wsieve-config = { path = "../crates/wsieve-config" }
 #   仓库只有 icons/icon.png。
 # custom-protocol 不写在这里 —— 它必须由上面的 embed-ui 间接开，
 #   否则就没有退回 devUrl 配合热重载的路了。
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# macos-proxy：`WebviewWindowBuilder::proxy_url` 的开关，多会话条带的免提权
+#   落地件要它（见 `src/webview_proxy.rs`）。
+#
+#   **它把 macOS 的最低版本抬到 14.0**：链进来的 `nw_proxy_config_create_*`
+#   是 macOS 14 才有的符号，13 及以下即使一次都不调用也可能在 dyld 绑定阶段
+#   就起不来。因此 `tauri.conf.json` 里显式写了
+#   `bundle.macOS.minimumSystemVersion = "14.0"` —— 那不是保守估计，是把这个
+#   下限变成一句明确的「系统版本过低」，而不是一次没有任何线索的启动失败。
+#   两处必须同步：删掉这个 feature 时记得把版本下限一起降回去。
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-proxy"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tokio-stream = "0.1"

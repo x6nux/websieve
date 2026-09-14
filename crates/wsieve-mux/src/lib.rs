@@ -21,6 +21,15 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin> Dupl
 pub trait Mux: Send + Sync {
     async fn open(&self) -> anyhow::Result<MuxStream>;
     async fn accept(&self) -> anyhow::Result<MuxStream>;
+
+    /// 把本端接收窗口扩大到 `target`（只增不减）。
+    ///
+    /// 默认空实现：窗口是流控细节，不是每种 mux 都能在运行期调。调用方
+    /// （自适应流控）只管按实测 BDP 提要求，支持的实现照做，不支持的忽略。
+    ///
+    /// 之所以挂在 trait 上而不是让调用方持有具体类型：`mux_factory` 按协商
+    /// 结果返回 `Box<dyn Mux>`，类型在那一步就被擦掉了。
+    fn grow_window(&self, _target: u32) {}
 }
 
 /// 客户端角色工厂。

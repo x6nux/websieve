@@ -197,8 +197,7 @@ async fn bridge_post_result(
         match b64_decode(&r.body_b64) {
             Ok(body) => Ok(PostReply {
                 status: r.status,
-                body: Bytes::from(body),
-            }),
+                body: Bytes::from(body), peer: None }),
             Err(e) => Err(anyhow::anyhow!("回填 body 解码失败: {e}")),
         }
     } else {
@@ -427,6 +426,7 @@ async fn connect_session(
             mux_prefs: vec![MuxId::Wsmux],
             group_id,
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await

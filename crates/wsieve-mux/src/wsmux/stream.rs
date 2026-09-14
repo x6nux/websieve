@@ -11,7 +11,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -24,7 +24,9 @@ pub struct Stream {
     st: Arc<StreamState>,
     out: Arc<Outbound>,
     /// 本端接收窗口，用于判断该在什么时候回 WND。会话级配置，各流一致。
-    window: u32,
+    /// 与会话共享：接收窗口会在运行期变大，这里必须看到同一个值，
+    /// 否则 ACK 的触发阈值会停在旧窗口上，窗口涨了 ACK 却按老节奏回。
+    window: Arc<AtomicU32>,
     /// 会话的流表，只为了在 `Drop` 里摘掉自己的表项。
     table: StreamTable,
 }
@@ -33,7 +35,7 @@ impl Stream {
     pub(crate) fn new(
         st: Arc<StreamState>,
         out: Arc<Outbound>,
-        window: u32,
+        window: Arc<AtomicU32>,
         table: StreamTable,
     ) -> Self {
         Self {
@@ -57,7 +59,7 @@ impl Stream {
         buf.advance(n);
         // 数据已交给上层，对应的接收窗口可以还了。`take_ack` 攒够半个窗口才
         // 真的发帧，所以这不是每读一次发一个 WND。
-        if let Some(delta) = self.st.take_ack(n, self.window) {
+        if let Some(delta) = self.st.take_ack(n, self.window.load(Ordering::Relaxed)) {
             self.out.push_control(Cmd::Wnd, self.st.sid, delta);
         }
         Poll::Ready(Ok(()))

@@ -58,16 +58,33 @@ impl Default for Config {
     }
 }
 
+/// 单流接收窗口的硬上限。
+///
+/// 窗口是**授信**：通告 N 字节就是允许对端塞 N 字节未读数据过来，而本实现
+/// **不限制并发流数**。总量 = 流数 × 窗口，那个乘数由对端决定；应用侧读取
+/// 一停（磁盘慢、界面卡），这份额度就全部落成常驻内存。
+///
+/// 事后收不回：`Cmd::Wnd` 只有正增量，协议里没有负的窗口更新。所以唯一的
+/// 闸口在**通告之前**，也就是这里——`window_size()` 与 `grow_window` 各自
+/// clamp 一次。自适应那边的档位表也自带同一个上限
+/// （`wsieve_xhttp::link_profile::MAX_WINDOW`），两处独立成立：档位表是
+/// "别要求超限值"，这里是"要求了也不给"。
+///
+/// 16 MiB 的依据：实测单流吞吐约 20 MB/s，16 MiB 在 100 ms RTT 上对应
+/// 160 MB/s，比实际能跑的高 8 倍——再大不会更快，只会更能被塞满。
+const MAX_WINDOW: u32 = 16 * 1024 * 1024;
+
 /// 接收窗口的实际取值，可用 `WSIEVE_WSMUX_WINDOW`（字节）覆盖。
 ///
 /// 下限 64 KiB：再小的话一个满帧都放不下，流控会退化成逐帧停等。
-/// 上限 `i64::MAX` 由 `credit` 的类型保证，实践中受内存约束，不另设。
+/// 上限见 `MAX_WINDOW`——env 也不能越过它，那是内存安全的闸而不是调优旋钮。
 fn window_size() -> u32 {
     std::env::var("WSIEVE_WSMUX_WINDOW")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&n| n >= 64 * 1024)
         .unwrap_or(DEFAULT_WINDOW)
+        .min(MAX_WINDOW)
 }
 
 struct Inner {
@@ -76,8 +93,50 @@ struct Inner {
     /// 下一个可用的 sid。客户端取奇数、服务端取偶数，两端各分一半空间，
     /// 不必为"谁先开流"做任何协商。
     next_sid: AtomicU32,
-    window: u32,
+    /// 本端接收窗口。原子的，因为它会随链路画像在运行期变大
+    /// （见 `Session::grow_window`），不再是建会话时定死的常量。
+    window: Arc<AtomicU32>,
     dead: AtomicBool,
+}
+
+impl Session {
+    /// 把本端接收窗口扩大到 `target`，并把增量通告给对端。
+    ///
+    /// **只增不减**，这是有意的：缩小需要一个负的 WND，协议里没有这个东西。
+    /// 真要收缩，停发 delta 让它自然耗尽即可（软收缩），但那是另一件事——
+    /// 自适应只会因为链路变好而调大，链路变差时深窗口本身不造成损害。
+    ///
+    /// 两步的**顺序不能反**：先把每条流的入站闸提高，再通告新窗口。反过来的话
+    /// 对端一收到更大的窗口就会多发，而本端的闸还卡在旧值上，于是它一边守规矩
+    /// 一边被判越窗（见 `StreamState::grow_in_limit`）。
+    pub fn grow_window(&self, target: u32) {
+        // 先封顶再谈别的：见 `MAX_WINDOW`。调用方是自适应驱动器，它按 BDP
+        // 公式算"单流该多深"，那个公式里没有"会话里有多少条流"这一项。
+        let target = target.min(MAX_WINDOW);
+        // **整个操作在 streams 锁内完成**，包括 `fetch_max`。
+        //
+        // 建流的一侧（`open` / `dispatch` 的 SYN 分支）也必须在这把锁内读窗口
+        // 并插表，否则有一个会永久停滞的缝：建流方读到旧窗口 → 这里 fetch_max
+        // 并遍历（那个 sid 还没插进表，收不到 delta）→ 建流方插表并按旧窗口发
+        // SYN。结果是对端的发送信用停在旧窗口，而本端的 ACK 阈值（`take_ack`
+        // 读共享的 `Arc<AtomicU32>`）已经是新窗口的一半——对端发满旧窗口就停，
+        // 本端 unacked 永远够不到阈值，WND 再也不会发出。没有错误，只有静默卡死。
+        let streams = self.inner.streams.lock().unwrap();
+        let prev = self.inner.window.fetch_max(target, Ordering::AcqRel);
+        if target <= prev {
+            return;
+        }
+        let delta = target - prev;
+        for (sid, st) in streams.iter() {
+            st.grow_in_limit(target);
+            self.inner.out.push_control(Cmd::Wnd, *sid, delta);
+        }
+    }
+
+    /// 当前的本端接收窗口。
+    pub fn window(&self) -> u32 {
+        self.inner.window.load(Ordering::Relaxed)
+    }
 }
 
 impl Inner {
@@ -112,7 +171,7 @@ impl Session {
             out: Arc::new(Outbound::new()),
             streams: StreamTable::default(),
             next_sid: AtomicU32::new(if is_server { 2 } else { 1 }),
-            window: cfg.window,
+            window: Arc::new(AtomicU32::new(cfg.window)),
             dead: AtomicBool::new(false),
         });
 
@@ -153,20 +212,32 @@ impl Drop for Session {
 
 #[async_trait::async_trait]
 impl Mux for Session {
+    fn grow_window(&self, target: u32) {
+        Session::grow_window(self, target);
+    }
+
     async fn open(&self) -> anyhow::Result<MuxStream> {
         if self.inner.dead.load(Ordering::Acquire) {
             anyhow::bail!("wsmux 会话已关闭，无法开流");
         }
         let sid = self.alloc_sid();
         // 发送信用先按保守额度起步，真实额度等对端的 WND；接收上限用本端窗口。
-        let st = Arc::new(StreamState::new(sid, INITIAL_CREDIT, self.inner.window));
-        self.inner.streams.lock().unwrap().insert(sid, st.clone());
+        //
+        // 读窗口与插表必须在**同一把锁**内，与 `grow_window` 互斥——否则扩窗
+        // 会漏掉这条正在建的流，见 `grow_window` 的注释。
+        let (win, st) = {
+            let mut streams = self.inner.streams.lock().unwrap();
+            let win = self.inner.window.load(Ordering::Relaxed);
+            let st = Arc::new(StreamState::new(sid, INITIAL_CREDIT, win));
+            streams.insert(sid, st.clone());
+            (win, st)
+        };
         // SYN 先于任何数据发出。arg 带本端接收窗口，对端据此设定它的发送信用。
-        self.inner.out.push_control(Cmd::Syn, sid, self.inner.window);
+        self.inner.out.push_control(Cmd::Syn, sid, win);
         Ok(Box::new(Stream::new(
             st,
             self.inner.out.clone(),
-            self.inner.window,
+            self.inner.window.clone(),
             self.inner.streams.clone(),
         )))
     }
@@ -246,19 +317,27 @@ fn dispatch(
     match h.cmd {
         Cmd::Syn => {
             // SYN 的 arg 是对端的接收窗口，正是我们能往它发多少字节。
-            let st = Arc::new(StreamState::new(h.sid, h.arg, inner.window));
-            inner.streams.lock().unwrap().insert(h.sid, st.clone());
+            //
+            // 与 `open` 同理：读窗口与插表要在同一把锁内，才能与 `grow_window`
+            // 互斥。少了这一层，扩窗会漏掉这条流并让它永久停滞。
+            let (win, st) = {
+                let mut streams = inner.streams.lock().unwrap();
+                let win = inner.window.load(Ordering::Relaxed);
+                let st = Arc::new(StreamState::new(h.sid, h.arg, win));
+                streams.insert(h.sid, st.clone());
+                (win, st)
+            };
             // 对端此刻只给自己留了 `INITIAL_CREDIT`，立刻把本端真实窗口补给它。
             // 不补的话它每发 64 KiB 就要停下来等一次窗口更新。
-            if inner.window > INITIAL_CREDIT {
+            if win > INITIAL_CREDIT {
                 inner
                     .out
-                    .push_control(Cmd::Wnd, h.sid, inner.window - INITIAL_CREDIT);
+                    .push_control(Cmd::Wnd, h.sid, win - INITIAL_CREDIT);
             }
             let s = Stream::new(
                 st,
                 inner.out.clone(),
-                inner.window,
+                inner.window.clone(),
                 inner.streams.clone(),
             );
             // 发送失败说明 Session 已被丢弃，没人再来 accept 了。

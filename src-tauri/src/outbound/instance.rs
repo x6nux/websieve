@@ -26,6 +26,7 @@ use wsieve_mux::stripe_runtime::{StripeCfg, StripeDialer};
 use wsieve_mux::{mux_factory, Mux, MuxStream};
 use wsieve_proto::hello::{IpStrategy, MuxId};
 use wsieve_xhttp::client::{random_group_id, UpstreamCfg, XhttpConn};
+use wsieve_xhttp::link_profile::{FlowKind, LinkProfile};
 
 use crate::bridge::{TransportCore, WebViewTransport};
 
@@ -118,6 +119,14 @@ pub struct OutboundCfg {
     /// 因此这里现在总是 `Some(origin)`（绝对 https URL）——跨域名靠服务端
     /// CORS 放宽成立（见设计文档 §9.1 与 `docs/superpowers/spikes/2026-08-25-*`）。
     pub session_bases: Vec<Option<String>>,
+    /// 配置里那个服务端 URL 的 origin（`scheme://authority`）。
+    ///
+    /// 它只服务一件事：给链路画像做持久化主键（见 `link_key`）。不能用
+    /// `session_bases[0]` 顶替——那里面的端口是**本地转发器**端口，启动时
+    /// 按 `config.proxies` 的顺序分配。用户把配置里两条出站上下换个位置，
+    /// 端口就对调了，于是两套历史画像互相认错了链路：一条慢链路会继承
+    /// 另一条快链路的基线，一上来就跳到过高的档。
+    pub server_origin: String,
     /// 本出站的域名解析地址族偏好，随每条会话的 msg1 发给服务端。
     ///
     /// 逐出站而非全局：换一台服务器换一套出网环境，v6 出口通不通是**那台**
@@ -173,6 +182,12 @@ pub struct OutboundInstance {
     stop: Notify,
     /// 请求彻底停下（出站被禁用 / 应用退出）。
     stopping: AtomicBool,
+    /// 这条链路的实测画像，驱动自适应流控。
+    ///
+    /// **挂在实例上而不是每代重建**：重连不会改变物理路径，上一代测出来的
+    /// RTT/带宽对下一代依然成立。每代重来等于每次断线都要重新收敛一遍，
+    /// 而断线恰恰是链路不好的时候——最需要正确参数的时刻反而在从头学。
+    profile: Arc<LinkProfile>,
 }
 
 impl OutboundInstance {
@@ -185,11 +200,33 @@ impl OutboundInstance {
             connected: Notify::new(),
             stop: Notify::new(),
             stopping: AtomicBool::new(false),
+            profile: Arc::new(LinkProfile::new()),
         })
     }
 
     pub fn name(&self) -> &str {
         &self.cfg.name
+    }
+
+    /// 本出站在画像里的主键：配置里那个服务端 URL 的 origin。
+    ///
+    /// 用它而不是出站名：改个显示名不该丢掉已经测出来的链路特征，而换了
+    /// 服务器**就该**换一套记录。
+    ///
+    /// 更不能用 `session_bases[0]`——理由见 `OutboundCfg::server_origin`：
+    /// 那里的端口是本地转发器端口，重排配置就会让两条出站互相继承对方的历史。
+    pub fn link_key(&self) -> &str {
+        &self.cfg.server_origin
+    }
+
+    /// 当前画像快照，供持久化。样本不足时为 `None`。
+    pub fn link_snapshot(&self) -> Option<wsieve_xhttp::link_profile::ProfileSnapshot> {
+        self.profile.snapshot()
+    }
+
+    /// 用上次运行留下的记录给画像热启动。只在还没有实测样本时生效。
+    pub fn seed_link_profile(&self, snap: wsieve_xhttp::link_profile::ProfileSnapshot) {
+        self.profile.adopt_history(snap);
     }
 
     /// 本出站的连接参数（管理器编排承载计划时要读）。
@@ -438,6 +475,7 @@ impl OutboundInstance {
                 mux_prefs: self.cfg.mux_prefs.clone(),
                 group_id,
                 ip_strategy: self.cfg.ip_strategy,
+                profile: self.profile.clone(),
             },
         )
         .await?;
@@ -449,6 +487,7 @@ impl OutboundInstance {
         }
         let io: MuxStream = Box::new(liveness.watch(conn));
         let mux: Arc<dyn Mux> = Arc::from(mux_factory(neg.mux_id, io).await?);
+        self.spawn_window_driver(&mux);
         let dialer = StripeDialer::new(mux, StripeCfg::with_env());
 
         // 额外会话：每个一个独立 origin（同域名不同端口）—— 共用一个
@@ -485,6 +524,46 @@ impl OutboundInstance {
         Ok((dialer, liveness))
     }
 
+    /// 把画像算出的接收窗口周期性应用到一个 mux 会话上。
+    ///
+    /// 为什么要一个独立循环，而不是在画像的 `observe_*` 里顺手调：画像住在
+    /// xhttp 层（测的是上行 POST 往返），mux 会话在它**上面**一层。让下层反过来
+    /// 持有上层句柄会把依赖方向拧反，而这里是唯一同时看得见两者的地方。
+    ///
+    /// 持 `Weak`：会话死了循环必须跟着退，否则它会把会话钉在内存里到进程结束。
+    /// 出站会被反复重建（每次断线一代），每代泄一个就是稳定增长。
+    fn spawn_window_driver(&self, mux: &Arc<dyn Mux>) {
+        /// 应用间隔。不必更密：窗口只增不减，晚一个周期涨上去只损失一点吞吐；
+        /// 而每次扩窗都要给所有活跃流发一个 WND 控制帧，密集调用是浪费。
+        const APPLY_EVERY: Duration = Duration::from_secs(2);
+
+        // 显式锁了窗口就不要再动它。
+        //
+        // 这条曾经漏掉，后果很隐蔽：`WSIEVE_WSMUX_WINDOW` 只作用于建会话时的
+        // 初始值，而这个循环照样按画像把窗口调大——于是"锁死窗口做对照"的
+        // A/B 实验里，两臂的窗口其实一直是同一个值，测出来的"无差异"是假的。
+        if std::env::var("WSIEVE_WSMUX_WINDOW").is_ok()
+            || !wsieve_xhttp::link_profile::adaptive_enabled()
+        {
+            return;
+        }
+        let profile = self.profile.clone();
+        let weak = Arc::downgrade(mux);
+        tokio::spawn(async move {
+            let mut applied = 0u32;
+            loop {
+                tokio::time::sleep(APPLY_EVERY).await;
+                let Some(m) = weak.upgrade() else { return };
+                // 窗口是链路属性，不随流型变，取哪一种都一样。
+                let want = profile.tier(FlowKind::Bulk).window;
+                if want > applied {
+                    m.grow_window(want);
+                    applied = want;
+                }
+            }
+        });
+    }
+
     async fn extra_session(
         &self,
         core: &Arc<TransportCore>,
@@ -508,11 +587,17 @@ impl OutboundInstance {
                 // 值，额外会话报 Auto 就等于同一出站里一半连接走 v6、一半走
                 // v4，故障只在部分请求上出现。
                 ip_strategy: self.cfg.ip_strategy,
+                // 与主会话**共用同一个画像**：它们是同一条物理路径上的多条
+                // 连接（同域名不同端口），RTT 和带宽是同一件事。各测各的既
+                // 慢三倍收敛，又会因为样本被摊薄而更容易被噪声带偏。
+                profile: self.profile.clone(),
             },
         )
         .await?;
         let io: MuxStream = Box::new(liveness.watch(conn));
-        Ok(Arc::from(mux_factory(neg.mux_id, io).await?))
+        let mux: Arc<dyn Mux> = Arc::from(mux_factory(neg.mux_id, io).await?);
+        self.spawn_window_driver(&mux);
+        Ok(mux)
     }
 }
 
@@ -665,6 +750,7 @@ mod tests {
             client_priv: [2u8; 32],
             mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![None],
+            server_origin: format!("https://{name}.example"),
             ip_strategy: IpStrategy::Auto,
         }
     }

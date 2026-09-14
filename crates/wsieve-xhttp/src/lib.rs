@@ -1,6 +1,7 @@
 //! xhttp 传输层（spec §6/§7）：默认 mux 选型常量 + 客户端/服务端实现。
 
 pub mod client;
+pub mod link_profile;
 pub mod server;
 
 use wsieve_proto::hello::MuxId;

@@ -299,10 +299,57 @@
         headers: { 'Content-Type': 'text/plain' },
       });
       var buf = new Uint8Array(await resp.arrayBuffer());
-      await sendFrame('wsieve_raw_post', 1, requestId, resp.status, buf);
+      await sendFrame('wsieve_raw_post', 1, requestId, resp.status, buf, peerObs(resp));
     } catch (e) {
-      try { await sendFrame('wsieve_raw_post', 2, requestId, 0, null); } catch (_) {}
+      // 把错误原文带回去。`catch (e)` 之后只报一个「失败」标志的话，Rust 侧
+      // 拿到的永远是同一句 `post fetch failed`——而 fetch 的失败原因（CORS 被
+      // 拒、证书不匹配、连接超时、被代理拒绝）在排查时天差地别，且这条路上
+      // 没有任何别的地方能看到它：WebView 的 console 在无头运行时不可达。
+      // 2026-09-11 多会话条带调试实测：没有这一行就只能靠猜。
+      var msg = null;
+      try { msg = utf8(String((e && e.message) || e)); } catch (_) {}
+      try { await sendFrame('wsieve_raw_post', 2, requestId, 0, msg); } catch (_) {}
     }
+  }
+
+  // 从 `Server-Timing` 取服务端侧的链路观测，打包进回帧头那 4 个空闲字节。
+  //
+  // 服务端发的形状是 `edge;dur=0.3, q;desc="<空洞数>-<重复数>"`，与真实 CDN
+  // （Cloudflare 的 `cfEdge;dur=12` 之流）一致。客户端需要这两样自己拿不到的
+  // 东西：`dur` 从往返里扣掉才是纯网络 RTT；空洞/重复则区分了「请求没到」
+  // 和「响应丢了」——客户端只知道自己重试了，分不清是哪一种。
+  //
+  // 编码与 Rust 侧 `wsieve_transport::pack_peer_observation` 逐位对齐：
+  //   srv_us+1 : u16 | gaps : u8 | dups : u8
+  // `+1` 让全零能明确表示「没有观测数据」，与「服务端零耗时零丢包」区分开。
+  //
+  // 读不到头就返回 0（没数据）。响应头缺失是常态而非故障：伪装响应不带它，
+  // 跨 origin 时还要 `Timing-Allow-Origin`（服务端已无条件发）。
+  function peerObs(resp) {
+    try {
+      var h = resp.headers.get('server-timing');
+      if (!h) return 0;
+      var us = 0;
+      var m = /(?:^|,)\s*edge;dur=([0-9.]+)/.exec(h);
+      if (m) us = Math.round(parseFloat(m[1]) * 1000) || 0;
+      if (us > 65534) us = 65534;
+      var gaps = 0, dups = 0;
+      var q = /q;desc="(\d+)-(\d+)"/.exec(h);
+      if (q) {
+        gaps = Math.min(parseInt(q[1], 10) || 0, 255);
+        dups = Math.min(parseInt(q[2], 10) || 0, 255);
+      }
+      // `>>> 0` 保证按无符号看待：`<< 16` 在 JS 里走的是 32 位**有符号**
+      // 运算，us 超过 32767 时符号位会被点亮，结果变成负数。
+      return (((us + 1) << 16) | (gaps << 8) | dups) >>> 0;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  /// 字符串 → UTF-8 字节。回帧的 payload 必须是 Uint8Array。
+  function utf8(s) {
+    return new TextEncoder().encode(s);
   }
 
   // ---- 下行长 GET -------------------------------------------------------

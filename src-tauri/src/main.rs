@@ -34,6 +34,7 @@ mod control;
 mod custody;
 mod emitter_src;
 mod events;
+mod link_metrics;
 mod outbound;
 mod router;
 mod runtime_state;
@@ -42,6 +43,7 @@ mod shard_setup;
 mod stats;
 mod tun;
 mod tray;
+mod webview_proxy;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -239,9 +241,34 @@ fn main() {
         })
         .collect();
 
+    // WebView 专用的本地 SOCKS5 代理：多会话条带的免提权落地件。必须在
+    // `plan_many` **之前**起——编排要把改写表灌进去；也必须在建承载窗口
+    // 之前，因为代理 URL 是建窗口时一次性定死的（`proxy_url` 之后改不了）。
+    //
+    // 起不来就退回 hosts 劫持那条老路，不阻断启动：代理只是「让 WebView
+    // 找到转发器」的一种手段，不是传输本身。
+    //
+    // 这条退路看着像永不触发（`spawn` 只是在 127.0.0.1:0 上 bind 一个
+    // TcpListener），但它有具体的触发方式，不是摆设：
+    //   - **fd 耗尽**。本会话 2026-09-12 就在压测机上撞到过一次（`Too many
+    //     open files`，2022 条 ESTABLISHED）。那台是服务端，同样的事在客户端
+    //     侧会让这个 bind 直接失败。
+    //   - 沙箱/安全软件拒绝监听回环（企业 MDM 配置里不罕见）。
+    // 两种都是"代理不可用但 hosts 仍可用"的真实局面，所以这条路要留着。
+    let webview_proxy = match tauri::async_runtime::block_on(webview_proxy::WebviewProxy::spawn()) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::warn!("WebView 代理启动失败（{e:#}）——条带退回 hosts 劫持，需要管理员权限");
+            None
+        }
+    };
     let shard = tauri::async_runtime::block_on(shard_setup::plan_many(
         targets,
         custody::hosts::system_path(),
+        match &webview_proxy {
+            Some(p) => shard_setup::Reach::Proxy(p),
+            None => shard_setup::Reach::Hosts,
+        },
     ));
     // 没有 bypass 就绝不拉 TUN（§8.3.1）。这不是保守，是确定性：
     // 转发器的第一条出网连接会被 TUN 捕获、判「走代理」、绕回本机。
@@ -345,6 +372,13 @@ fn main() {
     // 刷新时会白屏。它不托管任何系统状态（不像 hosts / 系统代理），因此
     // **不进** RunEvent::Exit 的摘除序列，持有到 main 结束即可。
     let _carrier_page = carrier_page;
+    // 建承载窗口时要用的代理 URL。先取出字符串再把句柄挪走 —— `.setup()`
+    // 的闭包是 `move`，借着句柄进去会把它的生命周期绑在闭包上。
+    let carrier_proxy_url = webview_proxy.as_ref().map(|p| p.url());
+    // 代理同样必须活到进程结束：句柄一 drop，accept 任务就被 abort，承载
+    // WebView 的**全部**请求（数据面与承载页壳）会一起失败。它不托管任何
+    // 系统状态，因此与承载页 server 一样不进 RunEvent::Exit 的摘除序列。
+    let _webview_proxy = webview_proxy;
     // 系统代理托管（spec §8.2 / §10）。同 hosts 一样：持有即生效、drop 即恢复，
     // 崩溃残留由启动时的 clear_stale 兜底。
     let sysproxy_guard = std::sync::Mutex::new(setup_system_proxy(&cfg));
@@ -388,7 +422,12 @@ fn main() {
             // emitter（同源关键，见模块注释）。零出站时没有承载计划，整段
             // 跳过——不是「建一个空窗口」，是一个都不建。
             if let Some(c) = &carrier {
-                outbound::carrier::spawn_carrier_windows(&app.handle().clone(), c, show_window)?;
+                outbound::carrier::spawn_carrier_windows(
+                    &app.handle().clone(),
+                    c,
+                    show_window,
+                    carrier_proxy_url.as_deref(),
+                )?;
             }
 
             // 托盘先于窗口建：窗口建失败时用户至少还有托盘可用（这两条
@@ -729,6 +768,12 @@ async fn run_stack(
         table.insert(inst.name().to_string(), inst);
     }
 
+    // 自适应流控的跨进程记忆：把上次测出来的 RTT/带宽喂回去，让冷启动直接
+    // 落到正确档位而不是从默认档重新爬。**必须在会话循环起来之前**——
+    // `seed_link_profile` 只在画像还没有实测样本时生效，晚一步就被忽略了
+    // （实测永远比历史可信，那条让步是有意的，见 `adopt_history`）。
+    spawn_link_metrics_keeper(&app, &table);
+
     // 路由分派器与出站管理器**共用同一批实例**：管理器跑它们的会话循环、
     // 往里装 dialer，分派器读 dialer 决定这条连接能不能走。各持一份副本
     // 的话，分派器会永远看到一个空的 dialer 格 —— 表现为「明明连上了却
@@ -872,6 +917,58 @@ async fn run_stack(
         // 给页面一点时间重新加载并把 emitter 注回去。
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// 读回上次的链路画像喂给各出站，并起一个周期落盘的任务。
+///
+/// 取不到配置目录时整个跳过：这是一份**纯优化用途**的缓存，没有它只是每次
+/// 启动都要重新收敛一遍，功能一点不少。让它有权中断启动是把代价和重要性
+/// 搞反了——同样的取舍在 `stats` 那边也是这么做的。
+fn spawn_link_metrics_keeper(
+    app: &tauri::AppHandle,
+    table: &BTreeMap<String, Arc<outbound::instance::OutboundInstance>>,
+) {
+    /// 落盘间隔。画像变化是分钟级的（EWMA + 三次滞回），一分钟一次绰绰有余；
+    /// 更密只是在反复重写同一组数字。
+    const SAVE_EVERY: Duration = Duration::from_secs(60);
+
+    let dir = match app.path().app_config_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!("取配置目录失败（{e}），链路画像不做跨启动记忆");
+            return;
+        }
+    };
+    let path = link_metrics::LinkMetrics::default_path(&dir);
+    let store = link_metrics::LinkMetrics::load(&path);
+    for inst in table.values() {
+        if let Some(snap) = store.get(inst.link_key()) {
+            tracing::debug!(出站 = inst.name(), "用上次的链路画像热启动");
+            inst.seed_link_profile(snap);
+        }
+    }
+
+    let insts: Vec<_> = table.values().cloned().collect();
+    tauri::async_runtime::spawn(async move {
+        let mut store = store;
+        loop {
+            tokio::time::sleep(SAVE_EVERY).await;
+            let mut dirty = false;
+            for inst in &insts {
+                // 没快照就跳过：样本还不够——存一份没依据的数字，下次冷启动
+                // 会拿它去跳档，比没有记录更糟。
+                if let Some(snap) = inst.link_snapshot() {
+                    store.put(inst.link_key(), snap);
+                    dirty = true;
+                }
+            }
+            if dirty {
+                if let Err(e) = store.save() {
+                    tracing::debug!("链路画像落盘失败: {e}");
+                }
+            }
+        }
+    });
 }
 
 /// 建一代出站管理器。
@@ -1246,17 +1343,31 @@ async fn handle_frame(core: &Arc<bridge::TransportCore>, body: bytes::Bytes) -> 
     let payload = body.slice(HEADER..);
     match kind {
         1 => {
+            // POST 结果帧不用分片序号那 4 个字节，自适应流控借它回传服务端
+            // 侧的链路观测（`Server-Timing` 解出来的三个数）。编码见
+            // `wsieve_transport::pack_peer_observation`——借这个空位是为了
+            // 不动 `capabilities/transport.json` 的授权面，也不让每个 POST
+            // 多付一次 IPC。
             core.complete_post(
                 request_id,
                 Ok(wsieve_transport::PostReply {
                     status,
                     body: payload,
+                    peer: wsieve_transport::unpack_peer_observation(seq),
                 }),
             )
             .await;
         }
         2 => {
-            core.complete_post(request_id, Err(anyhow::anyhow!("post fetch failed")))
+            // payload 是 JS 侧带回来的 fetch 错误原文（可能为空——老版本的
+            // 承载页只报标志位）。带上它，"post fetch failed" 才可排查。
+            let detail = String::from_utf8_lossy(&payload);
+            let msg = if detail.is_empty() {
+                "post fetch failed".to_string()
+            } else {
+                format!("post fetch failed: {detail}")
+            };
+            core.complete_post(request_id, Err(anyhow::anyhow!(msg)))
                 .await;
         }
         3 => {

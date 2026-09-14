@@ -217,17 +217,26 @@ impl CarrierPlan {
 /// 第二个调用点——**调用方必须保证同一时刻只有一次这个函数在跑**（比如
 /// 靠一把序列化重建流程的锁），否则两次并发调用可能都判定"标签不存在"，
 /// 都尝试建同一个窗口，后一个 `.build()` 会因为标签重复而报错。
+///
+/// `proxy_url` 是 [`crate::webview_proxy`] 的地址（形如
+/// `socks5://127.0.0.1:54321`）。递进来的话，这个 WebView 的**全部**网络请求
+/// 都交给那个代理：数据面按改写表落到本地转发器，承载页自己的 http 壳查不到
+/// 改写、原样直连。`None` 表示走 hosts 劫持那条老路。
+///
+/// 它只能在建窗口时一次性定死 —— `proxy_url` 建好之后改不了，所以代理必须
+/// 先于本函数起来。
 pub fn spawn_carrier_windows(
     app: &tauri::AppHandle,
     plan: &CarrierPlan,
     show_window: bool,
+    proxy_url: Option<&str>,
 ) -> anyhow::Result<()> {
     use tauri::Manager;
     for (label, url) in plan.windows() {
         if app.get_webview_window(&label).is_some() {
             continue;
         }
-        tauri::webview::WebviewWindowBuilder::new(
+        let mut b = tauri::webview::WebviewWindowBuilder::new(
             app,
             label,
             tauri::WebviewUrl::External(url.parse()?),
@@ -240,8 +249,11 @@ pub fn spawn_carrier_windows(
         // spec §3.4：后台节流压制——macOS WKWebView 后台/隐藏时挂起
         // JS 定时器与 fetch（Task 18 E2E 实测心跳/流分块会停摆）。
         .background_throttling(tauri_utils::config::BackgroundThrottlingPolicy::Disabled)
-        .initialization_script(crate::bootstrap::loader_js())
-        .build()?;
+        .initialization_script(crate::bootstrap::loader_js());
+        if let Some(p) = proxy_url {
+            b = b.proxy_url(p.parse()?);
+        }
+        b.build()?;
     }
     Ok(())
 }
@@ -511,6 +523,7 @@ mod tests {
             client_priv: [9u8; 32],
             mux_prefs: vec![MuxId::Wsmux],
             session_bases: vec![Some("https://host.example:18443".to_string())],
+            server_origin: "https://host.example".into(),
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
         });
         let a2 = a.clone();
@@ -570,8 +583,7 @@ mod tests {
                             id,
                             Ok(PostReply {
                                 status: 200,
-                                body: bytes::Bytes::from_static(b"ok"),
-                            }),
+                                body: bytes::Bytes::from_static(b"ok"), peer: None }),
                         )
                         .await;
                     });

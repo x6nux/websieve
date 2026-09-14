@@ -3359,6 +3359,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tower",
+ "webpki-roots",
  "wsieve-mux",
  "wsieve-proto",
  "wsieve-socks5",

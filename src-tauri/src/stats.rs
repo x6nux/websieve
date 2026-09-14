@@ -114,7 +114,11 @@ pub fn save(p: &Path, stats: &StatsFile) -> std::io::Result<()> {
 /// 让子进程循环调用这个函数、复用同一份预先序列化好的文本，「进程被杀时正
 /// 处在写文件中途」的概率才接近 1 —— 否则测试会因为没踩中窗口而假绿。
 /// 这一点是实证的：拆分之前，把实现换成原地写，崩溃测试照样通过。
-fn write_atomically(p: &Path, text: &str) -> std::io::Result<()> {
+///
+/// `pub(crate)`：`link_metrics` 也要落一份 JSON，而它曾经自己写了一遍
+/// temp+rename——写漏了 `sync_all`，也就是漏掉了三道保护里挡掉电的那一道。
+/// 同一件事不该有第二份实现，尤其当那份实现比这份少一道保护。
+pub(crate) fn write_atomically(p: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }

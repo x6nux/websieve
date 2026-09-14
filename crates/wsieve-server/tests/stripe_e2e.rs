@@ -60,6 +60,7 @@ async fn connect_dialer(rig: &Rig, cfg: StripeCfg) -> Arc<StripeDialer> {
             mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await

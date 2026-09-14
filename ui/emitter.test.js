@@ -109,3 +109,64 @@ describe('IPC 通路契约：invoke 实际收到的 body 形状', () => {
     expect(emitter.proto()).toBe('');
   });
 });
+
+describe('服务端链路观测回传', () => {
+  /** 用一个受控的 fetch 响应跑一次 post()，返回 invoke 收到的那一帧。 */
+  async function postWithHeader(serverTiming) {
+    delete window.__wsieve;
+    vi.stubGlobal('location', {
+      protocol: 'http:', hostname: '127.0.0.1', origin: 'http://127.0.0.1',
+    });
+    const invoke = vi.fn(() => Promise.resolve());
+    window.__TAURI__ = { core: { invoke } };
+    const headers = new Map();
+    if (serverTiming !== null) headers.set('server-timing', serverTiming);
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      status: 204,
+      arrayBuffer: async () => new ArrayBuffer(0),
+      headers: { get: (k) => headers.get(k) ?? null },
+    })));
+    new Function(SRC)();
+    await window.__wsieve.post(7, '/api/sync?n=1&sid=x', '');
+    // 第一帧可能是心跳，取 wsieve_raw_post 那次
+    const call = invoke.mock.calls.find((c) => c[0] === 'wsieve_raw_post');
+    return call ? call[1] : null;
+  }
+
+  // 这 4 个字节在 POST 结果帧里本来是空的（下行分片序号只在流帧上用）。
+  // 自适应流控借它回传服务端观测，省掉一次 IPC 和一条新的 Tauri 命令授权。
+  function decodeObs(f) {
+    return ((f[11] << 24) | (f[12] << 16) | (f[13] << 8) | f[14]) >>> 0;
+  }
+
+  it('把 Server-Timing 的三个数编进回帧头的空闲字节', async () => {
+    const f = await postWithHeader('edge;dur=0.3, q;desc="2-5"');
+    expect(f).not.toBeNull();
+    // srv_us = 300 → 存 301；gaps=2；dups=5
+    expect(decodeObs(f)).toBe(((301 << 16) | (2 << 8) | 5) >>> 0);
+  });
+
+  // 缺头是常态而非故障（伪装响应不带它）。全零必须表示「没有数据」，
+  // 而不能被 Rust 侧读成「服务端零耗时、零丢包」——那会让画像把链路
+  // 判得比实际更好，且是静默的。
+  it('没有 Server-Timing 时回传零（即“无数据”）', async () => {
+    const f = await postWithHeader(null);
+    expect(decodeObs(f)).toBe(0);
+  });
+
+  // `<< 16` 在 JS 里是 32 位**有符号**运算：us 超过 32767 时符号位被点亮，
+  // 不做 `>>> 0` 就会变成负数，写进字节数组后 Rust 侧解出一个天文数字。
+  it('大延迟不会因为有符号位移而翻成负数', async () => {
+    const f = await postWithHeader('edge;dur=60.0, q;desc="0-0"');
+    const v = decodeObs(f);
+    expect(v).toBeGreaterThan(0);
+    expect(v >>> 16).toBe(60001);
+  });
+
+  // u16 在 65 ms 处饱和。饱和本身就是「服务端非常慢」的信号，不丢信息；
+  // 回绕则会把最慢读成最快。
+  it('超过 u16 的服务端耗时饱和而不回绕', async () => {
+    const f = await postWithHeader('edge;dur=5000.0, q;desc="0-0"');
+    expect(decodeObs(f) >>> 16).toBe(65535);
+  });
+});

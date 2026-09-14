@@ -73,7 +73,22 @@ pub fn bind_endpoint(
     )?;
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
         .context("rustls config 不满足 QUIC 要求（需 TLS1.3，且 early_data 为 0 或 u32::MAX）")?;
-    let server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic));
+
+    // 拥塞控制换成 BBR。quinn 默认是 Cubic，而内核 TCP 面跑的是 BBR——两边
+    // 不是一个算法，在有丢包的链路上会拉开数量级的差距：
+    //
+    //   2026-09-11 跨境实测，同一条链路同一时段
+    //     TCP(BBR)   重传 8.1%，8MiB 下行 3.5 MiB/s
+    //     QUIC(Cubic) 丢包 2.7%，8MiB 下行 0.4 MiB/s
+    //
+    // 丢得更少却慢一个数量级，因为 Cubic 每个丢包事件砍半窗口，按 Mathis
+    // 上限 MSS/(RTT·√p) = 1350/(0.04·√0.027) ≈ 0.2 MiB/s，实测正好落在这个
+    // 量级；BBR 不看丢包，按实测带宽发。这一行之前，h3 在任何有损链路上都
+    // 只会比 TCP 慢，看起来像"QUIC 不行"，其实是默认值不匹配。
+    let mut transport = quinn::TransportConfig::default();
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    server_cfg.transport_config(Arc::new(transport));
 
     quinn::Endpoint::server(server_cfg, listen)
         .with_context(|| format!("QUIC 监听 {listen} 失败"))
@@ -128,16 +143,6 @@ pub struct LinkQuality {
     pub black_holes: u64,
 }
 
-impl LinkQuality {
-    /// 丢包率（0.0–1.0）。`sent` 为 0 时返回 0，不是"完美"而是"没样本"。
-    pub fn loss_ratio(&self) -> f64 {
-        if self.sent == 0 {
-            return 0.0;
-        }
-        self.lost as f64 / self.sent as f64
-    }
-}
-
 fn sample(conn: &quinn::Connection) -> LinkQuality {
     let p = conn.stats().path;
     LinkQuality {
@@ -161,6 +166,59 @@ const LOSS_BAD: f64 = 0.05;
 /// 结果是在 h3/h2 之间反复横跳，比不降级更糟。
 const BAD_STREAK: u32 = 3;
 
+/// 一个采样窗口至少要有这么多发包，才谈得上丢包率。
+///
+/// 2026-09-12 真机翻车：连接刚建起来丢了 2 个包，窗口只有 24 个包，
+/// 8.33% 直接过阈值，10 分钟冷却期就此关死 h3。跨境链路握手阶段丢一两个
+/// 包是常态，样本小到 40 以下时 `lost>=2` 必然过 5% 线——那不是测量，是噪声。
+///
+/// 100 是按用途取的：这个机制要抓的是"运营商 QoS 掐 UDP"，那种劣化是持续
+/// 20%+ 的，100 个包足够看出来；而正常传输 10 秒轻松几千包，够不着门槛的
+/// 只有空闲连接，空闲连接本来就没有可谈的质量。
+const MIN_SAMPLE: u64 = 100;
+
+/// 一个采样窗口的判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// 窗口内确实劣化。
+    Bad,
+    /// 窗口内正常。
+    Ok,
+    /// 发包太少，这个窗口不构成证据——既不判劣也不清零滞回计数。
+    NotEnoughSamples,
+}
+
+/// 判定**两次采样之间**的链路质量。
+///
+/// 必须比较增量，不能直接看累计率。quinn 的 `lost_packets`/`sent_packets`
+/// 都是连接生命周期的累计值，拿累计率判劣会让早期的一次丢包被反复计入：
+/// 2026-09-12 真机上就是 `2/24 → 2/28 → 2/31`，实际第一次采样之后一个包
+/// 都没再丢，却被判了 3 次劣，`BAD_STREAK` 的滞回意图（要 3 次**独立**判劣）
+/// 退化成"同一个事实数 3 遍"，直接触发降级。
+pub fn judge(prev: &LinkQuality, now: &LinkQuality) -> Verdict {
+    // 黑洞按**累计**判，与丢包率相反——这不是疏忽，两者的性质不同。
+    //
+    // 丢包率必须看增量，否则早期的一次丢包会被反复计入（见函数文档）。
+    // 但 `black_holes_detected` 只在 quinn 确认"发出去的包整批消失"时才加，
+    // 是路径已经不通的**确定性**信号，不是一个会自己好转的比率。按增量判
+    // 就变成了边沿触发：只有出现黑洞的那一窗判劣，下一窗计数没再涨就落回
+    // `NotEnoughSamples`（黑洞链路本来就发不出几个包），`streak` 永远卡在 1，
+    // 降级再也不会触发——而这正是降级机制存在的那个场景。
+    if now.black_holes > 0 {
+        return Verdict::Bad;
+    }
+    let sent = now.sent.saturating_sub(prev.sent);
+    if sent < MIN_SAMPLE {
+        return Verdict::NotEnoughSamples;
+    }
+    let lost = now.lost.saturating_sub(prev.lost);
+    if lost as f64 / sent as f64 >= LOSS_BAD {
+        Verdict::Bad
+    } else {
+        Verdict::Ok
+    }
+}
+
 /// 降级后的冷却时长：这段时间内不再宣告 h3。
 ///
 /// 劣化多半是暂时的（运营商 QoS 有时段性），到点自动恢复，不需要人工干预。
@@ -178,29 +236,46 @@ const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
 fn spawn_quality_probe(conn: quinn::Connection, gate: crate::H3Gate) {
     tokio::spawn(async move {
         let mut streak = 0u32;
+        let mut prev = sample(&conn);
         loop {
             tokio::time::sleep(SAMPLE_EVERY).await;
             if conn.close_reason().is_some() {
                 return;
             }
             let q = sample(&conn);
-            // 没发过包就没有可谈的质量，跳过——否则空闲连接会刷出一串
-            // loss=0 的假"健康"记录，还会把 streak 洗掉。
-            if q.sent == 0 {
+            let verdict = judge(&prev, &q);
+            let sent = q.sent.saturating_sub(prev.sent);
+            let lost = q.lost.saturating_sub(prev.lost);
+            // 样本不足不打日志也不动 streak：空闲连接每 10 秒刷一行
+            // "没样本"既没信息量，又会把真实的劣化序列冲散。
+            //
+            // **基线也不能推进**。这一句曾经在 `continue` 之前，于是每个窗口
+            // 都把 `prev` 重置一次：一条被限速到每 10 秒几十个包的链路，
+            // 永远攒不到 `MIN_SAMPLE`，降级判据对它彻底失效——而那恰恰是最
+            // 需要降级的链路。留着 `prev` 不动，窗口就会一直变宽直到攒够证据。
+            if verdict == Verdict::NotEnoughSamples {
                 continue;
             }
-            let bad = q.loss_ratio() >= LOSS_BAD || q.black_holes > 0;
+            prev = q;
             eprintln!(
-                "h3: 链路质量 rtt={}ms 丢包={:.2}% ({}/{}) 拥塞事件={} 黑洞={}{}",
+                "h3: 链路质量 rtt={}ms 窗口丢包={:.2}% ({}/{}) 累计拥塞事件={} 黑洞={}{}",
                 q.rtt_ms,
-                q.loss_ratio() * 100.0,
-                q.lost,
-                q.sent,
+                if sent == 0 {
+                    0.0
+                } else {
+                    lost as f64 / sent as f64 * 100.0
+                },
+                lost,
+                sent,
                 q.congestion_events,
                 q.black_holes,
-                if bad { "  [判劣]" } else { "" }
+                if verdict == Verdict::Bad {
+                    "  [判劣]"
+                } else {
+                    ""
+                }
             );
-            if !bad {
+            if verdict == Verdict::Ok {
                 streak = 0;
                 continue;
             }

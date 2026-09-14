@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
             mux_prefs: mux_prefs.clone(),
             group_id,
             ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await?;
@@ -82,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
                 mux_prefs: mux_prefs.clone(),
                 group_id,
                 ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+                profile: Default::default(),
             },
         )
         .await?;

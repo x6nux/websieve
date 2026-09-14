@@ -50,3 +50,6 @@ wsieve-socks5 = { version = "0.1.0", path = "../wsieve-socks5" }
 # cross_origin_spike：Rust ←→ 真实 WKWebView 的桥用 JSON 交换 fetch 结果。
 serde = { workspace = true }
 serde_json = "1"
+# examples/h3_probe 要打真实公网服务端，得用公共根证书验链。
+# 只有 example 用得到，所以放 dev-dependencies（cargo 的 example 同时链接两者）。
+webpki-roots = "1"
