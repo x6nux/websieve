@@ -33,7 +33,7 @@ async fn start_server() -> Rig {
             priv_key: server_priv,
             whitelist,
         },
-        vec![MuxId::Yamux],
+        vec![MuxId::Wsmux],
         KeepaliveRange::default(),
         SEEN_CACHE_CAPACITY,
     );
@@ -57,15 +57,17 @@ async fn connect_dialer(rig: &Rig, cfg: StripeCfg) -> Arc<StripeDialer> {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await
     .unwrap();
-    assert_eq!(neg.mux_id, MuxId::Yamux);
+    assert_eq!(neg.mux_id, MuxId::Wsmux);
     let io: MuxStream = Box::new(conn);
-    let mux: Arc<dyn Mux> = Arc::from(mux_factory(MuxId::Yamux, io).await.unwrap());
+    let mux: Arc<dyn Mux> = Arc::from(mux_factory(MuxId::Wsmux, io).await.unwrap());
     StripeDialer::new(mux, cfg)
 }
 

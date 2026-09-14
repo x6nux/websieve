@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-connect"
+description = "允许控制窗口请求建立全部启用的出站连接"
+commands.allow = ["connect"]

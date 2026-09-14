@@ -1,0 +1,15 @@
+# `aes` 0.8 在 aarch64 上的硬件后端是**编译期 opt-in**：不加 `--cfg aes_armv8`
+# 就一路走 `aes::soft::fixslice` 纯软件实现。实测剖析里 `fixslice::sub_bytes`
+# 是仅次于 memmove 的热点，而 Apple Silicon 全系都有 FEAT_AES。
+#
+# 协议名 `Noise_IK_25519_AESGCM_BLAKE3` 把密码套件钉死成 AES-GCM，换不了，
+# 所以只能让这一套跑在硬件上。
+#
+# 同样的道理适用于 GHASH。AES-GCM 的认证部分走 `polyval`/`ghash`，它有**独立**
+# 的开关 `polyval_armv8`——只开 `aes_armv8` 的话，分组加密上了硬件、认证还留在
+# `polyval::backend::soft` 里，剖析里能直接看到它。两个都要开。
+#
+# x86_64 不用管：`aes` 和 `polyval` 在 x86 上都是运行时 cpuid 检测，
+# AES-NI / CLMUL 自动启用。
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

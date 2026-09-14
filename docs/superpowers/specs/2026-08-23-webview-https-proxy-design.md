@@ -66,7 +66,29 @@ websieve 是一个把网络传输层放进 WebView 执行的代理客户端。�
 | WKWebView 不支持流式上传，且引擎随 OS 不可独立更新 → 存量设备数年内无法使用 | **上行只用 packet-up（多个独立 POST）**。`stream-up` 不实现 |
 | 流式上传强制 HTTP/2 或 HTTP/3 + HTTPS，h1.1 直接 reject（`net::ERR_H2_OR_QUIC_REQUIRED`），不降级 | 即便未来启用 stream-up，也需服务端强制 h2/h3 |
 | Android Chromium timer 节流：后台每秒 1 次 → 10 秒后 0.01s/s 预算 → 5 分钟后每分钟 1 次 | 见 §9.3。**WebSocket/WebRTC 长连接被官方豁免节流**，是可用的规避路径 |
-| Tauri IPC 的 JSON 路径对大数据是官方承认的瓶颈 | 必须走二进制快路径：`Channel<&[u8]>` / 顶层 `Uint8Array`。**切勿把二进制嵌在 object 里**，会退化成数字数组 |
+| Tauri IPC 的 JSON 路径对大数据是官方承认的瓶颈 | ~~必须走二进制快路径：`Channel<&[u8]>` / 顶层 `Uint8Array`~~ **见下方修订：承载页是远程 origin，快路径不可用，改用 base64** |
+
+> **2026-09-09 修订（真机实测）**：上面那条「走顶层 `Uint8Array` 快路径」在
+> 生产形态下**从来没有成立过**。承载 WebView 加载的是远程 origin，而 Tauri 的
+> custom protocol IPC 走 `fetch('ipc://localhost/…')`——WKWebView 禁止 https
+> 页面访问 custom scheme，请求发都发不出去。Tauri 只 `console.warn` 一句就
+> **静默回退**到 postMessage，那条路径把 `Uint8Array` 交给 `JSON.stringify`，
+> replacer 里一句 `Array.from(val)` 正好退化成本条要避免的数字数组（~3.57x）。
+>
+> 症状极具迷惑性：**无 payload 的命令（心跳）照常成功**，所以出站会进入
+> `Connecting`、握手 POST 其实已成功往返，只是回帧那步 invoke 抛
+> `raw body required`、被 emitter 的 `catch` 吞掉，于是永久挂起、零错误日志。
+>
+> 逐一实测排除的绕过方案：`ipc://` 三种请求形态（最简 GET / 简单请求 /
+> 完整模拟，全部 `TypeError: Load failed`，故与 CORS、预检、Content-Type
+> 无关）；`http://127.0.0.1`（被拦，本地探针 server 零日志）；本地 origin 的
+> iframe 桥（连已知存在的 `index.html` 都不触发 onload）；`use_https_scheme`
+> （只作用于 asset protocol）；gzip（加密数据 1.001x，反而变大）。
+>
+> **结论**：唯一通道是 postMessage 的 JSON，二进制改走 base64 字符串。
+> 3.57x → 1.33x，JavaScriptCore 实测 75 → 148 MB/s（对 100Mbps 场景余量 12 倍）。
+> 编码用分块 `btoa`，比手写循环快 2.6 倍。实现见 `ui/emitter.js` 的 `sendFrame`
+> 与 `src-tauri/src/bridge.rs` 的 `bs64_decode`。
 
 Tauri IPC 官方说明：https://v2.tauri.app/develop/calling-rust/
 Chromium 节流：https://developer.chrome.com/blog/timer-throttling-in-chrome-88
@@ -241,16 +263,14 @@ padding 长度范围 0–1000 字节，每帧独立随机（Xray 经验值为 10
 ### 6.2 HTTP 端点与形态
 
 ```http
-# 握手 + 上行：POST，seq 在 query，sid 在 cookie
-POST /api/sync?n=17 HTTP/2   ← 浏览器↔CDN/源站为 h2 或 h3（§6.8）；CDN Flexible 模式下 CDN↔源站段可能是 h1.1，对客户端无影响
-Cookie: sid=<128-bit 随机的 base64url>
+# 握手 + 上行：POST，seq 与 sid 均在 query
+POST /api/sync?n=17&sid=<128-bit 随机的 base64url> HTTP/2   ← 浏览器↔CDN/源站为 h2 或 h3（§6.8）；CDN Flexible 模式下 CDN↔源站段可能是 h1.1，对客户端无影响
 → 200（n=0 且 msg1 验证通过，body = TU(msg2)）
 → 204（n≥1 且会话有效，body 恒空）
 → 其余（垃圾/重放/无会话/版本不符）：**不产生任何专属响应**，请求原样转交伪装处理器（反代上游，或内嵌 nginx 页的 404）——见 §8
 
 # 下行：一条长 GET
-GET /api/events HTTP/2
-Cookie: sid=<同上>
+GET /api/events?sid=<同上> HTTP/2
 Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 → 200（会话有效）
   Content-Type: text/event-stream
@@ -259,6 +279,24 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 → <TU 密文的持续字节流，永不结束>
 → 其余：同上转交伪装处理器
 ```
+
+> **2026-08-25 订正（重要）**：本节原文写作「sid 在 cookie」并给出
+> `Cookie: sid=...` 请求头。**这与实现不符，且该误述曾导致一次被公开撤回的
+> 错误架构结论**（若 sid 真在 cookie 里，WKWebView 的 ITP 会拦掉跨站第三方
+> cookie，「单 WebView 承载多出站」将结构性地不可能）。
+>
+> **实现事实：sid 自始至终走 query。**
+> 客户端 `crates/wsieve-xhttp/src/client.rs:133`（握手）、`:205`（下行）、
+> `:453`（后续上行）；服务端 `crates/wsieve-server/src/lib.rs:228`、`:250`
+> 均以 `query_param(&uri, "sid")` 取值。全仓 `crates/` 与 `src-tauri/src/`
+> 对 `cookie` 的搜索**零命中**。
+>
+> emitter 的 `credentials:'include'` 只是让 fetch 带上凭据（若有），
+> **与 sid 的传递无关**。
+>
+> 该事实已由 2026-08-25 的跨域名 spike 端到端确证（单 WebView 对两个
+> 不同 eTLD+1 的服务端各完成握手并跑通数据面）。见
+> `docs/superpowers/spikes/2026-08-25-cross-origin-carrier-spike.md`。
 
 设计说明：
 
@@ -271,7 +309,7 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
 
 ```
 1. C  生成 sid（128-bit 随机）
-2. C→S POST /api/sync?n=0, Cookie: sid, body = TU(Noise msg1)
+2. C→S POST /api/sync?n=0&sid=<sid>, body = TU(Noise msg1)
       msg1 的 0-RTT payload = [u8 version][u64 ts_ms][u8 mux_count][mux id 列表]（§7.4）
 3. S  尝试用静态私钥解密 msg1。以下任一情况 → **转交伪装处理器**（与普通请求同一出口，不落任何会话状态）：
       - 解密失败（垃圾/探测）
@@ -281,7 +319,7 @@ Sec-Fetch-Site: same-origin          ← 同源天然生成，无需伪造
       - 解出的客户端静态公钥不在白名单
       成功 → 建会话（进入 30s attach 窗口）→ 200, body = TU(Noise msg2)
 4. C  收 msg2 → 双方持有传输密钥。mux 协商在握手中完成，零额外 RTT
-5. C→S GET /api/events, Cookie: sid
+5. C→S GET /api/events?sid=<sid>
       sid 无会话或已被挂载 → **转交伪装处理器**；正常 → 200，挂载，开始下发 TU 流
 6. 之后上行 POST n=1,2,3…（每 body 含 1..N 个 TU）
 ```
@@ -388,7 +426,14 @@ WebView 加载的是服务端首页而非 `about:blank`，因此所有代理请�
 
 1. 这些差异全在 TLS 内部，中间人只看到若干条到 `:443` 的连接且 SNI 相同——对外伪装反而**优于**多子域名方案；
 2. CORS 预检被消除而非缓存：emitter 的 `Content-Type` 由 `application/octet-stream` 改为 `text/plain`（CORS 简单请求白名单），实测跨源 POST 预检次数 0 vs 1。服务端因此无需特殊响应 OPTIONS，少一个可探测面；
-3. CORS 响应头只加在**认证成功**的响应上，且只对与 `Host` 同域名的 `Origin`——未认证请求照常走伪装处理器（§8），探测者看不到任何 CORS 痕迹。
+3. CORS 响应头只加在**认证成功**的响应上——未认证请求照常走伪装处理器（§8），探测者看不到任何 CORS 痕迹。
+
+> **2026-08-25 修订**：本条原文为「且只对与 `Host` 同域名的 `Origin`」。该限制已随
+> 客户端 spec §9.1「单 WebView 承载多出站」放宽——服务端无从预知客户端把哪台机器
+> 当宿主，故不能再做同域名判据，现回显任意形态合法的 `Origin`（实现见
+> `crates/wsieve-server/src/lib.rs` 的 `cors_origin`，提交 `dbb300d`）。
+> **防线未变**：判据始终是「认证与否」，不是「同不同域」。原「同域名不同端口」的
+> 多端口条带场景是新判据的一个特例，仍被覆盖。
 
 会话 0 仍加载自转发器的首个端口并使用相对路径，保持完全同源。hosts 不可写（无管理员权限）时降级为单会话 + 警告日志，不阻断启动。
 

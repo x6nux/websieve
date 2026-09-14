@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-rule-test"
+description = "允许控制窗口运行规则试算探针（只读，不改变任何状态）"
+commands.allow = ["rule_test"]

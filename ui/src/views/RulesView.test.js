@@ -1,0 +1,538 @@
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, within } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
+import RulesView from './RulesView.svelte';
+import { move } from '../lib/reorder.js';
+
+const rules = [
+  { id: 1, type: 'geosite', value: 'category-ads', target: 'REJECT', hits: 18204, enabled: true },
+  { id: 2, type: 'suffix', value: 'googleapis.com', target: '新加坡', hits: 3891, enabled: true },
+  { id: 3, type: 'keyword', value: 'google', target: '日本节点', hits: 9417, enabled: true },
+  { id: 4, type: 'geosite', value: 'cn', target: 'DIRECT', hits: 42663, enabled: true },
+  { id: 5, type: 'final', value: '*', target: '日本节点', hits: 88120, enabled: true },
+];
+const colorOf = () => '#5b8ff9';
+const base = () => ({
+  rules,
+  colorOf,
+  probe: null,
+  ontest: vi.fn(),
+  onreorder: vi.fn(),
+  ontoggle: vi.fn(),
+});
+
+describe('规则视图', () => {
+  it('是一个带表头的列表，能被屏幕阅读器当表读', () => {
+    render(RulesView, base());
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getAllByRole('columnheader').length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('规则类型是低对比灰文本，不是彩色 pill', () => {
+    // 反 AI 塑料感 + spec §11.4 明确拒绝：颜色全部让给出站
+    const { container } = render(RulesView, base());
+    const type = container.querySelector('.type');
+    expect(type).toBeTruthy();
+    const cls = type.getAttribute('class') ?? '';
+    expect(cls).not.toMatch(/pill|badge|tag-/);
+  });
+
+  it('类型列不带任何内联颜色 —— 彩色会把列表变成彩虹糖', () => {
+    const { container } = render(RulesView, base());
+    for (const el of container.querySelectorAll('.type')) {
+      expect(el.getAttribute('style') ?? '').not.toMatch(/color|background/);
+    }
+  });
+
+  it('命中数越高背景越亮（signature ①）', () => {
+    const { container } = render(RulesView, base());
+    const rows = [...container.querySelectorAll('tbody tr')];
+    const alpha = (el) => {
+      const m = (el.getAttribute('style') ?? '').match(/rgba\(255,\s*255,\s*255,\s*([\d.]+)\)/);
+      return m ? parseFloat(m[1]) : 0;
+    };
+    // final（88,120）应比 suffix（3,891）亮
+    expect(alpha(rows[4])).toBeGreaterThan(alpha(rows[1]));
+  });
+
+  it('零命中的规则背景是透明的 —— 死规则要一眼可辨', () => {
+    const dead = [
+      ...rules,
+      { id: 6, type: 'domain', value: 'dead.com', target: 'DIRECT', hits: 0, enabled: true },
+    ];
+    const { container } = render(RulesView, { ...base(), rules: dead });
+    const last = [...container.querySelectorAll('tbody tr')].at(-1);
+    const style = last.getAttribute('style') ?? '';
+    expect(style).toMatch(/transparent|rgba\(255,\s*255,\s*255,\s*0\)/);
+  });
+
+  it('探针命中时该行被标出，其余降噪', () => {
+    render(RulesView, {
+      ...base(),
+      probe: { index: 3, decision: 'Outbound', outbound: '日本节点', tried: 2, needResolve: false },
+    });
+    const rows = screen.getAllByRole('row').slice(1);
+    expect(rows[2].className).toMatch(/hit/);
+    expect(rows[0].className).toMatch(/dim/);
+  });
+
+  it('探针激活时一行都不删 —— 它是探针不是过滤器', () => {
+    // signature ② 的全部价值在于「命中的是第 3 条，而前 2 条已试未命中」。
+    // 把不匹配的行删掉，这个上下文就没了，它也就退化成一个搜索框。
+    render(RulesView, {
+      ...base(),
+      probe: { index: 3, decision: 'Outbound', outbound: '日本节点', tried: 2, needResolve: false },
+    });
+    expect(screen.getAllByRole('row').slice(1)).toHaveLength(rules.length);
+  });
+
+  it('命中行用 aria-current 标注 —— 不只靠颜色', () => {
+    render(RulesView, {
+      ...base(),
+      probe: { index: 3, decision: 'Outbound', outbound: 'JP', tried: 2, needResolve: false },
+    });
+    const rows = screen.getAllByRole('row').slice(1);
+    expect(rows[2]).toHaveAttribute('aria-current', 'true');
+  });
+
+  it('每行有启用开关，且开关有可访问名字', () => {
+    render(RulesView, base());
+    const sw = screen.getAllByRole('switch');
+    expect(sw).toHaveLength(rules.length);
+    expect(sw[0]).toHaveAccessibleName(/启用|category-ads/);
+  });
+
+  it('点开关触发 ontoggle', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(RulesView, p);
+    await u.click(screen.getAllByRole('switch')[0]);
+    expect(p.ontoggle).toHaveBeenCalledWith(1, false);
+  });
+
+  it('Alt+↓ 把规则下移（拖拽的键盘等价物）', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(RulesView, p);
+    const handle = screen.getAllByRole('button', { name: /移动|拖拽/ })[0];
+    handle.focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    expect(p.onreorder).toHaveBeenCalledWith(0, 1);
+  });
+
+  it('Alt+↑ 把规则上移', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(RulesView, p);
+    screen.getAllByRole('button', { name: /移动/ })[2].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    expect(p.onreorder).toHaveBeenCalledWith(2, 1);
+  });
+
+  it('不按 Alt 的方向键不排序 —— 否则光标浏览会误改配置', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(RulesView, p);
+    screen.getAllByRole('button', { name: /移动/ })[1].focus();
+    await u.keyboard('{ArrowDown}');
+    await u.keyboard('{ArrowUp}');
+    expect(p.onreorder).not.toHaveBeenCalled();
+  });
+
+  it('首项再上移不触发排序，也不静默', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    const { container } = render(RulesView, p);
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    expect(p.onreorder).not.toHaveBeenCalled();
+    // 到头了要说一声，否则用户以为按键没生效会继续猛按
+    expect(container.querySelector('[aria-live="polite"][role="status"]').textContent).toMatch(
+      /已在最前/,
+    );
+  });
+
+  it('末项再下移不触发排序', async () => {
+    const u = userEvent.setup();
+    const p = base();
+    render(RulesView, p);
+    screen.getAllByRole('button', { name: /移动/ }).at(-1).focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    expect(p.onreorder).not.toHaveBeenCalled();
+  });
+
+  it('拖拽把手对键盘可达', () => {
+    render(RulesView, base());
+    const handles = screen.getAllByRole('button', { name: /移动|拖拽/ });
+    expect(handles).toHaveLength(rules.length);
+    for (const h of handles) expect(h.tabIndex).toBeGreaterThanOrEqual(0);
+  });
+
+  it('把手的可访问名字里带当前位置与操作方法', () => {
+    // 键盘用户看不到「第几行」这个视觉信息，名字里不带就无从判断移到哪了
+    render(RulesView, base());
+    const h = screen.getAllByRole('button', { name: /移动/ })[0];
+    const name = h.getAttribute('aria-label');
+    expect(name).toMatch(/第 1 条/);
+    expect(name).toMatch(/共 5 条/);
+    expect(name).toMatch(/Alt/);
+  });
+
+  it('排序后播报新位置 —— 键盘路径没有拖拽的视觉反馈', async () => {
+    const u = userEvent.setup();
+    const { container } = render(RulesView, base());
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    const live = container.querySelector('[aria-live="polite"][role="status"]');
+    expect(live).toBeTruthy();
+    expect(live.textContent).toMatch(/第 2 条/);
+    expect(live.textContent).toMatch(/共 5 条/);
+  });
+
+  it('播报区对屏幕阅读器可见、对眼睛不可见', () => {
+    const { container } = render(RulesView, base());
+    const live = container.querySelector('[aria-live="polite"][role="status"]');
+    expect(live.className).toMatch(/sr-only/);
+  });
+
+  it('规则引用不存在的出站时标红（spec §12）', () => {
+    const bad = [
+      { id: 9, type: 'domain', value: 'x.com', target: 'GHOST', hits: 0, enabled: true, unknownOutbound: true },
+    ];
+    const { container } = render(RulesView, { ...base(), rules: bad });
+    expect(container.querySelector('tbody tr').className).toMatch(/invalid/);
+  });
+
+  it('无规则时给空状态引导，不渲染空表', () => {
+    render(RulesView, { ...base(), rules: [] });
+    expect(screen.queryByRole('table')).toBeNull();
+    // 标题与动作按钮都要在：只有标题等于说了「没有」却没说「怎么办」
+    expect(screen.getByText(/还没有规则/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /添加/ })).toBeInTheDocument();
+  });
+
+  it('空规则集不编造任何示例规则', () => {
+    const { container } = render(RulesView, { ...base(), rules: [] });
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(0);
+    expect(container.textContent).not.toMatch(/DOMAIN-SUFFIX|GEOSITE,/);
+  });
+});
+
+describe('写回失败：绝不静默，绝不假装成功', () => {
+  const err = (kind, message) => ({ ...base(), saveError: { kind, message } });
+
+  it('config_save 被拒时明说「顺序未保存」', () => {
+    render(RulesView, err('io', '写入 config.yaml 失败：磁盘已满'));
+    expect(screen.getByText(/顺序未保存/)).toBeInTheDocument();
+    expect(screen.getByText(/磁盘已满/)).toBeInTheDocument();
+  });
+
+  it('用 role=alert 而非 polite —— 顺序没落盘要立刻打断', () => {
+    const { container } = render(RulesView, err('io', '写入失败'));
+    expect(container.querySelector('[role="alert"]')).toBeTruthy();
+  });
+
+  it('说清文件里仍是旧顺序，且分流按文件走', () => {
+    render(RulesView, err('io', '写入失败'));
+    expect(screen.getByText(/文件里的顺序仍是改动前的那一份/)).toBeInTheDocument();
+  });
+
+  it('行号陈旧（config-invalid）时给出可照做的下一步', () => {
+    // config_save 的并发校验：expect 对不上就拒绝，这时候让用户重试没用，
+    // 得先刷新拿到新行号。
+    render(
+      RulesView,
+      err('config-invalid', '第 13 行现在是 "MATCH,DIRECT"，而不是你看到的 "GEOSITE,cn,DIRECT"'),
+    );
+    expect(screen.getByText(/第 13 行现在是/)).toBeInTheDocument();
+    expect(screen.getByText(/刷新后重试/)).toBeInTheDocument();
+  });
+
+  it('未就绪（not-ready）也照实显示，不吞', () => {
+    render(RulesView, err('not-ready', 'set_mode 的落盘与生效 尚未接入（需要把 RuleSet 换成可热替换的）'));
+    expect(screen.getByText(/尚未接入/)).toBeInTheDocument();
+  });
+
+  it('没有 saveError 时不显示任何告示', () => {
+    const { container } = render(RulesView, base());
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it('保存失败不影响列表照常渲染与排序', async () => {
+    const u = userEvent.setup();
+    const p = err('io', '写入失败');
+    render(RulesView, p);
+    expect(screen.getAllByRole('row').slice(1)).toHaveLength(rules.length);
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    expect(p.onreorder).toHaveBeenCalledWith(0, 1);
+  });
+});
+
+describe('探针未就绪时规则视图仍可用', () => {
+  it('rule_test 报 not-ready 不影响列表渲染', () => {
+    render(RulesView, {
+      ...base(),
+      probeError: { kind: 'not-ready', message: 'rule_test 尚未接入（RuleSet 尚未进 managed state）' },
+    });
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getAllByRole('row').slice(1)).toHaveLength(rules.length);
+    expect(screen.getByText(/试算不可用/)).toBeInTheDocument();
+  });
+
+  it('探针未就绪时热度染色照常 —— 两个 signature 互不牵连', () => {
+    const { container } = render(RulesView, {
+      ...base(),
+      probeError: { kind: 'not-ready', message: 'rule_test 尚未接入' },
+    });
+    const rows = [...container.querySelectorAll('tbody tr')];
+    // jsdom 会把 style 属性里的 rgba 规范化成带空格的写法，正则得容忍
+    expect(rows[4].getAttribute('style')).toMatch(/rgba\(255,\s*255,\s*255,\s*0\.05/);
+  });
+});
+
+describe('键盘排序的端到端 —— 列表真的重排之后还得能继续按', () => {
+  // 上面那组用的是 mock 的 onreorder，列表**从不改变**，
+  // 于是「移动之后焦点还在不在」这条路径一次都没被走过。
+  // 而它恰恰是键盘排序最容易断的地方：带 key 的 {#each} 重排走 insertBefore，
+  // 把一个已在文档里的元素 insertBefore 到别处等价于先移除再插入，
+  // 焦点随即落回 <body> —— 第二次按键连接收者都没有。
+  const seed = () => [
+    { id: 1, type: 'geosite', value: 'a', target: 'DIRECT', hits: 5, enabled: true },
+    { id: 2, type: 'suffix', value: 'b', target: 'JP', hits: 3, enabled: true },
+    { id: 3, type: 'keyword', value: 'c', target: 'JP', hits: 1, enabled: true },
+  ];
+
+  /** 一个会真的把新数组传回来的父级，与 App.svelte 的 reorder 同形 */
+  function mountLive() {
+    let rules = seed();
+    const props = {
+      rules,
+      colorOf: () => '#5b8ff9',
+      probe: null,
+      ontest: vi.fn(),
+      ontoggle: vi.fn(),
+      onreorder: (f, t) => {
+        rules = move(rules, f, t);
+      },
+    };
+    const r = render(RulesView, props);
+    return {
+      ...r,
+      order: () => rules.map((x) => x.value),
+      sync: () => r.rerender({ rules }),
+    };
+  }
+
+  it('连按两次 Alt+↓ 能把首条一路移到第三位', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'a', 'c']);
+
+    // 第二次按键：焦点若已丢到 body，这一按就什么都不会发生
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'c', 'a']);
+  });
+
+  it('重排后焦点仍在**同一条规则**的把手上，没被抢到隔壁', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+
+    // 焦点必须还在 id=1（value 'a'）那条上，且它现在是第 2 条。
+    // 按下标找回焦点的实现会在这里把焦点放到 id=2 上 ——
+    // 用户再按一次，改的就是他没打算改的那条规则。
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '1');
+    expect(document.activeElement.getAttribute('aria-label')).toMatch(/第 2 条/);
+  });
+
+  it('Alt+↑ 往回移同样能连按', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[2].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['a', 'c', 'b']);
+
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['c', 'a', 'b']);
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '3');
+  });
+
+  it('撞到边界后焦点不丢，还能改方向继续移', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowUp}{/Alt}'); // 首项上移：到头了
+    await v.sync();
+    expect(v.order()).toEqual(['a', 'b', 'c']);
+    // 到头不该把焦点弄丢，否则用户得重新 Tab 回来
+    expect(document.activeElement).toHaveAttribute('data-rule-id', '1');
+
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(v.order()).toEqual(['b', 'a', 'c']);
+  });
+
+  it('播报的名次跟着每一次移动更新', async () => {
+    const u = userEvent.setup();
+    const v = mountLive();
+    const live = () => v.container.querySelector('[aria-live="polite"][role="status"]').textContent;
+
+    screen.getAllByRole('button', { name: /移动/ })[0].focus();
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(live()).toMatch(/第 2 条/);
+
+    await u.keyboard('{Alt>}{ArrowDown}{/Alt}');
+    await v.sync();
+    expect(live()).toMatch(/第 3 条/);
+    expect(live()).toMatch(/最后/);
+  });
+});
+
+describe('规则的新增/编辑/删除入口', () => {
+  const rules = [
+    { id: 0, line: 10, raw: 'DOMAIN,a.com,日本节点', type: 'domain', value: 'a.com', target: '日本节点', hits: 0, enabled: true },
+  ];
+
+  it('非空列表时工具栏也有添加按钮，不是只有空状态才有', () => {
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', onadd: vi.fn() });
+    expect(screen.getByRole('button', { name: /添加规则/ })).toBeInTheDocument();
+  });
+
+  it('每行都有编辑与删除按钮', () => {
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom' });
+    expect(screen.getByRole('button', { name: /编辑.*a\.com/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /删除.*a\.com/ })).toBeInTheDocument();
+  });
+
+  it('点编辑调用 onedit 并带上这条规则', async () => {
+    const u = userEvent.setup();
+    const onedit = vi.fn();
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', onedit });
+    await u.click(screen.getByRole('button', { name: /编辑.*a\.com/ }));
+    expect(onedit).toHaveBeenCalledWith(rules[0]);
+  });
+
+  it('点删除先要求二次确认，第二次点击才真的调用 ondelete', async () => {
+    const u = userEvent.setup();
+    const ondelete = vi.fn();
+    render(RulesView, { rules, colorOf: () => '#fff', preset: 'custom', ondelete });
+    const del = screen.getByRole('button', { name: /删除.*a\.com/ });
+    await u.click(del);
+    expect(ondelete).not.toHaveBeenCalled();
+    await u.click(screen.getByRole('button', { name: /确认删除/ }));
+    expect(ondelete).toHaveBeenCalledWith(rules[0]);
+  });
+
+  it('china/direct/global 预设下不显示添加按钮——那三条不是可编辑内容', () => {
+    render(RulesView, { rules: [], colorOf: () => '#fff', preset: 'china', globalOutbound: '日本节点' });
+    expect(screen.queryByRole('button', { name: /添加规则/ })).not.toBeInTheDocument();
+  });
+
+  it('config reload 换了新数组后，二次确认态不跟着挪到新占位的规则头上', async () => {
+    // id 是位置索引，reload 后同一个 id 可能落到另一条规则上。
+    // 对第 0 条点「删除」进入确认态，之后 loadConfig() 换了一份新数组——
+    // 哪怕新数组里 id=0 的位置换了条完全不同的规则，也不该顶着
+    // 「确认删除/取消」，得先回到普通的「编辑/删除」。
+    const u = userEvent.setup();
+    const twoRules = [
+      { id: 0, line: 10, raw: 'DOMAIN,a.com,日本节点', type: 'domain', value: 'a.com', target: '日本节点', hits: 0, enabled: true },
+      { id: 1, line: 20, raw: 'DOMAIN,b.com,日本节点', type: 'domain', value: 'b.com', target: '日本节点', hits: 0, enabled: true },
+    ];
+    const { rerender } = render(RulesView, { rules: twoRules, colorOf: () => '#fff', preset: 'custom' });
+
+    await u.click(screen.getByRole('button', { name: /删除.*a\.com/ }));
+    expect(screen.getByRole('button', { name: /确认删除/ })).toBeInTheDocument();
+
+    // 模拟 loadConfig() 重新 map 出的新数组：id=0 现在是条完全不同的规则
+    const reloaded = [
+      { id: 0, line: 10, raw: 'DOMAIN,c.com,日本节点', type: 'domain', value: 'c.com', target: '日本节点', hits: 0, enabled: true },
+      { id: 1, line: 20, raw: 'DOMAIN,b.com,日本节点', type: 'domain', value: 'b.com', target: '日本节点', hits: 0, enabled: true },
+    ];
+    await rerender({ rules: reloaded, colorOf: () => '#fff', preset: 'custom' });
+
+    expect(screen.queryByRole('button', { name: /确认删除/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /删除.*c\.com/ })).toBeInTheDocument();
+  });
+});
+
+describe('内置分流预设选择器', () => {
+  const withPreset = (preset, extra = {}) => ({ ...base(), preset, onpresetchange: vi.fn(), ...extra });
+
+  it('渲染四个预设选项，且当前值被选中', () => {
+    render(RulesView, withPreset('custom'));
+    const group = screen.getByRole('radiogroup', { name: /分流预设/ });
+    const options = within(group).getAllByRole('radio');
+    expect(options.map((o) => o.textContent)).toEqual(['全局直连', '全局代理', '中国大陆', '规则']);
+    expect(within(group).getByRole('radio', { name: '规则' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('点选另一个预设触发 onpresetchange，带上目标值', async () => {
+    const u = userEvent.setup();
+    const p = withPreset('custom');
+    render(RulesView, p);
+    await u.click(screen.getByRole('radio', { name: '中国大陆' }));
+    expect(p.onpresetchange).toHaveBeenCalledWith('china');
+  });
+
+  it('全局直连：不渲染规则表，给出静态说明', () => {
+    const { container } = render(RulesView, withPreset('direct'));
+    expect(screen.queryByRole('table')).toBeNull();
+    const note = container.querySelector('.preset-note');
+    expect(note.textContent).toMatch(/全局直连/);
+    expect(note.textContent).toMatch(/不咨询下面的规则/);
+  });
+
+  it('全局代理：未设置全局出站时如实提示，而不是假装有一个', () => {
+    render(RulesView, withPreset('global', { globalOutbound: '' }));
+    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.getByText(/尚未在设置里指定全局出站/)).toBeInTheDocument();
+  });
+
+  it('全局代理：已设置全局出站时点名是哪一个', () => {
+    render(RulesView, withPreset('global', { globalOutbound: '日本节点' }));
+    expect(screen.getByText('日本节点')).toBeInTheDocument();
+  });
+
+  it('中国大陆：渲染三行内置只读规则，不是文件自带的那份', () => {
+    const { container } = render(RulesView, withPreset('china'));
+    const rows = container.querySelectorAll('tbody tr');
+    expect(rows).toHaveLength(3);
+    expect(container.textContent).toMatch(/geosite/);
+    expect(container.textContent).toMatch(/geoip/);
+    expect(container.textContent).toMatch(/cn/);
+    // 完全无视 rules prop 里的内容——那是「规则」预设专属的数据源
+    expect(container.textContent).not.toMatch(/category-ads/);
+  });
+
+  it('中国大陆：只读，没有拖拽把手也没有启用开关', () => {
+    render(RulesView, withPreset('china'));
+    expect(screen.queryAllByRole('button', { name: /移动|拖拽/ })).toHaveLength(0);
+    expect(screen.queryAllByRole('switch')).toHaveLength(0);
+  });
+
+  it('中国大陆：MATCH 行的目标出站取自 global-outbound', () => {
+    render(RulesView, withPreset('china', { globalOutbound: '香港节点' }));
+    expect(screen.getByText('香港节点')).toBeInTheDocument();
+  });
+
+  it('规则（默认预设）：行为与不传 preset 时完全一致', () => {
+    // custom 是默认值，这条只是显式核对一遍，不重复上面已经覆盖过的全部断言
+    render(RulesView, withPreset('custom'));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(screen.getAllByRole('switch')).toHaveLength(rules.length);
+  });
+});

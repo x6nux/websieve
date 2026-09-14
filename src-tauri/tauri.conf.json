@@ -3,7 +3,12 @@
   "productName": "websieve",
   "version": "0.1.0",
   "identifier": "org.websieve.app",
-  "build": {},
+  "build": {
+    "beforeDevCommand": "npm --prefix ../ui run dev",
+    "beforeBuildCommand": "npm --prefix ../ui run build",
+    "devUrl": "http://localhost:5174",
+    "frontendDist": "../ui/dist"
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [],
@@ -12,6 +17,9 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    }
   }
 }

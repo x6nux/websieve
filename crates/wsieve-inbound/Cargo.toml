@@ -1,0 +1,17 @@
+[package]
+name = "wsieve-inbound"
+version = "0.1.0"
+edition = "2021"
+description = "混合入口：同一端口上嗅探 SOCKS5 与 HTTP"
+
+[dependencies]
+wsieve-proto = { path = "../wsieve-proto" }
+wsieve-socks5 = { path = "../wsieve-socks5" }
+tokio = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

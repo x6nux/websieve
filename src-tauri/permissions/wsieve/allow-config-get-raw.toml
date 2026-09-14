@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-config-get-raw"
+description = "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。"
+commands.allow = ["config_get_raw"]

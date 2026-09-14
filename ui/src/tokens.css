@@ -1,0 +1,226 @@
+/* websieve 设计 token —— 设计文档 §11.4 的逐条落地。
+ *
+ * 阶段 5 的全部视图只许引用这里的变量，不许现场写 #xxxxxx 或 12px。
+ * 理由是 §11.4 的「颜色纪律」：约 90% 屏幕为中性结构色，彩色只出现在
+ * 出站色码与状态色上。这条纪律靠人自觉守不住，靠「能取到的只有这些」守得住。
+ */
+
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+:root {
+  /* ── 表面：单一色相只移明度，每级 4–7% ───────────────── */
+  --surface-0: #16181b; /* 画布 */
+  --surface-1: #1c1f23; /* 行/面板 */
+  --surface-2: #23272c; /* 悬浮/选中 */
+
+  /* ── 边框：borders-only 深度策略，不混用阴影（浮层除外）── */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  /* ── 文本四级 ─────────────────────────────────────── */
+  --text-1: #e6e8ea; /* 主要 */
+  --text-2: #a4abb3; /* 次要 */
+  --text-3: #6f777f; /* 弱化 */
+  --text-4: #4d545b; /* 极弱（占位、禁用） */
+
+  /* ── 状态色 ───────────────────────────────────────── */
+  --state-live: #3fb27f;
+  --state-warn: #d99a3f;
+  --state-fail: #d1595c;
+  --state-direct: #7d8894;
+
+  /* ── 出站色码：界面中唯一允许的彩色 ───────────────── */
+  --outbound-1: #5b8ff9;
+  --outbound-2: #61ddaa;
+  --outbound-3: #f6bd16;
+  --outbound-4: #7262fd;
+  --outbound-5: #78d3f8;
+  --outbound-6: #f6903d;
+  --outbound-7: #008685;
+  --outbound-8: #f08bb4;
+
+  /* ── 命中热度染色（§11.5 signature ①）───────────────
+   * 用中性色而非出站色，避免与出站色码语义冲突。
+   * 阶段 5 按命中数归一化后在 min..max 之间插值。 */
+  --heat-min: rgba(255, 255, 255, 0.014);
+  --heat-max: rgba(255, 255, 255, 0.052);
+
+  /* ── 字体：IBM Plex，不用 Inter ─────────────────────
+   * 理由见 §11.4：Plex 有 IBM 技术文档的工程血统，同族搭配气质统一。 */
+  --font-sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, system-ui,
+    sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* ── 字阶：1.25 / 14px base。层级靠字重+颜色，不靠字号 ── */
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+  --fs-22: 22px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+
+  /* ── 间距：基数 4px ───────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ── 密度：§11.4 钉死的行高 ───────────────────────── */
+  --row-rule: 32px; /* 规则行 */
+  --row-outbound: 38px; /* 出站行 */
+
+  /* ── 浮层是 borders-only 的唯一例外 ─────────────────── */
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --radius: 4px;
+}
+
+/* ── 主题：浅色档，仅覆盖与明暗相关的变量 ─────────────────
+ * 出站色码与状态色两个主题共用 :root 里的原值，不在这里重复定义——
+ * 它们是高饱和点缀色，深浅背景下都压得住，重新设计是无意义的重复劳动。 */
+:root[data-theme='light'] {
+  --surface-0: #f4f5f6; /* 画布 */
+  --surface-1: #ffffff; /* 行/面板 */
+  --surface-2: #e8eaec; /* 悬浮/选中 */
+
+  --border: rgba(0, 0, 0, 0.08);
+  --border-strong: rgba(0, 0, 0, 0.15);
+
+  --text-1: #1b1d1f; /* 主要 */
+  --text-2: #565d64; /* 次要 */
+  --text-3: #868d94; /* 弱化 */
+  --text-4: #aeb4ba; /* 极弱（占位、禁用） */
+
+  --heat-min: rgba(0, 0, 0, 0.02);
+  --heat-max: rgba(0, 0, 0, 0.07);
+
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+/* 深色档显式声明（与上面 :root 的默认值一致）——不只靠「没有 data-theme
+ * 属性」这个隐含状态代表深色，三态里的两态都要有据可查，也方便测试直接
+ * 断言这个选择器存在。 */
+:root[data-theme='dark'] {
+  --surface-0: #16181b;
+  --surface-1: #1c1f23;
+  --surface-2: #23272c;
+
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.13);
+
+  --text-1: #e6e8ea;
+  --text-2: #a4abb3;
+  --text-3: #6f777f;
+  --text-4: #4d545b;
+
+  --heat-min: rgba(255, 255, 255, 0.014);
+  --heat-max: rgba(255, 255, 255, 0.052);
+
+  --shadow-overlay: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--surface-0);
+  color: var(--text-1);
+  font-family: var(--font-sans);
+  font-size: var(--fs-14);
+  font-weight: var(--fw-regular);
+  line-height: 1.45;
+  /* 密集界面里默认的字距过松 */
+  letter-spacing: -0.006em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 数字必须能对齐成列（§11.4：延迟与会话数用 tabular-nums 对齐） */
+.mono,
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 键盘可达性：桑基图的无障碍评级已经是 C（§11.6），
+ * 焦点环这种白送的东西不能再丢。 */
+:focus-visible {
+  outline: 2px solid var(--outbound-1);
+  outline-offset: 1px;
+}
+
+/* 屏幕阅读器可读、视觉上不可见。
+ * 桑基图这类结构性流图的无障碍评级只有 C（§11.6）—— 形状与颜色传达的
+ * 信息，屏幕阅读器一点也拿不到。表视图的 <caption>、图的文字摘要、
+ * 各处只给辅助技术看的 <th> 标签都要靠它，属于无障碍硬要求而非样式偏好。
+ *
+ * 用 clip-path 而非 clip：后者已废弃，且在 WebKit 下与 position:absolute
+ * 的组合有历史包袱。width/height 保留 1px 而不是 0 —— 0 尺寸元素会被部分
+ * 屏幕阅读器当作不可见而跳过，那就白写了。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* §11.6 明确要求：reduced-motion 下流带宽度直接跳变 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── 滚动条：跟随主题，不用系统默认 ───────────────────────
+ * 两套写法都留着：`scrollbar-color`/`scrollbar-width` 是标准 CSS
+ * Scrollbars 规范，现代 Chromium（本项目 Windows 上 WebView2 的内核）已
+ * 支持；`::-webkit-scrollbar-*` 是更早期就有、覆盖面更广的写法。两者不
+ * 冲突，同时写上比只赌一边更稳。颜色用既有的 --border-strong/--text-3
+ * ——滚动条本质是一条更粗的边框，跟着边框/弱化文字色走，两个主题下都已经
+ * 有正确的明暗值，不需要再造一套「滚动条专用」token。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}

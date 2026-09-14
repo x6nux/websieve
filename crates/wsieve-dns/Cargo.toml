@@ -1,0 +1,21 @@
+[package]
+name = "wsieve-dns"
+version = "0.1.0"
+edition = "2021"
+description = "内部 DNS 解析器：服务于路由判决，含 bootstrap 隔离与硬超时"
+
+[dependencies]
+wsieve-proto = { path = "../wsieve-proto" }
+wsieve-geo = { path = "../wsieve-geo" }
+wsieve-route = { path = "../wsieve-route" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = "0.1"
+hickory-resolver = { version = "0.26", default-features = false, features = [
+    "tokio",
+    "system-config",
+    "https-ring",
+    "webpki-roots",
+] }
+
+[dev-dependencies]

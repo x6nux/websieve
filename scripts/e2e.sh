@@ -108,6 +108,20 @@ if [ "${1:-}" = "--with-app" ]; then
       "http://127.0.0.1:$HTTP_PORT/test.txt" || true)
     [ "$B2" = "e2e-acceptance-body-v1" ] && break
   done
+  # 阶段 4：控制窗口共存断言。
+  # 命题是「控制窗口的存在不破坏传输」—— 两个窗口共享事件循环与
+  # WKWebsiteDataStore，控制窗口的 JS 阻塞主线程就会拖死传输的 fetch。
+  #
+  # 上面的 B2 已经证明隧道通了；这里再取一次，确认控制窗口完成加载与
+  # 首次 IPC 之后隧道**仍然**通（而不是只在控制窗口 JS 跑起来之前通）。
+  sleep 3
+  B3=$(curl -s --max-time 8 --socks5-hostname 127.0.0.1:11081 \
+    "http://127.0.0.1:$HTTP_PORT/test.txt" || true)
+  [ "$B3" = "e2e-acceptance-body-v1" ] || {
+    tail -40 "$WORK/app.log"
+    fail "控制窗口起来之后隧道断了 —— 双窗口互相干扰"
+  }
+  echo "PASS: 双窗口共存，控制窗口不影响传输"
   kill $APP_PID 2>/dev/null || true
   [ "$B2" = "e2e-acceptance-body-v1" ] || { tail -30 "$WORK/app.log"; fail "app-mode proxy failed"; }
   echo "PASS: real Tauri app tunnel verified"

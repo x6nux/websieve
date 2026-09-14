@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-outbound-enable"
+description = "允许控制窗口启停单个出站"
+commands.allow = ["outbound_enable"]

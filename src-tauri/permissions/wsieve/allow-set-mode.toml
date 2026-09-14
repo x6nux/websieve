@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-set-mode"
+description = "允许控制窗口切换分流模式（rule / global / direct）"
+commands.allow = ["set_mode"]

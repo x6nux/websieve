@@ -183,6 +183,108 @@
           "markdownDescription": "emitter IPC: heartbeat + raw frame channels (app commands)\n#### This default permission set includes:\n\n- `allow-wsieve-heartbeat`\n- `allow-wsieve-raw-post`\n- `allow-wsieve-raw-stream`"
         },
         {
+          "description": "允许控制窗口退出应用。走 app.exit(0) 以确保 RunEvent::Exit 到达 —— hosts 摘除、系统代理恢复、命中计数落盘都挂在那里。",
+          "type": "string",
+          "const": "allow-app-quit",
+          "markdownDescription": "允许控制窗口退出应用。走 app.exit(0) 以确保 RunEvent::Exit 到达 —— hosts 摘除、系统代理恢复、命中计数落盘都挂在那里。"
+        },
+        {
+          "description": "允许控制窗口按名字删除一个出站服务器块。删除一个不存在的名字会被拒绝而不是静默无操作。",
+          "type": "string",
+          "const": "allow-config-delete-proxy",
+          "markdownDescription": "允许控制窗口按名字删除一个出站服务器块。删除一个不存在的名字会被拒绝而不是静默无操作。"
+        },
+        {
+          "description": "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。",
+          "type": "string",
+          "const": "allow-config-get",
+          "markdownDescription": "允许控制窗口读取结构化配置。client-priv 已脱敏为 \"***\"，明文私钥不经这条命令流出（要原文请走 allow-config-get-raw）。"
+        },
+        {
+          "description": "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。",
+          "type": "string",
+          "const": "allow-config-get-raw",
+          "markdownDescription": "允许控制窗口读取配置原文，**含明文 client-priv 私钥**。绝不可授予 transport capability —— 那个窗口加载的是远端服务器的页面，服务器被攻破即等同于私钥被拿走。"
+        },
+        {
+          "description": "允许控制窗口新增一个出站服务器块（结构化，UI 表单驱动）。名字与已有出站/代理组冲突时拒绝，写入前完整校验。",
+          "type": "string",
+          "const": "allow-config-insert-proxy",
+          "markdownDescription": "允许控制窗口新增一个出站服务器块（结构化，UI 表单驱动）。名字与已有出站/代理组冲突时拒绝，写入前完整校验。"
+        },
+        {
+          "description": "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）",
+          "type": "string",
+          "const": "allow-config-save",
+          "markdownDescription": "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）"
+        },
+        {
+          "description": "允许控制窗口整份覆写配置原文（逃生舱）。写入前会解析并校验，语法或语义不合法一律拒绝。",
+          "type": "string",
+          "const": "allow-config-save-raw",
+          "markdownDescription": "允许控制窗口整份覆写配置原文（逃生舱）。写入前会解析并校验，语法或语义不合法一律拒绝。"
+        },
+        {
+          "description": "允许控制窗口请求建立全部启用的出站连接",
+          "type": "string",
+          "const": "allow-connect",
+          "markdownDescription": "允许控制窗口请求建立全部启用的出站连接"
+        },
+        {
+          "description": "允许控制窗口把自己隐藏到托盘（代理继续运行）",
+          "type": "string",
+          "const": "allow-control-hide",
+          "markdownDescription": "允许控制窗口把自己隐藏到托盘（代理继续运行）"
+        },
+        {
+          "description": "允许控制窗口请求断开全部出站连接",
+          "type": "string",
+          "const": "allow-disconnect",
+          "markdownDescription": "允许控制窗口请求断开全部出站连接"
+        },
+        {
+          "description": "允许控制窗口查询 GEO 数据文件是否就位（只读）",
+          "type": "string",
+          "const": "allow-geo-status",
+          "markdownDescription": "允许控制窗口查询 GEO 数据文件是否就位（只读）"
+        },
+        {
+          "description": "允许控制窗口触发 GEO 数据更新",
+          "type": "string",
+          "const": "allow-geo-update",
+          "markdownDescription": "允许控制窗口触发 GEO 数据更新"
+        },
+        {
+          "description": "允许控制窗口启停单个出站",
+          "type": "string",
+          "const": "allow-outbound-enable",
+          "markdownDescription": "允许控制窗口启停单个出站"
+        },
+        {
+          "description": "允许控制窗口对单个出站做一次延迟探测",
+          "type": "string",
+          "const": "allow-outbound-latency-probe",
+          "markdownDescription": "允许控制窗口对单个出站做一次延迟探测"
+        },
+        {
+          "description": "允许控制窗口运行规则试算探针（只读，不改变任何状态）",
+          "type": "string",
+          "const": "allow-rule-test",
+          "markdownDescription": "允许控制窗口运行规则试算探针（只读，不改变任何状态）"
+        },
+        {
+          "description": "允许控制窗口切换分流模式（rule / global / direct）",
+          "type": "string",
+          "const": "allow-set-mode",
+          "markdownDescription": "允许控制窗口切换分流模式（rule / global / direct）"
+        },
+        {
+          "description": "允许控制窗口取一次流量计数快照（只读，用于刚打开时补齐历史）",
+          "type": "string",
+          "const": "allow-traffic-snapshot",
+          "markdownDescription": "允许控制窗口取一次流量计数快照（只读，用于刚打开时补齐历史）"
+        },
+        {
           "description": "Allows the emitter heartbeat command",
           "type": "string",
           "const": "allow-wsieve-heartbeat",

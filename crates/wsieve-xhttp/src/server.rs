@@ -49,6 +49,14 @@ impl Drop for DownlinkHandle {
 struct Session {
     /// 已连续消费到的下一个 seq
     next_seq: u64,
+    /// 观察到上行 seq 有空洞的次数。
+    ///
+    /// 这是**只有服务端看得见**的信号：客户端只知道自己重试了，分不清是请求
+    /// 没到（空洞）还是响应丢了（去重）。回传给客户端后，它的链路画像才能把
+    /// 「链路真的在丢包」和「服务端应答慢」区分开。
+    gaps: u32,
+    /// 收到重复 seq 的次数 —— 请求到了两次，说明丢的是**响应**不是请求。
+    dups: u32,
     /// 重组堆：seq -> body（BTreeMap 天然排序）
     heap: BTreeMap<u64, Bytes>,
     /// 下行是否已挂载
@@ -114,6 +122,8 @@ impl SessionStore {
             sid,
             Session {
                 next_seq: 1, // n=0 是握手 POST，数据 seq 从 1 起（spec §6.4）
+                gaps: 0,
+                dups: 0,
                 heap: BTreeMap::new(),
                 attached: false,
                 last_upstream_at: Instant::now(),
@@ -131,6 +141,7 @@ impl SessionStore {
 
         // 去重：seq < next_seq（已消费）或已在 heap → 丢弃，仍 Ok
         if seq < session.next_seq || session.heap.contains_key(&seq) {
+            session.dups = session.dups.saturating_add(1);
             return Ok(());
         }
 
@@ -147,6 +158,9 @@ impl SessionStore {
             .next()
             .map(|k| *k != session.next_seq)
             .unwrap_or(false);
+        if has_hole {
+            session.gaps = session.gaps.saturating_add(1);
+        }
         if has_hole && session.heap.len() > MAX_BUFFERED_POSTS {
             let dead = inner.sessions.remove(sid).unwrap();
             dead.notify.notify_one();
@@ -156,6 +170,19 @@ impl SessionStore {
         // 唤醒本会话的读任务（精准唤醒，见 Session::notify 注释）
         session.notify.notify_one();
         Ok(())
+    }
+
+    /// 本会话至今观察到的 (空洞次数, 重复次数)。
+    ///
+    /// 供 HTTP 层放进 `Server-Timing` 回传给客户端。会话不存在时返回零而不是
+    /// 报错：这是观测数据，取不到就当没有，不该让它影响数据面。
+    pub async fn link_observations(&self, sid: &Sid) -> (u32, u32) {
+        let inner = self.inner.lock().await;
+        inner
+            .sessions
+            .get(sid)
+            .map(|s| (s.gaps, s.dups))
+            .unwrap_or((0, 0))
     }
 
     /// 读取数据（阻塞直到有数据或会话死亡）。

@@ -1,0 +1,29 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "control",
+  "description": "控制窗口 control：加载 tauri://localhost 的本地 Svelte 资产。授权配置与控制命令。绝不能有 remote 字段——一旦有，远端页面就能借这个 capability 读到含 client-priv 私钥的配置（allow-config-get-raw 返回的正是明文原文）。这 18 条与 transport.json 的三条交集必须为空，由 tests/capability_isolation.rs 守住。",
+  "windows": [
+    "control"
+  ],
+  "permissions": [
+    "core:default",
+    "allow-config-get",
+    "allow-config-save",
+    "allow-config-get-raw",
+    "allow-config-save-raw",
+    "allow-config-insert-proxy",
+    "allow-config-delete-proxy",
+    "allow-connect",
+    "allow-disconnect",
+    "allow-set-mode",
+    "allow-outbound-enable",
+    "allow-outbound-latency-probe",
+    "allow-rule-test",
+    "allow-geo-update",
+    "allow-geo-status",
+    "allow-traffic-snapshot",
+    "allow-control-hide",
+    "allow-app-quit"
+  ],
+  "local": true
+}

@@ -10,7 +10,7 @@ use futures::stream::BoxStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use wsieve_proto::crypto::{build_server, gen_keypair};
-use wsieve_proto::hello::{encode_msg2, Msg2, MuxId};
+use wsieve_proto::hello::{IpStrategy, encode_msg2, Msg2, MuxId};
 use wsieve_proto::tu::{Frame, MAX_PAYLOAD};
 use wsieve_transport::{HttpTransport, PostReply};
 use wsieve_xhttp::client::{UpstreamCfg, XhttpConn};
@@ -100,7 +100,7 @@ impl HttpTransport for FakeTransport {
             server.read_message(&msg1_cipher, &mut buf)?;
 
             let msg2 = encode_msg2(&Msg2 {
-                chosen_mux_id: MuxId::Yamux,
+                chosen_mux_id: MuxId::Wsmux,
                 fallback: false,
             });
             let mut out = vec![0u8; 65535];
@@ -111,8 +111,7 @@ impl HttpTransport for FakeTransport {
             reply.extend_from_slice(&out[..n]);
             Ok(PostReply {
                 status: 200,
-                body: Bytes::from(reply),
-            })
+                body: Bytes::from(reply), peer: None })
         } else {
             // 脚本化失败：fail_first 计数
             let prev = self
@@ -130,12 +129,11 @@ impl HttpTransport for FakeTransport {
             // 状态码覆盖
             let guard = self.n_ge1_status.lock().unwrap();
             if let Some((status, body)) = guard.clone() {
-                return Ok(PostReply { status, body });
+                return Ok(PostReply { status, body, peer: None });
             }
             Ok(PostReply {
                 status: 204,
-                body: Bytes::new(),
-            })
+                body: Bytes::new(), peer: None })
         }
     }
 
@@ -170,8 +168,10 @@ async fn make_pair(
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: Default::default(),
     };
     let (conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
     (t, conn)
@@ -213,8 +213,7 @@ async fn handshake_garbage_reply_kills() {
         async fn post(&self, _p: &str, _b: Bytes) -> anyhow::Result<PostReply> {
             Ok(PostReply {
                 status: 404,
-                body: Bytes::from("not found"),
-            })
+                body: Bytes::from("not found"), peer: None })
         }
         async fn get_stream(
             &self,
@@ -229,8 +228,10 @@ async fn handshake_garbage_reply_kills() {
         &UpstreamCfg {
             server_pub,
             client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await;
@@ -289,7 +290,7 @@ async fn write_frames_become_tus() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -300,14 +301,12 @@ async fn write_frames_become_tus() {
                 *self.server_state.lock().await = Some(server.into_transport_mode()?);
                 return Ok(PostReply {
                     status: 200,
-                    body: Bytes::from(reply),
-                });
+                    body: Bytes::from(reply), peer: None });
             }
             self.posts.lock().unwrap().push((path.to_string(), body));
             Ok(PostReply {
                 status: 204,
-                body: Bytes::new(),
-            })
+                body: Bytes::new(), peer: None })
         }
         async fn get_stream(
             &self,
@@ -327,8 +326,10 @@ async fn write_frames_become_tus() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: Default::default(),
     };
     let (mut conn, _neg) = XhttpConn::connect(rt.clone(), &cfg).await.unwrap();
 
@@ -391,7 +392,7 @@ async fn window_capped_at_8() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -401,8 +402,7 @@ async fn window_capped_at_8() {
                 reply.extend_from_slice(&out[..n]);
                 return Ok(PostReply {
                     status: 200,
-                    body: Bytes::from(reply),
-                });
+                    body: Bytes::from(reply), peer: None });
             }
             let cur = self.outstanding.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_outstanding.fetch_max(cur, Ordering::SeqCst);
@@ -414,8 +414,7 @@ async fn window_capped_at_8() {
             self.outstanding.fetch_sub(1, Ordering::SeqCst);
             Ok(PostReply {
                 status: 204,
-                body: Bytes::new(),
-            })
+                body: Bytes::new(), peer: None })
         }
         async fn get_stream(
             &self,
@@ -437,8 +436,10 @@ async fn window_capped_at_8() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: Default::default(),
     };
     let (mut conn, _neg) = XhttpConn::connect(st.clone(), &cfg).await.unwrap();
 
@@ -452,9 +453,17 @@ async fn window_capped_at_8() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let max = st.max_outstanding.load(Ordering::SeqCst);
-    assert!(
-        max <= 8,
-        "in-flight window must be capped at 8, got {}",
+    // **断言恰好等于 8，不是 `<= 8`。**
+    //
+    // 原先是 `<= 8`，于是一个 4 的上限照样通过——一个真实缺陷正是从这道缝
+    // 漏过去的：`last_concurrent` 初始为 `None` 时流型曾落到 `Interactive`，
+    // `to_interactive` 把 inflight 减半，每条会话从建立起就跑在一半的上行
+    // 窗口上，而"默认行为与改造前逐字节相同"这条保底原则被无声破掉。
+    //
+    // 上限的两个方向都要守：小了是性能回归，大了是超发。
+    assert_eq!(
+        max, 8,
+        "默认在途窗口应当恰好是 8（小了是被减半的回归，大了是超发），实为 {}",
         max
     );
     assert!(max >= 1, "something must have been sent");
@@ -537,7 +546,7 @@ async fn downlink_frames_flow() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -549,13 +558,11 @@ async fn downlink_frames_flow() {
                 *self.state.lock().await = Some(st);
                 return Ok(PostReply {
                     status: 200,
-                    body: Bytes::from(reply),
-                });
+                    body: Bytes::from(reply), peer: None });
             }
             Ok(PostReply {
                 status: 204,
-                body: Bytes::new(),
-            })
+                body: Bytes::new(), peer: None })
         }
         async fn get_stream(
             &self,
@@ -596,8 +603,10 @@ async fn downlink_frames_flow() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: Default::default(),
     };
     let (mut conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
 
@@ -636,7 +645,7 @@ async fn idle_heartbeat_sends_padding() {
                 let mut buf = vec![0u8; 65535];
                 server.read_message(&msg1, &mut buf)?;
                 let msg2 = encode_msg2(&Msg2 {
-                    chosen_mux_id: MuxId::Yamux,
+                    chosen_mux_id: MuxId::Wsmux,
                     fallback: false,
                 });
                 let mut out = vec![0u8; 65535];
@@ -647,14 +656,12 @@ async fn idle_heartbeat_sends_padding() {
                 *self.server_state.lock().await = Some(server.into_transport_mode()?);
                 return Ok(PostReply {
                     status: 200,
-                    body: Bytes::from(reply),
-                });
+                    body: Bytes::from(reply), peer: None });
             }
             self.posts.lock().unwrap().push((path.to_string(), body));
             Ok(PostReply {
                 status: 204,
-                body: Bytes::new(),
-            })
+                body: Bytes::new(), peer: None })
         }
         async fn get_stream(
             &self,
@@ -674,8 +681,10 @@ async fn idle_heartbeat_sends_padding() {
     let cfg = UpstreamCfg {
         server_pub,
         client_priv,
-        mux_prefs: vec![MuxId::Yamux],
+        mux_prefs: vec![MuxId::Wsmux],
         group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: Default::default(),
     };
     let (conn, _neg) = XhttpConn::connect(ht.clone(), &cfg).await.unwrap();
 
@@ -698,4 +707,56 @@ async fn idle_heartbeat_sends_padding() {
     }
     assert!(saw_padding, "at least one PADDING TU in idle heartbeat");
     drop(conn);
+}
+
+
+/// **自适应的接线检查**：上行 POST 的往返必须真的喂进链路画像。
+///
+/// 这条链路（`send_post` 的 `t0.elapsed()` → `LinkProfile::observe_post` →
+/// 档位 → 形状参数）每一环单独看都对，但只要有一环没接上，整套自适应就是
+/// 个摆设——而且**不会报错**，只表现为"参数永远停在默认档"。`link_profile`
+/// 的单测覆盖的是控制律本身，覆盖不到这根线接没接。
+///
+/// 用 `post_delay` 注入一个已知的往返时间，然后看画像测出来的是不是它。
+#[tokio::test]
+async fn upstream_post_latency_actually_reaches_the_link_profile() {
+    let (server_priv, server_pub) = gen_keypair();
+    let t = Arc::new(FakeTransport::new(server_priv));
+    *t.post_delay.lock().unwrap() = Duration::from_millis(40);
+
+    let (client_priv, _) = gen_keypair();
+    // 自己持有 profile，才能在连接跑起来之后查它。
+    let profile = Arc::new(wsieve_xhttp::link_profile::LinkProfile::new());
+    let cfg = UpstreamCfg {
+        server_pub,
+        client_priv,
+        mux_prefs: vec![MuxId::Wsmux],
+        group_id: wsieve_xhttp::client::random_group_id(),
+        ip_strategy: IpStrategy::Auto,
+        profile: profile.clone(),
+    };
+    let (mut conn, _neg) = XhttpConn::connect(t.clone(), &cfg).await.unwrap();
+
+    conn.write_all(&[7u8; 256]).await.unwrap();
+    // 轮询画像本身而不是 `wait_for_records`：`FakeTransport` 是在 sleep
+    // **之前**录制的，录到不等于这次 POST 已经回来，而 `observe_post` 要等
+    // 它回来才调用。
+    for _ in 0..500 {
+        if profile.bdp().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        profile.bdp().is_some(),
+        "画像没收到任何样本——`send_post` 的 rtt 没接到 `observe_post` 上"
+    );
+    // 注入 40ms，允许调度抖动，但必须落在这个量级而不是零或秒级。
+    let snap = profile.snapshot().expect("有 bdp 就该有快照");
+    assert!(
+        (30_000..200_000).contains(&snap.min_rtt_us),
+        "画像测得 min_rtt={}µs，与注入的 40ms 对不上",
+        snap.min_rtt_us
+    );
 }

@@ -1,0 +1,10 @@
+[package]
+name = "wsieve-geo"
+version = "0.1.0"
+edition = "2021"
+description = "geosite.dat / geoip.dat 解析与匹配（手写 protobuf，零依赖）"
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]

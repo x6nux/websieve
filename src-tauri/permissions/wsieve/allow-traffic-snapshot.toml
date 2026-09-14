@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-traffic-snapshot"
+description = "允许控制窗口取一次流量计数快照（只读，用于刚打开时补齐历史）"
+commands.allow = ["traffic_snapshot"]

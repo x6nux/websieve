@@ -330,7 +330,7 @@ mod tests {
         let (c_priv, _c_pub) = crate::crypto::gen_keypair();
         let mut cli = crate::crypto::build_client(&s_pub, &c_priv).unwrap();
         let mut srv = crate::crypto::build_server(&s_priv).unwrap();
-        let hello = crate::hello::encode_msg1(0, 0, &[]);
+        let hello = crate::hello::encode_msg1(0, 0, &[], crate::hello::IpStrategy::Auto);
         let mut b1 = vec![0u8; 65535];
         let n1 = cli.write_message(&hello, &mut b1).unwrap();
         let mut p1 = vec![0u8; 65535];

@@ -172,10 +172,15 @@ pub fn encode_frame(offset: u64, payload: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(payload);
 }
 
-/// 尝试解码一个完整 DataFrame。返回 `(offset, payload, consumed)`。
+/// 一个解码出来的 DataFrame：`(offset, payload, consumed)`。
+///
+/// `consumed` 是本帧在输入缓冲里占用的字节数，调用方据此推进游标。
+pub type DecodedFrame<'a> = (u64, &'a [u8], usize);
+
+/// 尝试解码一个完整 DataFrame。
 /// 输入不完整 → `Ok(None)`；长度字段超上限 → `FrameTooLarge`。
 /// 注意：调用方需先确认首字节不是 0x02（内联 ConnHeader，见模块注释）。
-pub fn decode_frame(b: &[u8]) -> Result<Option<(u64, &[u8], usize)>, StripeError> {
+pub fn decode_frame(b: &[u8]) -> Result<Option<DecodedFrame<'_>>, StripeError> {
     if b.len() < FRAME_HEADER_LEN {
         return Ok(None);
     }

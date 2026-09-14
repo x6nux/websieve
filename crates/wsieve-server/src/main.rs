@@ -7,7 +7,12 @@
 //!   --deployment direct|cdn-flexible|cdn-full-self-signed   部署模式
 //!   --cert-file/--key-pem-file       direct 模式的 PEM 证书/私钥
 //!   --upstream URL                   伪装反代上游（可选）
-//!   --alt-svc-port N                 广播 Alt-Svc h3（可选）
+//!   --alt-svc-port N                 广播 Alt-Svc h3（可选，手工覆盖）
+//!   --h3 on|off                      本进程是否监听 UDP 提供 h3（默认 on）
+//!                                    off 只关本进程的 UDP 面；若同时显式给了
+//!                                    --alt-svc-port，仍会宣告——那是给 CDN 模式
+//!                                    留的（h3 由 CDN 提供，本进程不监听 UDP）
+//!   --alt-svc-ma N                   Alt-Svc 的 ma 秒数（默认 86400）
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -24,6 +29,14 @@ struct Config {
     deployment: Deployment,
     upstream: Option<String>,
     alt_svc_port: Option<u16>,
+    /// h3 总开关：off 则既不监听 UDP 也不宣告 Alt-Svc。
+    ///
+    /// 存在的理由是降级：跨境链路的 UDP 常被 QoS 限速，此时 h3 连得上但很慢，
+    /// 而 WebKit 只在 QUIC **握手失败**时回落，慢不会触发回落。运维发现这种
+    /// 情况时需要一个能立刻关掉 h3 的开关。
+    h3: bool,
+    /// Alt-Svc 的 ma 秒数。调小可让客户端更快忘掉 h3（代价见 ALT_SVC_MA_DEFAULT）。
+    alt_svc_ma: u32,
 }
 
 fn parse_args() -> Result<Config> {
@@ -41,6 +54,8 @@ fn parse_args() -> Result<Config> {
     let mut key_pem_file = None;
     let mut upstream = None;
     let mut alt_svc_port = None;
+    let mut h3 = true;
+    let mut alt_svc_ma = wsieve_server::ALT_SVC_MA_DEFAULT;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--listen" => listen = Some(get!("--listen")?),
@@ -57,6 +72,17 @@ fn parse_args() -> Result<Config> {
             "--alt-svc-port" => {
                 let v = get!("--alt-svc-port")?;
                 alt_svc_port = Some(v.parse().context("--alt-svc-port 需数字")?);
+            }
+            "--h3" => {
+                h3 = match get!("--h3")?.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => bail!("--h3 需 on|off，实为 {other}"),
+                };
+            }
+            "--alt-svc-ma" => {
+                let v = get!("--alt-svc-ma")?;
+                alt_svc_ma = v.parse().context("--alt-svc-ma 需数字（秒）")?;
             }
             other => bail!("未知参数: {other}"),
         }
@@ -81,6 +107,8 @@ fn parse_args() -> Result<Config> {
         deployment,
         upstream,
         alt_svc_port,
+        h3,
+        alt_svc_ma,
     })
 }
 
@@ -126,13 +154,13 @@ fn load_whitelist(path: &str) -> Result<HashSet<[u8; 32]>> {
 }
 
 fn enabled_mux() -> Vec<MuxId> {
-    // 全家桶启用（含 picomux：矩阵已验证互通）。
+    // 只剩一种 mux：wsmux。
     vec![
-        MuxId::Yamux,
-        MuxId::Smux,
-        MuxId::Muxado,
-        MuxId::Picomux,
-        MuxId::H2mux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
     ]
 }
 
@@ -145,6 +173,47 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
+        // 证书材料只读一次，TCP 与 UDP 两面共用。各读各的会在证书轮换的那
+        // 一瞬间读到两个版本，两个面于是拿着不同证书对外服务——不报错，只在
+        // 客户端零星出现校验失败。
+        let material = wsieve_server::tls::tls_material(&cfg.deployment)?;
+
+        // h3 降级闸门：QUIC 采样任务置位，Router 据此把 Alt-Svc 改成 clear。
+        // 两边共用同一个（内部是 Arc），所以必须在这里建好再分发。
+        let h3_gate = wsieve_server::H3Gate::new();
+
+        // UDP 面**先于 AppState** 绑定：Alt-Svc 要宣告的端口取决于它成不成功，
+        // 而 AppState 构造时就需要那个端口（端口 → AppState → router → 服务
+        // 是一条链）。失败只警告不中止——h3 是叠加能力，TCP 面必须照常服务，
+        // 与 shard_setup 里「条带禁用则退回单会话」同源的纪律。
+        let h3_endpoint = match &material {
+            // --h3 off：既不监听 UDP 也不宣告。运维在发现 h3 质量劣化时用它
+            // 立刻止血——WebKit 只在 QUIC 握手失败时回落，慢不会触发回落。
+            _ if !cfg.h3 => {
+                eprintln!("HTTP/3 已由 --h3 off 关闭");
+                None
+            }
+            Some((certs, key)) => {
+                match wsieve_server::http3::bind_endpoint(
+                    certs.clone(),
+                    key.clone_key(),
+                    cfg.listen,
+                ) {
+                    Ok(ep) => Some(ep),
+                    Err(e) => {
+                        eprintln!("HTTP/3 未启用（{e:#}）——继续以 h1/h2 提供服务");
+                        None
+                    }
+                }
+            }
+            // 明文部署（cdn-flexible）没有证书，QUIC 无从谈起
+            None => None,
+        };
+        let h3_port = h3_endpoint
+            .as_ref()
+            .and_then(|ep| ep.local_addr().ok())
+            .map(|a| a.port());
+
         let state = AppState::with_disguise(
             ServerKeys { priv_key, whitelist },
             enabled_mux(),
@@ -152,10 +221,23 @@ fn main() -> Result<()> {
             SEEN_CACHE_CAPACITY,
             DisguiseCfg {
                 upstream: cfg.upstream,
-                alt_svc_port: cfg.alt_svc_port,
+                // 只在 h3 真的起来了才宣告。宣告一个连不上的 QUIC 端点，会让
+                // 客户端此后每次连接都先试 QUIC 超时再回落，比不宣告更糟。
+                // 命令行的 --alt-svc-port 保留为手工覆盖（CDN 模式下 h3 由
+                // CDN 提供，本进程并不监听 UDP）。
+                alt_svc_port: h3_port.or(cfg.alt_svc_port),
+                alt_svc_ma: cfg.alt_svc_ma,
+                h3_gate: h3_gate.clone(),
             },
         );
-        wsieve_server::tls::serve(&cfg.deployment, cfg.listen, state.router()).await?;
+
+        if let Some(ep) = h3_endpoint {
+            wsieve_server::http3::serve(ep, state.clone().router(), h3_gate);
+            eprintln!("HTTP/3 就绪: udp://{}", cfg.listen);
+        }
+
+        let mode = wsieve_server::tls::mode_from_material(material)?;
+        wsieve_server::tls::serve_mode(mode, cfg.listen, state.router()).await?;
         eprintln!("wsieve-server listening on {} ({:?})", cfg.listen, cfg.deployment);
         tokio::signal::ctrl_c().await.ok();
         anyhow::Ok(())

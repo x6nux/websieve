@@ -65,11 +65,11 @@ async fn start_server() -> TestRig {
             whitelist,
         },
         vec![
-            MuxId::Yamux,
-            MuxId::Smux,
-            MuxId::Muxado,
-            MuxId::Picomux,
-            MuxId::H2mux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
+            MuxId::Wsmux,
         ],
         KeepaliveRange::default(),
         SEEN_CACHE_CAPACITY,
@@ -101,6 +101,8 @@ async fn connect_mux(
             client_priv: rig.client_priv,
             mux_prefs: prefs,
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await
@@ -149,14 +151,14 @@ async fn echo_roundtrip(
 }
 
 /// 服务端会话栈单元化诊断：握手后直接向 SessionStore 推一个手工加密的
-/// yamux 客户端首包，观察 mux factory 是否消费。
+/// 客户端首包，观察 mux factory 是否消费。
 /// 1. 完整握手 + mux 协商 + 开流 + 服务端拨号到本地 echo + 双向数据。
 #[tokio::test]
 async fn full_chain_echo() {
     let rig = start_server().await;
     let echo = echo_server().await;
-    let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
-    assert_eq!(chosen, MuxId::Yamux);
+    let (mux, chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
+    assert_eq!(chosen, MuxId::Wsmux);
     let got = echo_roundtrip(mux, echo, b"ping-over-full-chain").await;
     assert_eq!(got, b"ping-over-full-chain");
 }
@@ -166,11 +168,11 @@ async fn full_chain_echo() {
 async fn all_mux_matrix() {
     // 每种 mux 独立 rig：不同 mux 库的全局/后台任务行为互不干扰
     for id in [
-        MuxId::Yamux,
-        MuxId::Smux,
-        MuxId::Muxado,
-        MuxId::Picomux,
-        MuxId::H2mux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
+        MuxId::Wsmux,
     ] {
         let rig = start_server().await;
         run_one_mux(&rig, id).await;
@@ -191,7 +193,7 @@ async fn run_one_mux(rig: &TestRig, id: MuxId) {
 async fn upstream_64k_integrity() {
     let rig = start_server().await;
     let echo = echo_server().await;
-    let (mux, _chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
+    let (mux, _chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
     let payload: Vec<u8> = (0..80_000u32).map(|i| (i % 253) as u8).collect();
     let got = echo_roundtrip(mux, echo, &payload).await;
     assert_eq!(got.len(), payload.len());
@@ -209,8 +211,10 @@ async fn dead_session_detection() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await
@@ -294,15 +298,17 @@ async fn out_of_order_reorder() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Yamux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await
     .unwrap();
-    assert_eq!(neg.mux_id, MuxId::Yamux);
+    assert_eq!(neg.mux_id, MuxId::Wsmux);
     let io: MuxStream = Box::new(conn);
-    let mux: std::sync::Arc<dyn Mux> = std::sync::Arc::from(mux_factory(MuxId::Yamux, io).await.unwrap());
+    let mux: std::sync::Arc<dyn Mux> = std::sync::Arc::from(mux_factory(MuxId::Wsmux, io).await.unwrap());
 
     // 连续多段写：聚合层会切成多个 POST（seq 递增），奇数延迟后到达序打乱
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i % 249) as u8).collect();
@@ -334,7 +340,8 @@ async fn probing_equivalence() {
             .unwrap()
             .as_millis() as u64,
         wsieve_xhttp::client::random_group_id(),
-        &[MuxId::Yamux],
+        &[MuxId::Wsmux],
+        wsieve_proto::hello::IpStrategy::Auto,
     );
     let mut buf = vec![0u8; 65535];
     let n = client.write_message(&hello, &mut buf).unwrap();
@@ -398,8 +405,8 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
     // notify_one 被无关会话读者抢走、目标会话永久沉睡的窗口。
     let mut sessions = Vec::new();
     for _ in 0..N {
-        let (mux, chosen) = connect_mux(&rig, vec![MuxId::Yamux]).await;
-        assert_eq!(chosen, MuxId::Yamux);
+        let (mux, chosen) = connect_mux(&rig, vec![MuxId::Wsmux]).await;
+        assert_eq!(chosen, MuxId::Wsmux);
         sessions.push(mux);
     }
     // 等待所有服务端读任务挂起（attach 完成、无数据可读）
@@ -428,25 +435,26 @@ async fn concurrent_sessions_do_not_lose_wakeups() {
     }
 }
 
-/// CORS 头只出现在**认证成功**的响应上，且只对同域名的 Origin。
+/// CORS 头只出现在**认证成功**的响应上 —— 判据是「认证与否」，不是「同不同域」。
 ///
-/// 多端口条带（客户端 hosts 劫持 + 本地转发）会让各会话落在同域名的不同端口，
-/// 于是 fetch 变成跨源，需要 CORS 头才能被 JS 读取。但 CORS 头出现在 nginx
-/// 默认页上本身就是可探测特征，所以：未认证请求走伪装路径、绝不带头；
-/// 非同域 Origin 也绝不带头。
+/// 两种场景都需要跨源 fetch：多端口条带（同域名不同端口）与单 WebView 承载
+/// 多出站（彻底不同域名，设计文档 §9.1）。服务端无从预知客户端把哪台机器当
+/// 宿主，故 Origin 一律回显。真正的防线是「未认证请求走伪装路径、绝不带头」：
+/// CORS 头出现在 nginx 默认页上本身就是可探测特征，而探测者发不出合法 msg1
+/// 就永远看不到任何 CORS 痕迹。
 #[tokio::test]
-async fn cors_headers_only_on_authenticated_same_domain_responses() {
+async fn cors_headers_only_on_authenticated_responses() {
     let rig = start_server().await;
     let c = reqwest::Client::new();
     let base = format!("http://{}", rig.addr);
     let host = rig.addr.to_string();
-    // Origin 与 Host 同域名、端口不同 —— 正是条带产生的形态
-    let same_domain_origin = format!("http://{}:19999", rig.addr.ip());
+    // 彻底不同域名的 Origin —— 单 WebView 承载多出站产生的正是这种形态
+    let cross_domain_origin = "https://wsieve-host-a.example".to_string();
 
     // 1) 未认证的协议路径 → 走伪装，绝不带 CORS 头
     let r = c
         .post(format!("{base}/api/sync?n=7&sid=AAAAAAAAAAAAAAAAAAAAAA"))
-        .header("Origin", &same_domain_origin)
+        .header("Origin", &cross_domain_origin)
         .header("Host", &host)
         .body("garbage")
         .send()
@@ -460,7 +468,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     // 2) 完全无关的路径（纯伪装页）→ 同样不带
     let r = c
         .get(format!("{base}/"))
-        .header("Origin", &same_domain_origin)
+        .header("Origin", &cross_domain_origin)
         .header("Host", &host)
         .send()
         .await
@@ -472,7 +480,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     let transport = std::sync::Arc::new(CorsProbeTransport {
         client: c.clone(),
         base: base.clone(),
-        origin: same_domain_origin.clone(),
+        origin: cross_domain_origin.clone(),
         host: host.clone(),
         seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     });
@@ -482,8 +490,10 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
         &UpstreamCfg {
             server_pub: rig.server_pub,
             client_priv: rig.client_priv,
-            mux_prefs: vec![MuxId::Smux],
+            mux_prefs: vec![MuxId::Wsmux],
             group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
         },
     )
     .await
@@ -492,7 +502,7 @@ async fn cors_headers_only_on_authenticated_same_domain_responses() {
     let handshake_hdrs = recorded.first().expect("应记录到握手响应头");
     assert_eq!(
         handshake_hdrs.0.as_deref(),
-        Some(same_domain_origin.as_str()),
+        Some(cross_domain_origin.as_str()),
         "认证成功的响应应回显具体 Origin"
     );
     assert_eq!(handshake_hdrs.1.as_deref(), Some("true"), "应允许携带凭据");
@@ -504,8 +514,13 @@ struct CorsProbeTransport {
     base: String,
     origin: String,
     host: String,
-    /// (allow-origin, allow-credentials)
-    seen: std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+    /// (allow-origin, allow-credentials, expose-headers, server-timing)
+    ///
+    /// 后两项是自适应流控的回传通道所需：`server-timing` 是载荷，
+    /// `expose-headers` 是跨域 JS 能否读到它的前提。两者缺一，通道就静默失效。
+    seen: std::sync::Arc<
+        std::sync::Mutex<Vec<(Option<String>, Option<String>, Option<String>, Option<String>)>>,
+    >,
 }
 
 #[async_trait::async_trait]
@@ -529,9 +544,11 @@ impl HttpTransport for CorsProbeTransport {
         self.seen.lock().unwrap().push((
             hv("access-control-allow-origin"),
             hv("access-control-allow-credentials"),
+            hv("access-control-expose-headers"),
+            hv("server-timing"),
         ));
         let body = resp.bytes().await?;
-        Ok(PostReply { status, body })
+        Ok(PostReply { status, body, peer: None })
     }
 
     async fn get_stream(
@@ -554,4 +571,104 @@ impl HttpTransport for CorsProbeTransport {
             .map(|r| r.map_err(anyhow::Error::new))
             .boxed())
     }
+}
+
+/// `Server-Timing` 与 CORS 头受同一条防线约束：**只出现在认证成功的响应上**。
+///
+/// 这个头是自适应流控的回传通道（服务端把处理耗时和上行 seq 空洞告诉客户端）。
+/// 它一旦漏到伪装页上就是个可探测特征——nginx 默认页发 `server-timing` 里带
+/// 一个 `q;desc="0-0"`，是任何真实 nginx 都不会有的形状。
+///
+/// 与 `cors_headers_only_on_authenticated_responses` 分成两条而不是并进去：
+/// 两个头挂在不同的调用点上，将来任何一个被挪走，都该有自己的那条测试变红。
+#[tokio::test]
+async fn server_timing_only_on_authenticated_responses() {
+    let rig = start_server().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{}", rig.addr);
+    let host = rig.addr.to_string();
+
+    // 1) 未认证的协议路径 → 伪装，不得带
+    let r = c
+        .post(format!("{base}/api/sync?n=7&sid=AAAAAAAAAAAAAAAAAAAAAA"))
+        .header("Host", &host)
+        .body("garbage")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r.headers().get("server-timing").is_none(),
+        "未认证响应带了 server-timing，成为探测特征"
+    );
+
+    // 2) 纯伪装页 → 同样不得带
+    let r = c.get(format!("{base}/")).header("Host", &host).send().await.unwrap();
+    assert!(r.headers().get("server-timing").is_none());
+}
+
+/// `Server-Timing` 必须同时被 `Access-Control-Expose-Headers` 放行。
+///
+/// **两个头管的是两件不同的事，这正是原先搞混的地方**：
+///   - `Timing-Allow-Origin` 放行 `PerformanceResourceTiming`（走 Performance API）
+///   - `Access-Control-Expose-Headers` 放行 `Response.headers.get()`（走 fetch）
+///
+/// 自适应流控的回传读的是后者。少了它，跨域的
+/// `resp.headers.get('server-timing')` 恒为 null——不报错，只表现为服务端
+/// 观测永远是"无数据"，整个回传通道静默失效。
+///
+/// reqwest 不做 CORS 过滤，所以"能读到这个头"的测试抓不到这个缺陷；
+/// 必须直接断言放行头本身存在且包含它。
+#[tokio::test]
+async fn server_timing_is_exposed_to_cross_origin_javascript() {
+    let rig = start_server().await;
+    let c = reqwest::Client::new();
+    let base = format!("http://{}", rig.addr);
+    let host = rig.addr.to_string();
+    let origin = "https://wsieve-host-a.example".to_string();
+
+    let transport = std::sync::Arc::new(CorsProbeTransport {
+        client: c.clone(),
+        base: base.clone(),
+        origin: origin.clone(),
+        host: host.clone(),
+        seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let seen = transport.seen.clone();
+    let (mut conn, _neg) = XhttpConn::connect(
+        transport,
+        &UpstreamCfg {
+            server_pub: rig.server_pub,
+            client_priv: rig.client_priv,
+            mux_prefs: vec![MuxId::Wsmux],
+            group_id: wsieve_xhttp::client::random_group_id(),
+            ip_strategy: wsieve_proto::hello::IpStrategy::Auto,
+            profile: Default::default(),
+        },
+    )
+    .await
+    .expect("握手应当成功");
+
+    // 触发一个 n≥1 的数据面 POST —— Server-Timing 只挂在那上面。
+    use tokio::io::AsyncWriteExt;
+    conn.write_all(&[1u8; 64]).await.unwrap();
+    for _ in 0..200 {
+        if seen.lock().unwrap().iter().any(|(_, _, _, st)| st.is_some()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let headers = seen.lock().unwrap().clone();
+    let (_, _, expose, _) = headers
+        .iter()
+        .find(|(_, _, _, st)| st.is_some())
+        .expect("数据面响应上应当有 server-timing")
+        .clone();
+    let expose = expose
+        .expect("缺 Access-Control-Expose-Headers —— 跨域 JS 读不到 server-timing，回传通道静默失效")
+        .to_ascii_lowercase();
+    assert!(
+        expose.contains("server-timing"),
+        "放行列表里没有 server-timing，实为「{expose}」"
+    );
 }

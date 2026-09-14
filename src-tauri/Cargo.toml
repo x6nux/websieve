@@ -8,6 +8,20 @@ description = "websieve Tauri shell: WebViewTransport bridge + SOCKS5 wiring"
 # standalone crate on purpose: the workspace stays pure-lib (protocol crates),
 # the app references them by path.
 
+[features]
+default = ["embed-ui"]
+# 把 ui/dist 嵌进二进制，而不是从 devUrl 拉。
+#
+# 为什么需要显式开：tauri-macros 里是
+#   dev: cfg!(not(feature = "custom-protocol"))
+# （tauri-macros/src/context.rs:155）。也就是说 **debug 构建默认走 devUrl**，
+# 控制窗口会去连 http://localhost:5174 —— 没跑 vite dev 时就是一片空白。
+# 实测：不开此 feature 时控制窗口 URL 是 http://localhost:5174；
+# 开了之后是 tauri://localhost，本地资产正常加载。
+#
+# 用 `cargo build --no-default-features` 可退回 devUrl 模式配合 `vite dev` 热重载。
+embed-ui = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -17,8 +31,37 @@ wsieve-transport = { path = "../crates/wsieve-transport" }
 wsieve-xhttp = { path = "../crates/wsieve-xhttp" }
 wsieve-mux = { path = "../crates/wsieve-mux" }
 wsieve-socks5 = { path = "../crates/wsieve-socks5" }
+wsieve-inbound = { path = "../crates/wsieve-inbound" }
+wsieve-route = { path = "../crates/wsieve-route" }
+wsieve-geo = { path = "../crates/wsieve-geo" }
+wsieve-dns = { path = "../crates/wsieve-dns" }
+# TUN 入口的全部纯逻辑（fake-ip / bypass / 路由构造 / 启动顺序）。
+# src-tauri 侧只有 tun.rs 那一层薄编排 —— 判决逻辑必须留在 crate 里才能在
+# `cargo test` 里穷举，而 src-tauri 拖着整个 Tauri（设计文档 §8.3 的分层理由）。
+wsieve-tun = { path = "../crates/wsieve-tun" }
+# 配置的读、校验与「保留注释的定点改写」全在这个 crate 里（设计文档 §5.6）。
+# 命令面**不得**另起一套配置读写：写回若走 serde 序列化，用户手写的规则注释
+# 会在 UI 点一次开关之后全部消失 —— 而那正是 §5.1 选择 YAML 的唯一理由。
+# 该 crate 的 serde-saphyr 关掉了 serialize feature，`serde_saphyr::to_string`
+# 编译期就不存在，「写回不走序列化」因此是编译期事实而非注释里的约定。
+wsieve-config = { path = "../crates/wsieve-config" }
 
-tauri = { version = "2", features = [] }
+# tray-icon：托盘 API 挂在 #[cfg(all(desktop, feature = "tray-icon"))] 下
+#   （tauri/src/lib.rs:112），不开则 tauri::tray 模块根本不存在。
+# image-png：app.default_window_icon() 返回的图标要能被托盘复用，
+#   仓库只有 icons/icon.png。
+# custom-protocol 不写在这里 —— 它必须由上面的 embed-ui 间接开，
+#   否则就没有退回 devUrl 配合热重载的路了。
+# macos-proxy：`WebviewWindowBuilder::proxy_url` 的开关，多会话条带的免提权
+#   落地件要它（见 `src/webview_proxy.rs`）。
+#
+#   **它把 macOS 的最低版本抬到 14.0**：链进来的 `nw_proxy_config_create_*`
+#   是 macOS 14 才有的符号，13 及以下即使一次都不调用也可能在 dyld 绑定阶段
+#   就起不来。因此 `tauri.conf.json` 里显式写了
+#   `bundle.macOS.minimumSystemVersion = "14.0"` —— 那不是保守估计，是把这个
+#   下限变成一句明确的「系统版本过低」，而不是一次没有任何线索的启动失败。
+#   两处必须同步：删掉这个 feature 时记得把版本下限一起降回去。
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-proxy"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tokio-stream = "0.1"
@@ -31,9 +74,26 @@ hex = "0.4"
 tauri-utils = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 启动阶段（main() 里 Tauri Builder 建好之前）要算 config.yaml 的路径，
+# 而这一刻还没有 AppHandle，用不了 `app.path().app_config_dir()`。
+# `tauri::path::PathResolver::app_config_dir()` 的实现本身就是
+# `dirs::config_dir().join(identifier)`（已读过 tauri 2.11.5 源码确认）——
+# 这里直接用同一个 crate 复刻同一条逻辑，identifier 取自
+# `tauri::generate_context!()` 产出的 `Context::config()`，因此两处
+# 算出来的必然是同一条路径，不会出现「控制台编辑的和运行时读到的是两份
+# 文件」（见 commands/config.rs::config_path 的同款注释）。
+dirs = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# tauri 的 `test` feature 提供 MockRuntime —— 控制窗口的建/显/隐、事件推送
+# 能在无 GUI 的 CI 上真的跑起来，而不是只靠肉眼确认。写在 dev-dependencies
+# 里意味着这个 feature 只在编译 test target 时并入依赖图。
+tauri = { version = "2", features = ["test"] }
+# 只用于 carrier 的一个测试：验证 isolated 的窗口标签能被
+# capabilities/default.json 的 glob 授权匹配（含中文出站名）。
+# 该 crate 已经在 tauri-utils 的依赖树里，不引入新的编译成本。
+glob = "0.3"
 
 [profile.release]
 strip = true

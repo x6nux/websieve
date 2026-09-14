@@ -181,3 +181,33 @@ async fn assert_closed(s: &mut TcpStream) {
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
+
+/// 客户端不提供「无认证」时必须明确回 0xFF，而不是宣布选中它。
+///
+/// 早先的实现根本不看 METHODS，无条件回 `[05 00]`。对一个只支持用户名口令
+/// 的客户端，那是在回一个它没提供的方式——接下来双方对后续字节的理解就错位
+/// 了，表现为连接莫名卡住而不是一条明确的报错。
+#[tokio::test]
+async fn a_client_without_no_auth_gets_an_explicit_refusal() {
+    let addr = spawn_server(echo_handler()).await.unwrap();
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // VER=5, NMETHODS=1, METHODS=[0x02]（用户名口令），不含 0x00
+    s.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r, [0x05, 0xFF], "该回「无可接受方法」，收到 {r:?}");
+}
+
+/// 对照：提供了无认证就照常选中它，协商继续。
+///
+/// 与上一条成对：单有上一条的话，一个「永远回 0xFF」的实现也能过。
+#[tokio::test]
+async fn a_client_offering_no_auth_is_accepted() {
+    let addr = spawn_server(echo_handler()).await.unwrap();
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    // METHODS=[0x02, 0x00]：混在别的方式里也要被认出来
+    s.write_all(&[0x05, 0x02, 0x02, 0x00]).await.unwrap();
+    let mut r = [0u8; 2];
+    s.read_exact(&mut r).await.unwrap();
+    assert_eq!(r, [0x05, 0x00], "该选中无认证，收到 {r:?}");
+}

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-config-save"
+description = "允许控制窗口按行号定点改写规则（保留用户手写的注释，不整份重写）"
+commands.allow = ["config_save"]

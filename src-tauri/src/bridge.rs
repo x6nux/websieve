@@ -23,7 +23,7 @@
 //! （>15s 无 `wsieve_heartbeat`）→ 标记死亡 → 所有 pending waiter 立即
 //! 失败 → XhttpConn 会话死 → proxy.rs 重载页面重建（spec §9.1）。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,6 +40,15 @@ type PendingPosts = Arc<AsyncMutex<HashMap<u64, oneshot::Sender<anyhow::Result<P
 /// pending 流：request_id -> chunk 通道发送端。
 type PendingStreams = Arc<AsyncMutex<HashMap<u64, mpsc::Sender<anyhow::Result<Bytes>>>>>;
 
+/// 单条下行流的重排状态：下一个该下推的 seq，以及提前到达、正等缺口补齐的分片。
+///
+/// `BTreeMap` 而非 `HashMap`：重排只关心「最小的那个是不是我要的」，
+/// 有序容器让这个判断是 O(1) 而不用每次扫全表。
+struct StreamOrder {
+    next: u32,
+    held: BTreeMap<u32, Bytes>,
+}
+
 pub struct WebViewTransport {
     inner: Arc<TransportInner>,
 }
@@ -51,6 +60,9 @@ pub struct TransportCore {
     pending_streams: PendingStreams,
     dead: AtomicBool,
     last_heartbeat: Mutex<Instant>,
+    /// 下行分片重排状态（仅流水线模式用到；串行模式下 seq 恒为递增，
+    /// 走的是同一条路径，只是永远不会真的攒住东西）。
+    stream_order: AsyncMutex<HashMap<u64, StreamOrder>>,
 }
 
 impl TransportCore {
@@ -72,6 +84,7 @@ impl TransportCore {
             pending_streams: Arc::new(AsyncMutex::new(HashMap::new())),
             dead: AtomicBool::new(false),
             last_heartbeat: Mutex::new(at),
+            stream_order: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -119,8 +132,43 @@ impl TransportCore {
         }
     }
 
+    /// 带序号的分片：按 `seq` 还原成发送顺序后再下推。
+    ///
+    /// **为什么需要它**：emitter 侧串行 `await invoke()` 时，吞吐上限就是
+    /// 「批大小 ÷ IPC 往返」，与批里装什么无关——实测客户端 CPU 死死压在
+    /// 一个核上，正是这条串行链。放开成多个 invoke 同时在途能把往返的等待
+    /// 时间用起来，但 Tauri 不保证并发 invoke 的**完成顺序**，而下行是字节流，
+    /// 错一个位置整条 TLS 连接就废了。
+    ///
+    /// 所以顺序必须由我们自己保证：发送侧在帧头写单调递增的 seq，这里按
+    /// seq 重排。乱序到达的分片先攒着，等缺口补齐再一起下推。
+    pub async fn push_chunk_seq(&self, id: u64, seq: u32, chunk: Bytes) {
+        let mut ready: Vec<Bytes> = Vec::new();
+        {
+            let mut ord = self.stream_order.lock().await;
+            let st = ord.entry(id).or_insert_with(|| StreamOrder {
+                next: 0,
+                held: BTreeMap::new(),
+            });
+            if seq < st.next {
+                // 重复/过期分片：丢弃。发送侧不重发，走到这里说明帧被复制了。
+                return;
+            }
+            st.held.insert(seq, chunk);
+            while let Some(c) = st.held.remove(&st.next) {
+                ready.push(c);
+                st.next += 1;
+            }
+        }
+        for c in ready {
+            self.push_chunk(id, c).await;
+        }
+    }
+
     /// 流结束（Ok(None) 语义）或出错。
     pub async fn complete_stream(&self, id: u64, err: Option<anyhow::Error>) {
+        // 重排状态跟着流一起销毁：不清的话每条流都留一份，长跑必然泄漏。
+        self.stream_order.lock().await.remove(&id);
         let tx = self.pending_streams.lock().await.remove(&id);
         if let Some(tx) = tx {
             if let Some(e) = err {
@@ -259,6 +307,12 @@ impl HttpTransport for WebViewTransport {
 
 impl WebViewTransport {
     /// `eval` 闭包负责把 JS 命令送进 webview（tauri `Webview::eval`）。
+    ///
+    /// **只给测试用**（`#[cfg(test)]`）：生产路径一律走 `with_base` ——
+    /// 基址由承载计划决定，而空基址意味着「与承载页面同源」。留一个
+    /// 默认空基址的便捷构造在那里，等于给「忘了传基址」留了条静默的路，
+    /// 而那条路会把请求发到承载页面自己的 origin，也就是另一台服务器。
+    #[cfg(test)]
     pub fn new(eval: Box<dyn Fn(String) + Send + Sync>) -> Arc<Self> {
         Self::with_base(eval, String::new())
     }
@@ -282,8 +336,15 @@ impl WebViewTransport {
     }
 }
 
-/// 纯 Rust base64（标准字母表 + padding），避免只为上行引入依赖。
-/// 上行 POST body ≤ 1MB 且每 POST 一次，编码成本可忽略。
+/// 纯 Rust base64（标准字母表 + padding），避免只为这一处引入依赖。
+///
+/// 上行（Rust → JS，经 eval）恒走它——eval 只能吃字符串，无可替代。
+/// 下行回帧（JS → Rust，经 IPC）现在以 raw body 快路径为主，这里的
+/// base64 只是 custom protocol 粘性回退到 postMessage 后的兼容路径，
+/// 完整理由见 `ui/emitter.js` 顶部。
+///
+/// 手写而不引 crate：实测瓶颈在 JS 侧（JavaScriptCore 编码 + stringify
+/// 约 148 MB/s），Rust 侧无论手写还是 SIMD 都远不是瓶颈，多一个依赖不值。
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn bs64_encode(data: &[u8]) -> String {
@@ -299,9 +360,65 @@ pub fn bs64_encode(data: &[u8]) -> String {
     out
 }
 
+/// `bs64_encode` 的逆，供下行回帧解码（`wsieve_raw_post`/`wsieve_raw_stream`）。
+///
+/// **非法字符报错而不是跳过**：静默忽略会把一个损坏的帧解成一段内容错位
+/// 但长度合法的字节流，那会一路漏进 Noise 解密层，报出来的错离病因极远。
+/// 宁可在这里就拒收。
+pub fn bs64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break; // padding 之后没有有效数据
+        }
+        let v: u8 = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return Err(format!("非法 base64 字符 {:?}", c as char)),
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 编解码必须严格互逆——这条链路上一个 off-by-one 不会立刻报错，
+    /// 而是变成一段长度合法、内容错位的字节流，一路漏进 Noise 解密层。
+    /// 三种余数（len%3 == 0/1/2）都要覆盖，padding 分支正是在这里分岔。
+    #[test]
+    fn base64_round_trips_including_every_padding_case() {
+        for len in 0..=64usize {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 13) as u8).collect();
+            let enc = bs64_encode(&data);
+            let dec = bs64_decode(&enc).expect("自己编的应当能自己解");
+            assert_eq!(dec, data, "len={len} 未能往返，编码={enc}");
+        }
+        // 全字节值都要能过，别在高位字节上栽跟头
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(bs64_decode(&bs64_encode(&all)).unwrap(), all);
+    }
+
+    /// 非法字符必须报错而不是被跳过（见 bs64_decode 的文档）。
+    #[test]
+    fn base64_rejects_junk_instead_of_silently_skipping() {
+        assert!(bs64_decode("AA*A").is_err(), "* 不在字母表里");
+        assert!(bs64_decode("AA A").is_err(), "空格也不行");
+        let e = bs64_decode("AA#A").unwrap_err();
+        assert!(e.contains('#'), "错误要点名冒犯的字符：{e}");
+    }
 
     #[test]
     fn url_joins_base_and_path() {
@@ -346,7 +463,7 @@ mod tests {
     async fn pending_post_add_complete() {
         let core = TransportCore::new();
         let rx = core.register_post(7).await;
-        core.complete_post(7, Ok(PostReply { status: 204, body: Bytes::new() }))
+        core.complete_post(7, Ok(PostReply { status: 204, body: Bytes::new(), peer: None }))
             .await;
         let r = rx.await.unwrap().unwrap();
         assert_eq!(r.status, 204);
@@ -355,7 +472,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_post_completion_is_silent() {
         let core = TransportCore::new();
-        core.complete_post(999, Ok(PostReply { status: 200, body: Bytes::new() }))
+        core.complete_post(999, Ok(PostReply { status: 200, body: Bytes::new(), peer: None }))
             .await; // 不 panic
     }
 

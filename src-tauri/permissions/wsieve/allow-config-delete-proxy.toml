@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-config-delete-proxy"
+description = "允许控制窗口按名字删除一个出站服务器块。删除一个不存在的名字会被拒绝而不是静默无操作。"
+commands.allow = ["config_delete_proxy"]

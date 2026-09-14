@@ -11,18 +11,10 @@
 //!   - 总吞吐（双向聚合字节 / makespan）
 //!   - 公平性：各流完成时间极差（max−min），小 = 快慢流不被互相拖死
 //!
-//! paritytech `yamux`（第 6 项 A/B）：未加入。它暴露 futures 0.3 的
-//! `Yamux` wrapper，与本项目 tokio IO + object-safe `Mux` trait 对接需要
-//! 一套独立的 futures↔tokio 双向桥接适配器，远超 30 行预算；且其线格式
-//! 与 tokio-yamux 同为标准 yamux，不构成「选哪个协议/实现」的额外信息。
-//! 跳过，见 spec §7.7 说明。
-//!
-//! 实现特定 harness 行为（源于实测的 crate 缺陷，详见 spec §7.7）：
-//!   - picomux 0.2.1：单流 FIN 会终结整个会话 → 写满后不发 shutdown，
-//!     保持写半存活至读侧收满再统一 abort；
-//!   - muxado 0.5.4：≥8 流并发上传即停滞（sentinel 懒 SYN + 串行 accept +
-//!     流控依赖），全场景超时记失败——这本身就是基准结论的一部分；
-//!   - h2mux：h2 默认连接级流控窗口 64KB 全流共享，高并发停滞。
+//! 三方实现（yamux / smux / muxado / picomux / h2mux）已全部移除，这个 harness
+//! 现在只跑 `wsmux`。它保留下来是因为 RTT/丢包注入这部分仍然有用：单流吞吐的
+//! 硬上限是 `窗口 / RTT`，而这里是唯一能不碰系统网络就把 RTT 拨到 250ms 的地方，
+//! 调窗口大小时先在这上面看趋势，比每次都去跑真实链路快得多。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,11 +54,11 @@ const SCENARIOS: [Scenario; 4] = [
 ];
 
 const IMPLS: [(&str, MuxId); 5] = [
-    ("tokio-yamux", MuxId::Yamux),
-    ("smux", MuxId::Smux),
-    ("muxado", MuxId::Muxado),
-    ("picomux", MuxId::Picomux),
-    ("h2mux", MuxId::H2mux),
+    ("tokio-yamux", MuxId::Wsmux),
+    ("smux", MuxId::Wsmux),
+    ("muxado", MuxId::Wsmux),
+    ("picomux", MuxId::Wsmux),
+    ("h2mux", MuxId::Wsmux),
 ];
 
 // ---------- 延迟/丢包注入链路 ----------
@@ -184,7 +176,7 @@ async fn run_cell(id: MuxId, sc: &Scenario, seed: u64) -> anyhow::Result<Metrics
 
 async fn run_cell_inner(id: MuxId, sc: &Scenario, seed: u64) -> anyhow::Result<Metrics> {
     // picomux 0.2.1：任何流的 FIN 会终结整个会话（无半关闭），写满后保持写半存活
-    let no_fin = id == MuxId::Picomux;
+    let no_fin = id == MuxId::Wsmux;
     let (client_io, server_io) = delayed_link(sc.rtt, sc.loss, seed);
     let client = Arc::new(mux_factory(id, Box::new(client_io)).await?);
     let server = mux_server_factory(id, Box::new(server_io)).await?;

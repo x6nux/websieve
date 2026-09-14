@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-app-quit"
+description = "允许控制窗口退出应用。走 app.exit(0) 以确保 RunEvent::Exit 到达 —— hosts 摘除、系统代理恢复、命中计数落盘都挂在那里。"
+commands.allow = ["app_quit"]

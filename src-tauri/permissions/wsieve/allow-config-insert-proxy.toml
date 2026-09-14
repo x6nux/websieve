@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-config-insert-proxy"
+description = "允许控制窗口新增一个出站服务器块（结构化，UI 表单驱动）。名字与已有出站/代理组冲突时拒绝，写入前完整校验。"
+commands.allow = ["config_insert_proxy"]
